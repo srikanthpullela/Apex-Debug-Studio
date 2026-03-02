@@ -1,5 +1,5 @@
 /* ================================================================
-   CongaNote — Color Picker Module
+   CongaCode — Color Picker Module
    Detect colors in code, show inline swatches, visual picker.
    ================================================================ */
 'use strict';

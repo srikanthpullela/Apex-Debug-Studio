@@ -1,5 +1,5 @@
 /* ========================================================================
-   CongaNote — Styles
+   CongaCode — Styles
    ======================================================================== */
 
 /* ---- Reset & Base ---- */
@@ -1098,13 +1098,15 @@ html, body {
 /* Header — VS Code style */
 .welcome-header {
   margin-bottom: 32px;
+  text-align: center;
 }
-.welcome-title {
-  font-size: 28px; font-weight: 300;
-  color: var(--text-primary);
-  letter-spacing: -0.3px;
-  line-height: 1.2;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+.welcome-logo {
+  width: 180px;
+  height: 180px;
+  margin-bottom: 20px;
+  user-select: none;
+  -webkit-user-drag: none;
+  image-rendering: -webkit-optimize-contrast;
 }
 .welcome-subtitle {
   font-size: 14px; font-weight: 400;
@@ -1942,6 +1944,33 @@ html, body {
 .history-commit-author {
   font-size: 10px; color: var(--text-muted);
 }
+
+/* Diff commit info banner */
+.diff-commit-banner {
+  padding: 8px 14px;
+  background: var(--bg-secondary, #1e1e2e);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+.diff-commit-banner-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin-bottom: 3px;
+}
+.diff-commit-banner-hash {
+  font-family: 'SF Mono', Menlo, Monaco, monospace;
+  font-size: 12px; color: #E4322B; font-weight: 600;
+}
+.diff-commit-banner-date {
+  font-size: 11px; color: var(--text-muted);
+}
+.diff-commit-banner-msg {
+  font-size: 13px; color: var(--text-primary); font-weight: 500;
+  margin-bottom: 2px;
+}
+.diff-commit-banner-author {
+  font-size: 11px; color: var(--text-muted);
+}
+
 .outline-list {
   overflow-y: auto;
   flex: 1;
@@ -3241,6 +3270,59 @@ body.zen-mode #editor-container { border-radius: 0; }
 /* ============ TOOLBAR SEPARATOR ============ */
 .titlebar-tools-sep { display: inline-block; width: 1px; height: 16px; background: var(--border); margin: 0 3px; vertical-align: middle; opacity: .5; }
 
+/* ============ KEBAB OVERFLOW MENU ============ */
+.titlebar-kebab-btn { display: none; }
+.titlebar-kebab-menu {
+  position: fixed;
+  top: 40px;
+  right: 220px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0,0,0,.45);
+  padding: 4px 0;
+  z-index: 9999;
+  min-width: 200px;
+  -webkit-app-region: no-drag;
+}
+.titlebar-kebab-menu.hidden { display: none; }
+.titlebar-kebab-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 14px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  border: none;
+  background: none;
+  width: 100%;
+  text-align: left;
+}
+.titlebar-kebab-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.titlebar-kebab-item.active {
+  color: var(--accent);
+}
+.titlebar-kebab-item svg {
+  flex-shrink: 0;
+  opacity: .8;
+}
+.titlebar-kebab-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 10px;
+}
+
+/* Responsive: hide overflowing tools, show kebab */
+.titlebar-kebab-btn { display: none; }
+.titlebar-tools.tools-overflow .titlebar-kebab-btn { display: flex !important; }
+.titlebar-tools.tools-overflow .titlebar-tool-btn:not(.titlebar-kebab-btn) { display: none; }
+.titlebar-tools.tools-overflow .titlebar-tools-sep { display: none; }
+
 /* ============ SNIPPET MANAGER ============ */
 .snippet-body { display: flex; flex-direction: column; height: calc(100% - 36px); overflow: hidden; }
 .snippet-search { width: calc(100% - 20px); margin: 8px 10px; background: var(--bg-input); border: 1px solid var(--border); color: var(--text-primary); padding: 6px 10px; border-radius: 6px; font-size: 12px; outline: none; }
@@ -3377,12 +3459,7 @@ body.zen-mode #editor-container { border-radius: 0; }
 .pomo-start { color: var(--accent); border-color: var(--accent); }
 
 /* Pomodoro status bar widget */
-.pomo-status-widget { display: flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; color: var(--text-muted); }
-.pomo-status-widget:hover { background: var(--bg-hover); }
-.pomo-status-widget.pomo-running { color: var(--accent); }
-.pomo-status-widget.pomo-break-mode { color: #2ecc71; }
-.pomo-status-icon { font-size: 12px; }
-.pomo-status-time { font-family: 'SF Mono', monospace; font-size: 11px; }
+
 
 /* Pomodoro titlebar header widget */
 .pomo-titlebar {

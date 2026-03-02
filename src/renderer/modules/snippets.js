@@ -1,12 +1,12 @@
 /* ================================================================
-   CongaNote — Snippet Manager Module
+   CongaCode — Snippet Manager Module
    Save, tag, search, and insert reusable code snippets.
    ================================================================ */
 'use strict';
 
 (function () {
   // ---- State ----
-  const STORAGE_KEY = 'conganote-snippets';
+  const STORAGE_KEY = 'congacode-snippets';
   let snippets = [];
   let editingIdx = -1;
 

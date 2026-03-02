@@ -1,5 +1,5 @@
 /**
- * CongaNote — Main Process
+ * CongaCode — Main Process
  * Window management, file I/O, auto-save, session, menus, global search, context menu support.
  */
 
@@ -30,22 +30,22 @@ async function getMarked() {
 }
 
 // Set app name FIRST — fixes "Electron" in macOS menu bar
-app.setName('CongaNote');
+app.setName('CongaCode');
 
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
-const CONGANOTE_DIR = path.join(os.homedir(), 'CongaNote');
-const SESSION_FILE = path.join(CONGANOTE_DIR, '.session.json');
-const RECENT_FILE = path.join(CONGANOTE_DIR, '.recent.json');
-const SETTINGS_FILE = path.join(CONGANOTE_DIR, 'settings.json');
-const AUTOSAVE_DIR = path.join(CONGANOTE_DIR, 'AutoSave');
+const CONGACODE_DIR = path.join(os.homedir(), 'CongaCode');
+const SESSION_FILE = path.join(CONGACODE_DIR, '.session.json');
+const RECENT_FILE = path.join(CONGACODE_DIR, '.recent.json');
+const SETTINGS_FILE = path.join(CONGACODE_DIR, 'settings.json');
+const AUTOSAVE_DIR = path.join(CONGACODE_DIR, 'AutoSave');
 
 // File watcher instances (per watched directory)
 const watchers = new Map();
 
 function ensureDirs() {
-  for (const dir of [CONGANOTE_DIR, AUTOSAVE_DIR]) {
+  for (const dir of [CONGACODE_DIR, AUTOSAVE_DIR]) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
 }
@@ -194,7 +194,7 @@ function updateDockMenu() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-save path: ~/CongaNote/AutoSave/YYYY-MM-DD/
+// Auto-save path: ~/CongaCode/AutoSave/YYYY-MM-DD/
 // Returns the day directory, creating it if needed.
 // ---------------------------------------------------------------------------
 function generateAutoSavePath(dateStr) {
@@ -239,7 +239,7 @@ function createNewWindow() {
   const win = new BrowserWindow({
     width: 1280, height: 800,
     minWidth: 600, minHeight: 400,
-    title: 'CongaNote',
+    title: 'CongaCode',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 14, y: 14 },
     backgroundColor: '#1e1e2e',
@@ -280,7 +280,7 @@ function createWindow() {
     ...bounds,
     minWidth: 600,
     minHeight: 400,
-    title: 'CongaNote',
+    title: 'CongaCode',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 14, y: 14 },
     backgroundColor: '#1e1e2e',
@@ -331,7 +331,7 @@ function createWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// Application menu — with "CongaNote" as first menu label
+// Application menu — with "CongaCode" as first menu label
 // ---------------------------------------------------------------------------
 // Helper: send IPC to the currently focused window (not just mainWindow)
 function sendToFocused(channel, ...args) {
@@ -350,17 +350,17 @@ function buildMenu() {
 
   const template = [
     ...(isMac ? [{
-      label: 'CongaNote',
+      label: 'CongaCode',
       submenu: [
-        { label: 'About CongaNote', role: 'about' },
+        { label: 'About CongaCode', role: 'about' },
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
-        { label: 'Hide CongaNote', role: 'hide' },
+        { label: 'Hide CongaCode', role: 'hide' },
         { role: 'hideOthers' },
         { role: 'unhide' },
         { type: 'separator' },
-        { label: 'Quit CongaNote', role: 'quit' },
+        { label: 'Quit CongaCode', role: 'quit' },
       ],
     }] : []),
     {
@@ -461,7 +461,7 @@ function buildMenu() {
       role: 'help',
       submenu: [
         { label: 'Open AutoSave Folder', click: () => shell.openPath(AUTOSAVE_DIR) },
-        { label: 'Open CongaNote Folder', click: () => shell.openPath(CONGANOTE_DIR) },
+        { label: 'Open CongaCode Folder', click: () => shell.openPath(CONGACODE_DIR) },
       ],
     },
   ];
@@ -724,7 +724,7 @@ ipcMain.handle('session:load', async () => loadSession());
 ipcMain.handle('recent:add', async (_e, fp) => { addRecent(fp); buildMenu(); updateDockMenu(); return true; });
 ipcMain.handle('recent:get', async () => loadRecent());
 ipcMain.handle('recent:clear', async () => { saveRecent([]); buildMenu(); updateDockMenu(); return true; });
-ipcMain.handle('app:get-paths', async () => ({ conganoteDir: CONGANOTE_DIR, autosaveDir: AUTOSAVE_DIR, home: os.homedir() }));
+ipcMain.handle('app:get-paths', async () => ({ congacodeDir: CONGACODE_DIR, autosaveDir: AUTOSAVE_DIR, home: os.homedir() }));
 ipcMain.handle('app:new-window', async () => { createNewWindow(); return true; });
 ipcMain.handle('shell:show-item', async (_e, fp) => { shell.showItemInFolder(fp); return true; });
 ipcMain.handle('shell:open-path', async (_e, dp) => { shell.openPath(dp); return true; });
@@ -938,22 +938,85 @@ ipcMain.handle('git:file-log', async (_e, dirPath, relPath, count = 50) => {
     const git = simpleGit(dirPath);
     const isRepo = await git.checkIsRepo();
     if (!isRepo) return null;
-    const log = await git.log({ file: relPath, maxCount: count, '--follow': null });
-    return log.all.map(c => ({
-      hash: c.hash.slice(0, 7),
-      fullHash: c.hash,
-      message: c.message,
-      author: c.author_name,
-      date: c.date,
-    }));
+    // Use raw git log with --follow --no-merges to get commits that touched this file
+    const SEP = '---COMMIT---';
+    const format = `${SEP}%n%H%n%h%n%s%n%an%n%aI`;
+    const raw = await git.raw([
+      'log', '--follow', '--no-merges',
+      `--max-count=${count}`, `--format=${format}`, '--', relPath
+    ]);
+    if (!raw || !raw.trim()) return [];
+    const blocks = raw.split(SEP).filter(b => b.trim());
+    const commits = [];
+    for (const block of blocks) {
+      const lines = block.split('\n').filter(l => l !== '');
+      if (lines.length < 5) continue;
+      commits.push({
+        hash: lines[1],
+        fullHash: lines[0],
+        message: lines[2],
+        author: lines[3],
+        date: lines[4],
+      });
+    }
+    return commits;
   } catch { return null; }
 });
 
 ipcMain.handle('git:show-at', async (_e, dirPath, commitHash, relPath) => {
   try {
     const git = simpleGit(dirPath);
-    return await git.show([`${commitHash}:${relPath}`]);
-  } catch { return null; }
+    // relPath is relative to dirPath; git show needs repo-root-relative path
+    const prefix = (await git.raw(['rev-parse', '--show-prefix'])).trim();
+    const repoPath = prefix ? prefix + relPath : relPath;
+    const result = await git.show([`${commitHash}:${repoPath}`]);
+    return result || '';
+  } catch (err) {
+    console.error('[git:show-at] FAILED:', err.message.slice(0, 300));
+    return null;
+  }
+});
+
+// Get both parent and commit versions of a file for diff viewing
+ipcMain.handle('git:commit-file-diff', async (_e, dirPath, commitHash, relPath) => {
+  try {
+    const git = simpleGit(dirPath);
+
+    // relPath is relative to the opened folder (dirPath), but git show needs
+    // paths relative to the repo root. Resolve by prepending the prefix.
+    const prefix = (await git.raw(['rev-parse', '--show-prefix'])).trim();
+    const repoPath = prefix ? prefix + relPath : relPath;
+
+    let modified = '', original = '';
+
+    // Get file content at this commit
+    try { modified = await git.show([`${commitHash}:${repoPath}`]); } catch { modified = ''; }
+
+    // Get file content at parent commit (same path first)
+    try {
+      original = await git.show([`${commitHash}~1:${repoPath}`]);
+    } catch {
+      // Parent path might differ (rename). Try diff-tree to find old name
+      try {
+        const diffRaw = await git.raw([
+          'diff-tree', '--no-commit-id', '-r', '-M', '--name-status', commitHash
+        ]);
+        for (const line of diffRaw.split('\n')) {
+          const parts = line.split('\t');
+          if (parts.length >= 3 && parts[0].startsWith('R')) {
+            const newP = parts[2].trim();
+            if (newP === repoPath) {
+              const oldP = parts[1].trim();
+              try { original = await git.show([`${commitHash}~1:${oldP}`]); } catch { /* */ }
+              break;
+            }
+          }
+        }
+      } catch { /* initial commit — no parent */ }
+    }
+
+    return { original, modified };
+  } catch { return { original: '', modified: '' }; }
 });
 
 // ---------------------------------------------------------------------------
@@ -1224,7 +1287,7 @@ ipcMain.handle('db:query', async (_e, filePath, query, tableName) => {
 // ---------------------------------------------------------------------------
 // Bookmarks persistence
 // ---------------------------------------------------------------------------
-const BOOKMARKS_FILE = path.join(CONGANOTE_DIR, '.bookmarks.json');
+const BOOKMARKS_FILE = path.join(CONGACODE_DIR, '.bookmarks.json');
 
 ipcMain.handle('bookmarks:load', async () => {
   try { return JSON.parse(fs.readFileSync(BOOKMARKS_FILE, 'utf-8')); } catch { return []; }
@@ -1355,7 +1418,7 @@ function openFileInNewWindow(filePath) {
   const win = new BrowserWindow({
     width: 1280, height: 800,
     minWidth: 600, minHeight: 400,
-    title: 'CongaNote',
+    title: 'CongaCode',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 14, y: 14 },
     backgroundColor: '#1e1e2e',

@@ -4,12 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: file: blob:; script-src 'self' 'unsafe-inline'; connect-src *;" />
-  <title>CongaNote</title>
+  <title>CongaCode</title>
   <link rel="stylesheet" href="styles.css" />
   <script>
     // Apply saved theme before first paint to prevent flash
     try {
-      const t = localStorage.getItem('conganote-theme');
+      const t = localStorage.getItem('congacode-theme');
       if (t) document.documentElement.setAttribute('data-theme', t);
     } catch(e) {}
   </script>
@@ -24,7 +24,7 @@
         <line x1="5.5" y1="2" x2="5.5" y2="14" stroke="currentColor" stroke-width="1.2"/>
       </svg>
     </button>
-    <span id="titlebar-title">CongaNote</span>
+    <span id="titlebar-title">CongaCode</span>
     <div id="titlebar-tools" class="titlebar-tools">
       <button class="titlebar-tool-btn" id="tbtn-api" title="API Client (⌃⇧A)">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
@@ -60,7 +60,12 @@
       <button class="titlebar-tool-btn" id="tbtn-diff" title="Diff Checker (⌃⇧I)">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v18"/><path d="M5 7H2v10h3"/><path d="M19 7h3v10h-3"/><path d="M8 7l-3 5 3 5"/><path d="M16 7l3 5-3 5"/></svg>
       </button>
+      <!-- Kebab overflow menu for small windows -->
+      <button class="titlebar-tool-btn titlebar-kebab-btn" id="tbtn-kebab" title="More tools">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+      </button>
     </div>
+    <div id="titlebar-kebab-menu" class="titlebar-kebab-menu hidden"></div>
     <div id="pomo-titlebar" class="pomo-titlebar hidden">
       <span class="pomo-tb-icon">🍅</span>
       <span id="pomo-tb-time" class="pomo-tb-time">25:00</span>
@@ -436,8 +441,8 @@
   <div id="welcome-screen">
     <div class="welcome-content">
       <div class="welcome-header">
-        <h1 class="welcome-title">CongaNote</h1>
-        <p class="welcome-subtitle">Editing evolved</p>
+        <img src="logo-large.png" alt="CongaCode" class="welcome-logo" />
+        <!-- <p class="welcome-subtitle">Editing evolved</p> -->
       </div>
 
       <!-- Spotlight Search Bar -->
@@ -746,7 +751,7 @@
             <span class="dot red"></span><span class="dot yellow"></span><span class="dot green"></span>
           </div>
           <pre id="screenshot-code" class="screenshot-code"></pre>
-          <div id="screenshot-watermark-text" class="screenshot-watermark">CongaNote</div>
+          <div id="screenshot-watermark-text" class="screenshot-watermark">CongaCode</div>
         </div>
       </div>
     </div>

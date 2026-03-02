@@ -1,5 +1,5 @@
 /* ================================================================
-   CongaNote — Pomodoro Focus Timer Module
+   CongaCode — Pomodoro Focus Timer Module
    25-min work / 5-min break timer in the status bar.
    ================================================================ */
 'use strict';
@@ -19,9 +19,6 @@
   let sessionCount = 0;
 
   function init() {
-    // Create status bar widget (bottom of screen)
-    createStatusBarWidget();
-
     // Titlebar widget click → open panel
     $('#pomo-titlebar')?.addEventListener('click', () => window.toggleToolPanel('pomo-panel'));
 
@@ -39,26 +36,6 @@
     skipBtn?.addEventListener('click', skipToNext);
 
     updateDisplay();
-  }
-
-  function createStatusBarWidget() {
-    // Find or create status bar
-    let statusBar = $('#status-bar');
-    if (!statusBar) {
-      statusBar = document.createElement('div');
-      statusBar.id = 'status-bar';
-      statusBar.className = 'status-bar';
-      document.body.appendChild(statusBar);
-    }
-
-    // Add pomodoro widget
-    const widget = document.createElement('div');
-    widget.id = 'pomo-status';
-    widget.className = 'pomo-status-widget';
-    widget.title = 'Pomodoro Timer — Click to open';
-    widget.innerHTML = `<span class="pomo-status-icon">🍅</span><span id="pomo-status-time" class="pomo-status-time">${formatTime(remaining)}</span>`;
-    widget.addEventListener('click', () => window.toggleToolPanel('pomo-panel'));
-    statusBar.appendChild(widget);
   }
 
   function startTimer() {
@@ -124,7 +101,7 @@
 
     // Show native notification
     if (Notification.permission === 'granted') {
-      new Notification('CongaNote Pomodoro', {
+      new Notification('CongaCode Pomodoro', {
         body: mode === 'work' ? `Session #${sessionCount + 1} complete! Time for a break.` : 'Break is over! Ready to focus?',
         icon: '🍅',
       });
@@ -162,27 +139,18 @@
       progressEl.style.background = `conic-gradient(${mode === 'work' ? 'var(--accent)' : '#2ecc71'} ${pct}%, var(--bg-tertiary) ${pct}%)`;
     }
 
-    // Status bar
-    const statusTime = $('#pomo-status-time');
-    if (statusTime) statusTime.textContent = timeStr;
-    const statusWidget = $('#pomo-status');
-    if (statusWidget) {
-      statusWidget.classList.toggle('pomo-running', isRunning);
-      statusWidget.classList.toggle('pomo-break-mode', mode === 'break');
-    }
-
     // Titlebar header widget
     const tbWidget = $('#pomo-titlebar');
     const tbTime   = $('#pomo-tb-time');
     const tbMode   = $('#pomo-tb-mode');
     if (tbWidget) {
-      if (isRunning || remaining < (mode === 'work' ? WORK_MINS : getBreakDuration()) * 60) {
+      if (isRunning) {
         tbWidget.classList.remove('hidden');
         if (tbTime) tbTime.textContent = timeStr;
         if (tbMode) {
           tbMode.textContent = mode === 'work' ? 'Focus' : 'Break';
           tbWidget.classList.toggle('pomo-tb-break', mode === 'break');
-          tbWidget.classList.toggle('pomo-tb-running', isRunning);
+          tbWidget.classList.toggle('pomo-tb-running', true);
         }
       } else {
         tbWidget.classList.add('hidden');

@@ -1,5 +1,5 @@
 /* ========================================================================
-   CongaNote — Renderer (app.js)
+   CongaCode — Renderer (app.js)
    ======================================================================== */
 
 'use strict';
@@ -578,7 +578,7 @@ function initMonaco() {
       });
       // Add "File History" to editor right-click context menu
       state.editor.addAction({
-        id: 'conganote.fileHistory',
+        id: 'congacode.fileHistory',
         label: 'File History',
         contextMenuGroupId: '9_cutcopypaste',
         contextMenuOrder: 99,
@@ -646,8 +646,9 @@ window.activateTab = activateTab;
   // Handle special tabs (settings, image)
   hideSettingsUI();
   hideImagePreview();
-  // Hide diff editor if switching away from a diff tab
+  // Hide diff/commit editor if switching away
   hideDiffEditor();
+  hideCommitViewer();
 
   if (tab._isSettings) {
     state.editor.setModel(tab.model);
@@ -658,7 +659,16 @@ window.activateTab = activateTab;
     return;
   }
 
-  // Handle diff tabs
+  // Handle commit viewer tabs
+  if (tab._isCommitDiff) {
+    renderCommitViewer(tab);
+    renderTabs();
+    updateTitleBar(tab);
+    updateEmptyTabShortcuts();
+    return;
+  }
+
+  // Handle diff tabs (Diff Checker)
   if (tab._isDiff) {
     renderDiffEditor(tab);
     renderTabs();
@@ -690,6 +700,8 @@ window.activateTab = activateTab;
     hideRichTextEditor();
   }
 
+  // Restore main editor visibility (may have been hidden by diff/commit viewers)
+  dom.editorContainer.style.display = '';
   state.editor.setModel(tab.model);
   if (tab.viewState) state.editor.restoreViewState(tab.viewState);
   state.editor.focus();
@@ -712,8 +724,8 @@ function closeTab(id) {
   const idx = state.tabs.findIndex((t) => t.id === id);
   if (idx === -1) return;
   const tab = state.tabs[idx];
-  // Save to recently closed stack (skip settings tab)
-  if (!tab._isSettings) {
+  // Save to recently closed stack (skip settings & diff tabs)
+  if (!tab._isSettings && !tab._isDiff) {
     const closedEntry = { title: tab.title, filePath: tab.filePath, content: tab.model.getValue() };
     state.recentlyClosed.push(closedEntry);
     if (state.recentlyClosed.length > 20) state.recentlyClosed.shift();
@@ -722,10 +734,12 @@ function closeTab(id) {
   hideSettingsUI();
   hideImagePreview();
   hideDiffEditor();
+  hideCommitViewer();
   // Dispose diff editor resources
   if (tab._diffEditor) { tab._diffEditor.dispose(); }
   if (tab._diffOriginalModel) { tab._diffOriginalModel.dispose(); }
   if (tab._diffModifiedModel) { tab._diffModifiedModel.dispose(); }
+  if (tab._commitEditor) { tab._commitEditor.dispose(); }
   tab.model.dispose();
   state.tabs.splice(idx, 1);
   clearAutoSave(id);
@@ -789,7 +803,7 @@ function markTabModified(id, modified) {
 
 function updateTitleBar(tab) {
   const mod = tab && tab.modified ? '● ' : '';
-  dom.titlebarTitle.textContent = tab ? `${mod}${tab.title} — CongaNote` : 'CongaNote';
+  dom.titlebarTitle.textContent = tab ? `${mod}${tab.title} — CongaCode` : 'CongaCode';
 }
 
 /* ================================================================
@@ -798,10 +812,10 @@ function updateTitleBar(tab) {
 
 async function openFileDialog() {
   try {
-    const filePaths = await window.conganote.openFileDialog();
+    const filePaths = await window.congacode.openFileDialog();
     if (!filePaths || filePaths.length === 0) return;
     for (const fp of filePaths) {
-      const content = await window.conganote.readFile(fp);
+      const content = await window.congacode.readFile(fp);
       if (content != null) await openFile(fp, content);
     }
   } catch (err) {
@@ -818,18 +832,20 @@ async function openFile(filePath, content) {
   // For image files, create a placeholder tab (content will be shown via image preview)
   if (isImageFile(name)) {
     createTab(name, filePath, '', 'plaintext');
-    await window.conganote.addRecent(filePath);
+    await window.congacode.addRecent(filePath);
     return;
   }
 
   createTab(name, filePath, content);
-  await window.conganote.addRecent(filePath);
+  await window.congacode.addRecent(filePath);
 }
 window.openFile = openFile;
 
 async function saveFile(tabOrId) {
   const tab = typeof tabOrId === 'object' ? tabOrId : state.tabs.find((t) => t.id === tabOrId);
   if (!tab) return;
+  // Never save diff / commit-diff tabs
+  if (tab._isDiff || tab._isCommitDiff) return;
   // Sync rich text content to model before saving
   if (tab._richTextMode) saveRichTextContent(tab);
   let content = tab.model.getValue();
@@ -848,9 +864,9 @@ async function saveFile(tabOrId) {
     content += '\n';
   }
   if (!tab.filePath) {
-    // Untitled — auto-save to ~/CongaNote/AutoSave/YYYY-MM-DD/
+    // Untitled — auto-save to ~/CongaCode/AutoSave/YYYY-MM-DD/
     const today = new Date().toISOString().slice(0, 10);
-    const dir = await window.conganote.getAutoSavePath(today);
+    const dir = await window.congacode.getAutoSavePath(today);
     // Use tab title, sanitize it, and add .txt extension
     const safeName = (tab.title || 'Untitled').replace(/[^a-zA-Z0-9._\- ]/g, '_').trim() || 'Untitled';
     const baseName = safeName.includes('.') ? safeName : `${safeName}.txt`;
@@ -859,20 +875,20 @@ async function saveFile(tabOrId) {
     const ext = baseName.substring(baseName.lastIndexOf('.'));
     const stem = baseName.substring(0, baseName.lastIndexOf('.'));
     let i = 1;
-    while (await window.conganote.stat(filePath)) {
+    while (await window.congacode.stat(filePath)) {
       filePath = `${dir}/${stem}-${i}${ext}`;
       i++;
     }
-    await window.conganote.writeFile(filePath, content);
+    await window.congacode.writeFile(filePath, content);
     tab.filePath = filePath;
     tab.title = filePath.split('/').pop();
     renderTabs();
     updateTitleBar(tab);
     updateBreadcrumbs();
     // Add to recent files so it appears on the welcome page
-    await window.conganote.addRecent(filePath);
+    await window.congacode.addRecent(filePath);
   } else {
-    await window.conganote.writeFile(tab.filePath, content);
+    await window.congacode.writeFile(tab.filePath, content);
   }
   markTabModified(tab.id, false);
   showAutoSaved();
@@ -891,7 +907,7 @@ async function saveAsFile() {
   }
 
   const defaultName = tab.filePath || tab.title;
-  const newPath = await window.conganote.saveFileDialog(defaultName);
+  const newPath = await window.congacode.saveFileDialog(defaultName);
   if (!newPath) return;
 
   // Trim trailing whitespace if applicable
@@ -902,7 +918,7 @@ async function saveAsFile() {
     content += '\n';
   }
 
-  await window.conganote.writeFile(newPath, content);
+  await window.congacode.writeFile(newPath, content);
 
   const newName = newPath.split('/').pop();
   const oldWasRichText = tab._richTextMode;
@@ -934,7 +950,7 @@ async function saveAsFile() {
   updateStatusLanguage(tab);
   if (state.folderPath) await refreshTree();
   showToast(`Saved as ${newName}`, 'success', 2000);
-  await window.conganote.addRecent(newPath);
+  await window.congacode.addRecent(newPath);
 }
 
 function showAutoSaved() {
@@ -947,6 +963,8 @@ function showAutoSaved() {
    ================================================================ */
 function scheduleAutoSave(tabId) {
   clearAutoSave(tabId);
+  const t = state.tabs.find((t) => t.id === tabId);
+  if (t && (t._isDiff || t._isCommitDiff)) return; // never auto-save diff/commit tabs
   state.autoSaveTimers[tabId] = setTimeout(() => {
     const tab = state.tabs.find((t) => t.id === tabId);
     if (tab && tab.modified) saveFile(tab);
@@ -970,7 +988,7 @@ async function saveSession() {
       filePath: t.filePath,
       content: t.filePath ? null : t.model.getValue(),
     }));
-    await window.conganote.saveSession({
+    await window.congacode.saveSession({
       tabs,
       activeIndex: state.tabs.findIndex((t) => t.id === state.activeTabId),
       folderPath: state.folderPath,
@@ -991,7 +1009,7 @@ async function restoreSession() {
   if (params.get('new') === '1') {
     // Still restore theme preference
     try {
-      const session = await window.conganote.loadSession();
+      const session = await window.congacode.loadSession();
       if (session?.theme) { state.theme = session.theme; applyTheme(state.theme); }
     } catch {}
     // Sidebar stays hidden until a folder is opened
@@ -1000,7 +1018,7 @@ async function restoreSession() {
     return;
   }
   try {
-    const session = await window.conganote.loadSession();
+    const session = await window.congacode.loadSession();
     if (!session) return;
     // Restore user preferences only — theme, sidebar
     if (session.theme) { state.theme = session.theme; applyTheme(state.theme); }
@@ -1042,11 +1060,11 @@ async function openFolder(dirPath) {
     // Update terminal CWD if terminal is open
     if (state.terminalVisible && !state.terminalCwd) {
       state.terminalCwd = dirPath;
-      window.conganote.terminalSetCwd(dirPath);
+      window.congacode.terminalSetCwd(dirPath);
       updateTerminalCwd();
     }
     // Add folder to recent list
-    await window.conganote.addRecent(dirPath);
+    await window.congacode.addRecent(dirPath);
     dom.fileTreeEmpty.classList.add('hidden');
     dom.fileTree.innerHTML = '';
     dom.rootFolderBar.classList.remove('hidden');
@@ -1069,7 +1087,7 @@ async function openFolder(dirPath) {
 
 async function openFolderDialog() {
   try {
-    const dirPath = await window.conganote.openFolderDialog();
+    const dirPath = await window.congacode.openFolderDialog();
     if (!dirPath) return;
     hideWelcome();
     await openFolder(dirPath);
@@ -1081,7 +1099,7 @@ async function openFolderDialog() {
 async function renderTreeDir(dirPath, parentEl, depth) {
   let entries;
   try {
-    entries = await window.conganote.readDir(dirPath);
+    entries = await window.congacode.readDir(dirPath);
   } catch (err) {
     console.error('readDir error:', err);
     return;
@@ -1160,7 +1178,7 @@ async function renderTreeDir(dirPath, parentEl, depth) {
         dom.fileTree.querySelectorAll('.tree-item.active').forEach((el) => el.classList.remove('active'));
         item.classList.add('active');
         try {
-          const content = await window.conganote.readFile(entry.path);
+          const content = await window.congacode.readFile(entry.path);
           await openFile(entry.path, content);
         } catch (err) {
           console.error('Failed to open file:', err);
@@ -1220,14 +1238,14 @@ function initContextMenu() {
         const name = prompt('New file name:');
         if (!name) return;
         const fp = `${parentDir}/${name}`;
-        await window.conganote.writeFile(fp, '');
+        await window.congacode.writeFile(fp, '');
         await refreshTree();
         break;
       }
       case 'new-folder': {
         const name = prompt('New folder name:');
         if (!name) return;
-        await window.conganote.createDir(`${parentDir}/${name}`);
+        await window.congacode.createDir(`${parentDir}/${name}`);
         await refreshTree();
         break;
       }
@@ -1236,13 +1254,13 @@ function initContextMenu() {
         const newName = prompt('Rename to:', oldName);
         if (!newName || newName === oldName) return;
         const newPath = tp.substring(0, tp.lastIndexOf('/')) + '/' + newName;
-        await window.conganote.rename(tp, newPath);
+        await window.congacode.rename(tp, newPath);
         await refreshTree();
         break;
       }
       case 'delete': {
         if (!confirm(`Delete "${tp.split('/').pop()}"?`)) return;
-        await window.conganote.deleteFile(tp);
+        await window.congacode.deleteFile(tp);
         await refreshTree();
         break;
       }
@@ -1251,7 +1269,7 @@ function initContextMenu() {
         break;
       }
       case 'reveal-finder': {
-        try { await window.conganote.revealInFinder(tp); } catch (err) { console.error('reveal error:', err); }
+        try { await window.congacode.revealInFinder(tp); } catch (err) { console.error('reveal error:', err); }
         break;
       }
       case 'file-history': {
@@ -1261,7 +1279,7 @@ function initContextMenu() {
         break;
       }
       case 'open-terminal': {
-        try { await window.conganote.openInTerminal(parentDir); } catch (err) { console.error('open terminal error:', err); }
+        try { await window.congacode.openInTerminal(parentDir); } catch (err) { console.error('open terminal error:', err); }
         break;
       }
     }
@@ -1333,7 +1351,7 @@ function initTabContextMenu() {
         break;
       case 'tab-reveal-finder':
         if (tab.filePath) {
-          try { await window.conganote.revealInFinder(tab.filePath); } catch (err) { console.error(err); }
+          try { await window.congacode.revealInFinder(tab.filePath); } catch (err) { console.error(err); }
         }
         break;
       case 'tab-file-history':
@@ -1344,7 +1362,7 @@ function initTabContextMenu() {
       case 'tab-open-terminal': {
         if (tab.filePath) {
           const dir = tab.filePath.substring(0, tab.filePath.lastIndexOf('/'));
-          try { await window.conganote.openInTerminal(dir); } catch (err) { console.error(err); }
+          try { await window.congacode.openInTerminal(dir); } catch (err) { console.error(err); }
         }
         break;
       }
@@ -1353,7 +1371,7 @@ function initTabContextMenu() {
           const confirmed = confirm(`Are you sure you want to permanently delete "${tab.title}"?\n\nThis action cannot be undone.`);
           if (!confirmed) break;
           try {
-            const ok = await window.conganote.deleteFile(tab.filePath);
+            const ok = await window.congacode.deleteFile(tab.filePath);
             if (ok) {
               closeTab(tab.id);
               if (state.folderPath) await refreshTree();
@@ -1413,7 +1431,7 @@ function startInlineTabRename(tab) {
     const dir = tab.filePath.substring(0, tab.filePath.lastIndexOf('/'));
     const newPath = dir + '/' + newName;
     try {
-      const ok = await window.conganote.rename(tab.filePath, newPath);
+      const ok = await window.congacode.rename(tab.filePath, newPath);
       if (!ok) { showToast('Rename failed', 'error', 3000); renderTabs(); return; }
       tab.filePath = newPath;
       tab.title = newName;
@@ -1433,7 +1451,7 @@ function startInlineTabRename(tab) {
       updateStatusLanguage(tab);
       if (state.folderPath) await refreshTree();
       showToast(`Renamed to ${newName}`, 'success', 2000);
-      await window.conganote.addRecent(newPath);
+      await window.congacode.addRecent(newPath);
     } catch (err) {
       showToast(`Rename failed: ${err.message}`, 'error', 3000);
       renderTabs();
@@ -1673,7 +1691,7 @@ function hideQuickOpen() {
 async function loadQuickOpenFiles() {
   if (state.folderPath) {
     try {
-      quickOpenFiles = await window.conganote.getAllFiles(state.folderPath);
+      quickOpenFiles = await window.congacode.getAllFiles(state.folderPath);
     } catch {
       quickOpenFiles = [];
     }
@@ -1703,7 +1721,7 @@ function renderQuickOpenResults(files) {
     item.addEventListener('click', async () => {
       hideQuickOpen();
       try {
-        const content = await window.conganote.readFile(fp);
+        const content = await window.congacode.readFile(fp);
         await openFile(fp, content);
       } catch (err) { console.error('quick open error:', err); }
     });
@@ -1761,7 +1779,7 @@ function initQuickOpen() {
 
 const COMMANDS = [
   { id: 'new-tab',        label: 'New Tab',            shortcut: '⌘N',    action: () => createTab() },
-  { id: 'new-window',     label: 'New Window',         shortcut: '⇧⌘N',   action: () => window.conganote.newWindow() },
+  { id: 'new-window',     label: 'New Window',         shortcut: '⇧⌘N',   action: () => window.congacode.newWindow() },
   { id: 'open-file',      label: 'Open File',          shortcut: '⌘O',    action: openFileDialog },
   { id: 'open-folder',    label: 'Open Folder',        shortcut: '⇧⌘O',   action: openFolderDialog },
   { id: 'save',           label: 'Save',               shortcut: '⌘S',    action: () => { const t = state.tabs.find((t) => t.id === state.activeTabId); if (t) saveFile(t); } },
@@ -1940,7 +1958,7 @@ async function doGlobalSearch() {
   try {
     const caseSensitive = dom.globalSearchCase.checked;
     const isRegex = dom.globalSearchRegex.checked;
-    const results = await window.conganote.searchInFiles(state.folderPath, query, { caseSensitive, isRegex });
+    const results = await window.congacode.searchInFiles(state.folderPath, query, { caseSensitive, isRegex });
 
     // Check if this search was aborted
     if (controller.signal.aborted) return;
@@ -1979,7 +1997,7 @@ async function doGlobalSearch() {
           // Hide overlay so user can see the file, results stay for when they come back
           dom.globalSearchOverlay.classList.add('hidden');
           try {
-            const content = await window.conganote.readFile(file.filePath);
+            const content = await window.congacode.readFile(file.filePath);
             await openFile(file.filePath, content);
             // Jump to the line
             const ln = match.line || match.lineNumber;
@@ -2127,7 +2145,7 @@ function applyTheme(themeId) {
   state.theme = themeId;
   document.documentElement.setAttribute('data-theme', themeId);
   // Persist theme to localStorage for instant load on next startup
-  try { localStorage.setItem('conganote-theme', themeId); } catch(e) {}
+  try { localStorage.setItem('congacode-theme', themeId); } catch(e) {}
   if (state.editor) {
     monaco.editor.setTheme(monacoThemeId(themeId));
   }
@@ -2246,7 +2264,7 @@ function toggleRecentSection() {
 
 async function loadRecentFiles() {
   try {
-    const recentFiles = await window.conganote.getRecent();
+    const recentFiles = await window.congacode.getRecent();
     renderRecentList(recentFiles || []);
     renderWelcomeRecent(recentFiles || []);
   } catch {
@@ -2290,7 +2308,7 @@ function renderRecentList(files) {
       item.innerHTML = `<span class="recent-item-name">${escHtml(entry.name)}</span><span class="recent-item-path">${escHtml(entry.shortDir)}</span>`;
       item.addEventListener('click', async () => {
         try {
-          const content = await window.conganote.readFile(entry.path);
+          const content = await window.congacode.readFile(entry.path);
           await openFile(entry.path, content);
         } catch (err) { console.error('open recent error:', err); }
       });
@@ -2352,7 +2370,7 @@ function renderWelcomeRecent(files) {
       item.title = entry.path;
       item.addEventListener('click', async () => {
         try {
-          const content = await window.conganote.readFile(entry.path);
+          const content = await window.congacode.readFile(entry.path);
           await openFile(entry.path, content);
         } catch (err) { console.error('open recent error:', err); }
       });
@@ -2470,7 +2488,7 @@ async function showRecentPanel() {
   const list = $('#recent-panel-list');
   list.innerHTML = '<div style="padding:16px;color:var(--text-muted);">Loading...</div>';
 
-  const files = await window.conganote.getRecent() || [];
+  const files = await window.congacode.getRecent() || [];
   list.innerHTML = '';
 
   if (files.length === 0) {
@@ -2502,7 +2520,7 @@ async function showRecentPanel() {
         item.title = fp;
         item.addEventListener('click', async () => {
           try {
-            const content = await window.conganote.readFile(fp);
+            const content = await window.congacode.readFile(fp);
             await openFile(fp, content);
             hideRecentPanel();
           } catch (err) { console.error('open recent error:', err); }
@@ -2526,7 +2544,7 @@ async function showRecentPanel() {
       item.title = entry.path;
       item.addEventListener('click', async () => {
         try {
-          const content = await window.conganote.readFile(entry.path);
+          const content = await window.congacode.readFile(entry.path);
           await openFile(entry.path, content);
           hideRecentPanel();
         } catch (err) { console.error('open recent error:', err); }
@@ -2556,7 +2574,7 @@ async function groupRecentFilesWithStat(files) {
 
   for (const fp of files) {
     try {
-      const stat = await window.conganote.stat(fp);
+      const stat = await window.congacode.stat(fp);
       if (stat && stat.isDirectory) {
         directoryPaths.push(fp);
         continue;
@@ -2708,7 +2726,7 @@ async function runSystemSearch(query) {
   if (!dropdown) return;
 
   try {
-    const results = await window.conganote.systemSearch(query);
+    const results = await window.congacode.systemSearch(query);
     _sysSearchResults = results;
     _sysSearchActive = -1;
 
@@ -2772,7 +2790,7 @@ async function openSystemSearchResult(result) {
     await openFolder(result.path);
   } else {
     try {
-      const content = await window.conganote.readFile(result.path);
+      const content = await window.congacode.readFile(result.path);
       await openFile(result.path, content);
     } catch (err) {
       console.error('Failed to open search result:', err);
@@ -2862,7 +2880,7 @@ async function runWelcomeSearch(query) {
   if (!results || !list) return;
 
   try {
-    const items = await window.conganote.systemSearch(query);
+    const items = await window.congacode.systemSearch(query);
     _wsSearchResults = items;
     _wsSearchActive = -1;
     if (shimmer) shimmer.classList.add('hidden');
@@ -2916,7 +2934,7 @@ async function openWelcomeSearchResult(result) {
     await openFolder(result.path);
   } else {
     try {
-      const content = await window.conganote.readFile(result.path);
+      const content = await window.congacode.readFile(result.path);
       await openFile(result.path, content);
     } catch (err) {
       console.error('Failed to open welcome search result:', err);
@@ -3064,13 +3082,13 @@ function initWelcome() {
   $('#btn-welcome-new')?.addEventListener('click', () => createTab());
   $('#btn-welcome-open')?.addEventListener('click', openFileDialog);
   $('#btn-welcome-folder')?.addEventListener('click', openFolderDialog);
-  $('#btn-welcome-new-window')?.addEventListener('click', () => window.conganote.newWindow());
+  $('#btn-welcome-new-window')?.addEventListener('click', () => window.congacode.newWindow());
   // "More..." button to show full recent panel
   $('#btn-welcome-more-recent')?.addEventListener('click', () => showRecentPanel());
   // Recent panel close & clear
   $('#btn-recent-close')?.addEventListener('click', () => hideRecentPanel());
   $('#btn-recent-clear')?.addEventListener('click', async () => {
-    await window.conganote.clearRecent();
+    await window.congacode.clearRecent();
     hideRecentPanel();
     await loadRecentFiles();
   });
@@ -3097,7 +3115,7 @@ function initNoEditorShortcuts() {
       case 'command-palette': showCommandPalette(); break;
       case 'search-files':    showGlobalSearch();   break;
       case 'toggle-terminal': {
-        if (state.folderPath) { window.conganote.openInTerminal(state.folderPath); }
+        if (state.folderPath) { window.congacode.openInTerminal(state.folderPath); }
         break;
       }
     }
@@ -3198,7 +3216,7 @@ function initKeyboard() {
     // Cmd+N → New tab
     if (cmd && !shift && !alt && e.key === 'n') { e.preventDefault(); createTab(); return; }
     // Cmd+Shift+N → New window
-    if (cmd && shift && !alt && e.key === 'N') { e.preventDefault(); window.conganote.newWindow(); return; }
+    if (cmd && shift && !alt && e.key === 'N') { e.preventDefault(); window.congacode.newWindow(); return; }
     // Cmd+O → Open file
     if (cmd && !shift && !alt && e.key === 'o') { e.preventDefault(); openFileDialog(); return; }
     // Cmd+Shift+O → Open folder
@@ -3454,7 +3472,7 @@ function initKeyboard() {
    21. IPC HANDLERS (from main process)
    ================================================================ */
 function initIpcHandlers() {
-  const api = window.conganote;
+  const api = window.congacode;
   // File menu
   api.on('file:new', () => createTab());
   api.on('file:open-dialog', () => openFileDialog());
@@ -3521,12 +3539,12 @@ function initDragDrop() {
     e.stopPropagation();
     for (const file of e.dataTransfer.files) {
       try {
-        const stats = await window.conganote.stat(file.path);
+        const stats = await window.congacode.stat(file.path);
         if (stats && stats.isDirectory) {
           await openFolder(file.path);
           return; // open first dropped folder and stop
         } else {
-          const content = await window.conganote.readFile(file.path);
+          const content = await window.congacode.readFile(file.path);
           await openFile(file.path, content);
         }
       } catch (err) { console.error('drag drop error:', err); }
@@ -3663,7 +3681,7 @@ function updateBreadcrumbs() {
     // Left-click: reveal folder in Finder / open file
     crumb.addEventListener('click', () => {
       if (!isLast) {
-        window.conganote.revealInFinder(segmentPath);
+        window.congacode.revealInFinder(segmentPath);
       }
     });
 
@@ -3704,10 +3722,10 @@ function initBreadcrumbContextMenu() {
 
     switch (action) {
       case 'bc-reveal-finder':
-        try { await window.conganote.revealInFinder(bcContextPath); } catch (err) { console.error(err); }
+        try { await window.congacode.revealInFinder(bcContextPath); } catch (err) { console.error(err); }
         break;
       case 'bc-open-terminal':
-        try { await window.conganote.openInTerminal(dirPath); } catch (err) { console.error(err); }
+        try { await window.congacode.openInTerminal(dirPath); } catch (err) { console.error(err); }
         break;
       case 'bc-copy-path':
         await navigator.clipboard.writeText(bcContextPath);
@@ -3729,10 +3747,10 @@ async function showImagePreview(filePath) {
   const ext = filePath.split('.').pop().toLowerCase();
   if (ext === 'svg') {
     // SVG can be loaded directly
-    const content = await window.conganote.readFile(filePath);
+    const content = await window.congacode.readFile(filePath);
     dom.imagePreviewImg.src = 'data:image/svg+xml;base64,' + btoa(content);
   } else {
-    const base64 = await window.conganote.readBinary(filePath);
+    const base64 = await window.congacode.readBinary(filePath);
     if (base64) {
       const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp', ico: 'image/x-icon', tiff: 'image/tiff', tif: 'image/tiff' };
       dom.imagePreviewImg.src = `data:${mime[ext] || 'image/png'};base64,${base64}`;
@@ -3741,7 +3759,7 @@ async function showImagePreview(filePath) {
 
   // Show file info
   try {
-    const stat = await window.conganote.stat(filePath);
+    const stat = await window.congacode.stat(filePath);
     const size = stat?.size || 0;
     const sizeStr = size > 1024*1024 ? (size/1024/1024).toFixed(1) + ' MB' : size > 1024 ? (size/1024).toFixed(1) + ' KB' : size + ' B';
     dom.imagePreviewInfo.textContent = `${filePath.split('/').pop()} — ${sizeStr}`;
@@ -3785,7 +3803,7 @@ async function updateMarkdownPreview() {
   }
   const content = tab.model.getValue();
   try {
-    const html = await window.conganote.renderMarkdown(content);
+    const html = await window.congacode.renderMarkdown(content);
     dom.markdownContent.innerHTML = html || '';
   } catch {
     dom.markdownContent.innerHTML = '<div class="outline-empty">Error rendering markdown</div>';
@@ -3948,7 +3966,7 @@ async function showFileHistoryInPanel(filePath) {
   dom.historyList.innerHTML = `<div class="history-empty">Loading git history for ${escHtml(name)}…</div>`;
 
   try {
-    const commits = await window.conganote.gitFileLog(state.folderPath, relPath, 50);
+    const commits = await window.congacode.gitFileLog(state.folderPath, relPath, 50);
     if (!commits || commits.length === 0) {
       dom.historyList.innerHTML = `<div class="history-empty">No git history for ${escHtml(name)}</div>`;
       return;
@@ -4011,31 +4029,32 @@ async function showFileHistoryInPanel(filePath) {
 
 async function showCommitDiff(absPath, relPath, commit) {
   try {
-    // Get file at this commit and its parent
-    const atCommit = await window.conganote.gitShowAt(state.folderPath, commit.fullHash, relPath);
-    const parentHash = commit.fullHash + '~1';
-    let atParent = await window.conganote.gitShowAt(state.folderPath, parentHash, relPath);
-    if (atParent == null) atParent = ''; // file didn't exist in parent (initial commit)
-    if (atCommit == null) {
-      showToast('Cannot load file at this commit', 'error', 3000);
+    // Fetch the file content at this commit
+    const content = await window.congacode.gitShowAt(
+      state.folderPath, commit.fullHash, relPath
+    );
+
+    if (content === null || content === undefined) {
+      showToast(`Cannot load file at commit ${commit.hash}`, 'error', 3000);
       return;
     }
 
-    const diffTitle = `${commit.hash} ↔ ${relPath.split('/').pop()}`;
-    const existingDiff = state.tabs.find(t => t.title === diffTitle);
-    if (existingDiff) { activateTab(existingDiff.id); return; }
+    const fileName = relPath.split('/').pop();
+    const viewTitle = `${commit.hash} — ${fileName}`;
+    const existingTab = state.tabs.find(t => t.title === viewTitle);
+    if (existingTab) { activateTab(existingTab.id); return; }
 
     const lang = guessLanguage(relPath);
-    const tab = createTab(diffTitle, null, '', lang);
+    const tab = createTab(viewTitle, null, '', lang);
     tab._isDiff = true;
-    tab._diffOriginal = atParent;
-    tab._diffModified = atCommit;
-    tab._diffLang = lang;
-    renderDiffEditor(tab);
-
-    showToast(`Showing changes in ${commit.hash}: ${commit.message.slice(0, 50)}`, 'info', 3000);
+    tab._isCommitDiff = true;
+    tab._commitContent = content;
+    tab._commitLang = lang;
+    tab._commitInfo = commit;
+    renderCommitViewer(tab);
   } catch (err) {
-    showToast(`Diff error: ${err.message}`, 'error', 3000);
+    console.error('[FileHistory] showCommitDiff error', err);
+    showToast(`Diff error: ${err.message}`, 'error', 5000);
   }
 }
 
@@ -4208,7 +4227,7 @@ function makeTabDraggable(el, tab) {
 let fileWatchDebounce = null;
 
 function initFileWatcher() {
-  window.conganote.on('watch:change', (data) => {
+  window.congacode.on('watch:change', (data) => {
     // Debounce tree refresh to avoid excessive updates
     clearTimeout(fileWatchDebounce);
     fileWatchDebounce = setTimeout(async () => {
@@ -4218,7 +4237,7 @@ function initFileWatcher() {
         const tab = state.tabs.find(t => t.filePath === data.path);
         if (tab && data.event === 'change') {
           try {
-            const content = await window.conganote.readFile(data.path);
+            const content = await window.congacode.readFile(data.path);
             if (content !== null && content !== tab.model.getValue()) {
               // File changed externally — update if not modified by user
               if (!tab.modified) {
@@ -4235,7 +4254,7 @@ function initFileWatcher() {
 
 async function startWatching(dirPath) {
   try {
-    await window.conganote.watchFolder(dirPath);
+    await window.congacode.watchFolder(dirPath);
   } catch (err) {
     console.error('startWatching error:', err);
   }
@@ -4243,7 +4262,7 @@ async function startWatching(dirPath) {
 
 async function stopWatching(dirPath) {
   try {
-    await window.conganote.unwatchFolder(dirPath);
+    await window.congacode.unwatchFolder(dirPath);
   } catch {}
 }
 
@@ -4259,7 +4278,7 @@ async function refreshGitStatus() {
     return;
   }
   try {
-    const status = await window.conganote.gitStatus(state.folderPath);
+    const status = await window.congacode.gitStatus(state.folderPath);
     state.gitStatus = status;
     if (status) {
       dom.statusGit.classList.remove('hidden');
@@ -4302,7 +4321,7 @@ function getGitBadge(filePath) {
    ================================================================ */
 async function loadSettings() {
   try {
-    state.settings = await window.conganote.readSettings();
+    state.settings = await window.congacode.readSettings();
   } catch {
     state.settings = {};
   }
@@ -4311,7 +4330,7 @@ async function loadSettings() {
 
 async function saveSettings(newSettings) {
   state.settings = { ...state.settings, ...newSettings };
-  await window.conganote.writeSettings(state.settings);
+  await window.congacode.writeSettings(state.settings);
 }
 
 function openSettingsTab() {
@@ -4575,7 +4594,7 @@ function showTerminal() {
   dom.terminalResizer.classList.remove('hidden');
   if (!state.terminalCwd) {
     state.terminalCwd = state.folderPath || '';
-    if (state.terminalCwd) window.conganote.terminalSetCwd(state.terminalCwd);
+    if (state.terminalCwd) window.congacode.terminalSetCwd(state.terminalCwd);
   }
   updateTerminalCwd();
   dom.terminalInput.focus();
@@ -4610,7 +4629,7 @@ async function runTerminalCommand(cmd) {
   dom.terminalInput.value = '';
   dom.terminalInput.disabled = true;
   try {
-    const result = await window.conganote.terminalRun(cmd);
+    const result = await window.congacode.terminalRun(cmd);
     if (result.clear) dom.terminalOutput.innerHTML = '';
     if (result.error) appendTerminalLine(result.error, 'term-error');
     if (result.cwd) {
@@ -4652,7 +4671,7 @@ function initTerminal() {
     }
     if (e.ctrlKey && e.key === 'c') {
       if (terminalRunning) {
-        window.conganote.terminalKill();
+        window.congacode.terminalKill();
         appendTerminalLine('^C', 'term-error');
       }
       return;
@@ -4680,7 +4699,7 @@ function initTerminal() {
   $('#btn-terminal-close').addEventListener('click', hideTerminal);
   $('#btn-terminal-clear').addEventListener('click', () => { dom.terminalOutput.innerHTML = ''; });
   $('#btn-terminal-kill').addEventListener('click', () => {
-    window.conganote.terminalKill();
+    window.congacode.terminalKill();
     appendTerminalLine('^C (killed)', 'term-error');
   });
   // Terminal resizer
@@ -4804,12 +4823,12 @@ async function showDiffForCurrentFile() {
 
 async function showDiffView(relPath, absPath) {
   try {
-    const original = await window.conganote.gitShow(state.folderPath, relPath);
+    const original = await window.congacode.gitShow(state.folderPath, relPath);
     if (original == null) {
       showToast('No previous version found (new file or not in git)', 'info', 3000);
       return;
     }
-    const current = await window.conganote.readFile(absPath);
+    const current = await window.congacode.readFile(absPath);
     if (current == null) return;
     const diffTitle = `\u2194 ${relPath.split('/').pop()}`;
     const existingDiff = state.tabs.find(t => t.title === diffTitle);
@@ -4825,27 +4844,112 @@ async function showDiffView(relPath, absPath) {
   }
 }
 
+// Render a read-only Monaco editor showing file content at a specific commit
+function renderCommitViewer(tab) {
+  dom.editorContainer.style.display = 'none';
+  hideSettingsUI();
+  hideImagePreview();
+  hideDiffEditor();
+  let commitContainer = $('#commit-viewer-container');
+  if (!commitContainer) {
+    commitContainer = document.createElement('div');
+    commitContainer.id = 'commit-viewer-container';
+    commitContainer.style.cssText = 'flex:1;display:flex;flex-direction:column;overflow:hidden;';
+    dom.editorSplitContainer.appendChild(commitContainer);
+  }
+  commitContainer.style.display = 'flex';
+  if (tab._commitEditor) { try { tab._commitEditor.dispose(); } catch {} tab._commitEditor = null; }
+  commitContainer.innerHTML = '';
+
+  // Commit info banner
+  if (tab._commitInfo) {
+    const ci = tab._commitInfo;
+    const d = new Date(ci.date);
+    const dateStr = d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const banner = document.createElement('div');
+    banner.className = 'diff-commit-banner';
+    banner.innerHTML = `
+      <div class="diff-commit-banner-row">
+        <span class="diff-commit-banner-hash">${escHtml(ci.hash)}</span>
+        <span class="diff-commit-banner-date">${escHtml(dateStr)}</span>
+      </div>
+      <div class="diff-commit-banner-msg">${escHtml(ci.message)}</div>
+      <div class="diff-commit-banner-author">by ${escHtml(ci.author)}</div>
+    `;
+    commitContainer.appendChild(banner);
+  }
+
+  const editorWrapper = document.createElement('div');
+  editorWrapper.style.cssText = 'flex:1;overflow:hidden;';
+  commitContainer.appendChild(editorWrapper);
+
+  const commitEditor = monaco.editor.create(editorWrapper, {
+    value: tab._commitContent || '',
+    language: tab._commitLang || 'plaintext',
+    theme: monacoThemeId(state.theme),
+    automaticLayout: true,
+    readOnly: true,
+    fontSize: state.editor.getOption(monaco.editor.EditorOption.fontSize),
+    fontFamily: "'SF Mono', Menlo, Monaco, 'Courier New', monospace",
+    scrollBeyondLastLine: false,
+    minimap: { enabled: false },
+  });
+  tab._commitEditor = commitEditor;
+}
+
+function hideCommitViewer() {
+  for (const t of state.tabs) {
+    if (t._commitEditor) { try { t._commitEditor.dispose(); } catch {} t._commitEditor = null; }
+  }
+  const c = $('#commit-viewer-container');
+  if (c) c.style.display = 'none';
+}
+
 function renderDiffEditor(tab) {
   dom.editorContainer.style.display = 'none';
   hideSettingsUI();
   hideImagePreview();
+  hideCommitViewer();
   let diffContainer = $('#diff-container');
   if (!diffContainer) {
     diffContainer = document.createElement('div');
     diffContainer.id = 'diff-container';
-    diffContainer.style.cssText = 'flex:1;overflow:hidden;';
+    diffContainer.style.cssText = 'flex:1;display:flex;flex-direction:column;overflow:hidden;';
     dom.editorSplitContainer.appendChild(diffContainer);
   }
-  diffContainer.style.display = '';
+  diffContainer.style.display = 'flex';
   if (tab._diffEditor) { try { tab._diffEditor.dispose(); } catch {} tab._diffEditor = null; }
   diffContainer.innerHTML = '';
+
+  // Commit info banner (only for commit diffs)
+  if (tab._commitInfo) {
+    const ci = tab._commitInfo;
+    const d = new Date(ci.date);
+    const dateStr = d.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const banner = document.createElement('div');
+    banner.className = 'diff-commit-banner';
+    banner.innerHTML = `
+      <div class="diff-commit-banner-row">
+        <span class="diff-commit-banner-hash">${escHtml(ci.hash)}</span>
+        <span class="diff-commit-banner-date">${escHtml(dateStr)}</span>
+      </div>
+      <div class="diff-commit-banner-msg">${escHtml(ci.message)}</div>
+      <div class="diff-commit-banner-author">by ${escHtml(ci.author)}</div>
+    `;
+    diffContainer.appendChild(banner);
+  }
+
+  const editorWrapper = document.createElement('div');
+  editorWrapper.style.cssText = 'flex:1;overflow:hidden;';
+  diffContainer.appendChild(editorWrapper);
+
   if (!tab._diffOriginalModel) tab._diffOriginalModel = monaco.editor.createModel(tab._diffOriginal, tab._diffLang);
   if (!tab._diffModifiedModel) tab._diffModifiedModel = monaco.editor.createModel(tab._diffModified, tab._diffLang);
-  const diffEditor = monaco.editor.createDiffEditor(diffContainer, {
+  const diffEditor = monaco.editor.createDiffEditor(editorWrapper, {
     theme: monacoThemeId(state.theme),
     automaticLayout: true,
     readOnly: true,
-    renderSideBySide: true,
+    renderSideBySide: false,
     fontSize: state.editor.getOption(monaco.editor.EditorOption.fontSize),
     fontFamily: "'SF Mono', Menlo, Monaco, 'Courier New', monospace",
     scrollBeyondLastLine: false,
@@ -4860,7 +4964,6 @@ function hideDiffEditor() {
   }
   const diffContainer = $('#diff-container');
   if (diffContainer) diffContainer.style.display = 'none';
-  dom.editorContainer.style.display = '';
 }
 
 /* ================================================================
@@ -4891,7 +4994,7 @@ async function loadBlameData() {
   const tab = state.tabs.find(t => t.id === state.activeTabId);
   if (!tab || !tab.filePath || !state.folderPath) { state.blameData = null; return; }
   try {
-    state.blameData = await window.conganote.gitBlame(state.folderPath, tab.filePath);
+    state.blameData = await window.congacode.gitBlame(state.folderPath, tab.filePath);
   } catch { state.blameData = null; }
 }
 
@@ -4993,8 +5096,8 @@ async function showGitInfoPopup() {
 
   // Fetch info & log in parallel
   const [info, commits] = await Promise.all([
-    window.conganote.gitInfo(state.folderPath).catch(() => null),
-    window.conganote.gitLog(state.folderPath, 10).catch(() => null),
+    window.congacode.gitInfo(state.folderPath).catch(() => null),
+    window.congacode.gitLog(state.folderPath, 10).catch(() => null),
   ]);
 
   if (!info) {
@@ -5401,6 +5504,112 @@ function initToolbarButtons() {
   $('#tbtn-todo')?.addEventListener('click', () => toggleToolPanel('todo-panel'));
   $('#tbtn-pomo')?.addEventListener('click', () => toggleToolPanel('pomo-panel'));
   $('#tbtn-diff')?.addEventListener('click', () => toggleToolPanel('diff-panel'));
+
+  // Kebab overflow menu
+  initKebabMenu();
+}
+
+function initKebabMenu() {
+  const kebabBtn = $('#tbtn-kebab');
+  const kebabMenu = $('#titlebar-kebab-menu');
+  if (!kebabBtn || !kebabMenu) return;
+
+  const toolDefs = [
+    { id: 'tbtn-api',        label: 'API Client',     shortcut: '⌃⇧A', panel: 'api-client-panel' },
+    { id: 'tbtn-regex',      label: 'Regex Tester',   shortcut: '⌃⇧R', panel: 'regex-panel' },
+    { id: 'tbtn-json',       label: 'JSON / YAML',    shortcut: '⌃⇧J', panel: 'json-viewer-panel', action: () => openJsonViewer() },
+    { id: 'tbtn-bookmarks',  label: 'Bookmarks',      shortcut: '⌃⇧B', panel: 'bookmarks-panel' },
+    { id: 'tbtn-screenshot', label: 'Screenshot',     shortcut: '⌃⇧S', panel: 'screenshot-panel', action: () => openScreenshotPanel() },
+    { id: 'tbtn-db',         label: 'Database',       shortcut: '⌃⇧D', panel: 'db-panel' },
+    { sep: true },
+    { id: 'tbtn-snippets',   label: 'Snippets',       shortcut: '⌃⇧E', panel: 'snippet-panel' },
+    { id: 'tbtn-color',      label: 'Color Picker',   shortcut: '⌃⇧K', panel: 'color-panel' },
+    { id: 'tbtn-todo',       label: 'TODO Tracker',   shortcut: '⌃⇧G', panel: 'todo-panel' },
+    { id: 'tbtn-pomo',       label: 'Pomodoro Timer', shortcut: '⌃⇧Y', panel: 'pomo-panel' },
+    { id: 'tbtn-diff',       label: 'Diff Checker',   shortcut: '⌃⇧I', panel: 'diff-panel' },
+  ];
+
+  // Build menu items
+  toolDefs.forEach(def => {
+    if (def.sep) {
+      const sep = document.createElement('div');
+      sep.className = 'titlebar-kebab-sep';
+      kebabMenu.appendChild(sep);
+      return;
+    }
+    const srcBtn = $(`#${def.id}`);
+    if (!srcBtn) return;
+
+    const item = document.createElement('button');
+    item.className = 'titlebar-kebab-item';
+    item.dataset.toolId = def.id;
+    // Clone the SVG icon from the original button
+    const iconSvg = srcBtn.querySelector('svg');
+    const clonedSvg = iconSvg ? iconSvg.cloneNode(true) : '';
+    if (clonedSvg) item.appendChild(clonedSvg);
+    const labelSpan = document.createElement('span');
+    labelSpan.textContent = def.label;
+    item.appendChild(labelSpan);
+    const kbdSpan = document.createElement('kbd');
+    kbdSpan.style.cssText = 'margin-left:auto;font-size:10px;color:var(--text-muted);font-family:inherit;';
+    kbdSpan.textContent = def.shortcut;
+    item.appendChild(kbdSpan);
+
+    item.addEventListener('click', () => {
+      kebabMenu.classList.add('hidden');
+      if (def.action) { def.action(); }
+      else { toggleToolPanel(def.panel); }
+    });
+
+    kebabMenu.appendChild(item);
+  });
+
+  // Toggle menu on kebab button click
+  kebabBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    // Sync active states
+    kebabMenu.querySelectorAll('.titlebar-kebab-item').forEach(item => {
+      const srcBtn = $(`#${item.dataset.toolId}`);
+      item.classList.toggle('active', srcBtn?.classList.contains('active'));
+    });
+    kebabMenu.classList.toggle('hidden');
+    // Position menu near kebab button
+    const rect = kebabBtn.getBoundingClientRect();
+    kebabMenu.style.top = rect.bottom + 4 + 'px';
+    kebabMenu.style.right = (window.innerWidth - rect.right) + 'px';
+  });
+
+  // Close menu on outside click
+  document.addEventListener('click', (e) => {
+    if (!kebabMenu.contains(e.target) && e.target !== kebabBtn) {
+      kebabMenu.classList.add('hidden');
+    }
+  });
+
+  // Detect overflow on resize — switch to kebab when tools would overlap
+  const toolsContainer = $('#titlebar-tools');
+  const titlebar = $('#titlebar');
+  function checkToolbarOverflow() {
+    // Temporarily show all buttons to measure
+    toolsContainer.classList.remove('tools-overflow');
+    kebabMenu.classList.add('hidden');
+    requestAnimationFrame(() => {
+      const titleEl = $('#titlebar-title');
+      const searchEl = $('#titlebar-search');
+      const pomoEl = $('#pomo-titlebar');
+      const titleRight = titleEl ? titleEl.getBoundingClientRect().right : 0;
+      const pomoRight = pomoEl && !pomoEl.classList.contains('hidden') ? pomoEl.getBoundingClientRect().right : titleRight;
+      const leftEdge = Math.max(titleRight, pomoRight) + 12;
+      const searchLeft = searchEl ? searchEl.getBoundingClientRect().left : window.innerWidth;
+      const toolsWidth = toolsContainer.scrollWidth;
+      const availableWidth = searchLeft - leftEdge - 16;
+      if (toolsWidth > availableWidth) {
+        toolsContainer.classList.add('tools-overflow');
+      }
+    });
+  }
+  window.addEventListener('resize', checkToolbarOverflow);
+  checkToolbarOverflow();
 }
 
 function initApiClient() {
@@ -5607,7 +5816,7 @@ async function sendApiRequest() {
   }
 
   try {
-    const res = await window.conganote.sendApiRequest({ method, url: fullUrl, headers, body });
+    const res = await window.congacode.sendApiRequest({ method, url: fullUrl, headers, body });
 
     // Status
     const statusEl = $('#api-response-status');
@@ -5839,7 +6048,7 @@ function flattenPostmanItems(items, folderPrefix = '') {
 
 async function importApiCollection() {
   try {
-    const paths = await window.conganote.openFileDialog();
+    const paths = await window.congacode.openFileDialog();
     if (!paths || paths.length === 0) return;
     // Only pick .json files
     const jsonPaths = paths.filter(p => p.endsWith('.json'));
@@ -5847,7 +6056,7 @@ async function importApiCollection() {
 
     let imported = 0;
     for (const fp of jsonPaths) {
-      const raw = await window.conganote.readFile(fp);
+      const raw = await window.congacode.readFile(fp);
       if (!raw) { showToast(`Could not read ${fp}`, 'error'); continue; }
       let data;
       try { data = JSON.parse(raw); } catch { showToast(`Invalid JSON: ${fp}`, 'error'); continue; }
@@ -5859,8 +6068,8 @@ async function importApiCollection() {
         state.apiCollections.push({ name, requests });
         imported += requests.length;
       }
-      // Detect format: CongaNote native export
-      else if (data._conganote && Array.isArray(data.collections)) {
+      // Detect format: CongaCode native export
+      else if (data._congacode && Array.isArray(data.collections)) {
         data.collections.forEach(col => {
           state.apiCollections.push({ name: col.name || 'Imported', requests: col.requests || [] });
           imported += (col.requests || []).length;
@@ -5922,9 +6131,9 @@ async function exportApiCollection() {
     const postmanCollection = buildPostmanExport(col);
     const json = JSON.stringify(postmanCollection, null, 2);
     const defaultName = col.name.replace(/[^a-zA-Z0-9_-]/g, '_') + '.postman_collection.json';
-    const savePath = await window.conganote.saveFileDialog(defaultName);
+    const savePath = await window.congacode.saveFileDialog(defaultName);
     if (!savePath) continue;
-    const ok = await window.conganote.writeFile(savePath, json);
+    const ok = await window.congacode.writeFile(savePath, json);
     if (ok) showToast(`Exported "${col.name}" successfully`, 'info');
     else showToast('Export failed', 'error');
   }
@@ -6382,7 +6591,7 @@ function initBookmarks() {
 
   clearBtn?.addEventListener('click', async () => {
     state.bookmarks = [];
-    await window.conganote.saveBookmarks([]);
+    await window.congacode.saveBookmarks([]);
     renderBookmarks();
     showToast('All bookmarks cleared', 'info');
   });
@@ -6393,7 +6602,7 @@ function initBookmarks() {
 
 async function loadBookmarks() {
   try {
-    state.bookmarks = await window.conganote.loadBookmarks() || [];
+    state.bookmarks = await window.congacode.loadBookmarks() || [];
   } catch { state.bookmarks = []; }
 }
 
@@ -6422,7 +6631,7 @@ function addLineBookmark() {
   };
 
   state.bookmarks.push(bookmark);
-  window.conganote.saveBookmarks(state.bookmarks);
+  window.congacode.saveBookmarks(state.bookmarks);
   renderBookmarks();
   showToast(`Bookmarked line ${line} in ${tab.title}`, 'info');
 }
@@ -6443,7 +6652,7 @@ function addFreeBookmark(text) {
   };
 
   state.bookmarks.push(bookmark);
-  window.conganote.saveBookmarks(state.bookmarks);
+  window.congacode.saveBookmarks(state.bookmarks);
   renderBookmarks();
   showToast('Bookmark added', 'info');
 }
@@ -6488,7 +6697,7 @@ function renderBookmarks() {
         activateTab(tab.id);
       } else if (b.filePath && !b.filePath.startsWith('Untitled')) {
         try {
-          const content = await window.conganote.readFile(b.filePath);
+          const content = await window.congacode.readFile(b.filePath);
           if (content != null) await openFile(b.filePath, content);
         } catch {}
       }
@@ -6508,7 +6717,7 @@ function renderBookmarks() {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       state.bookmarks.splice(+btn.dataset.idx, 1);
-      window.conganote.saveBookmarks(state.bookmarks);
+      window.congacode.saveBookmarks(state.bookmarks);
       renderBookmarks();
     });
   });
@@ -6586,7 +6795,7 @@ async function exportScreenshot() {
   const canvas = await renderScreenshotCanvas();
   if (!canvas) return;
   const dataUrl = canvas.toDataURL('image/png');
-  const saved = await window.conganote.saveScreenshot(dataUrl);
+  const saved = await window.congacode.saveScreenshot(dataUrl);
   if (saved) showToast('Screenshot saved to ' + saved, 'info');
 }
 
@@ -6659,7 +6868,7 @@ function renderScreenshotCanvas() {
       ctx.fillStyle = 'rgba(255,255,255,0.15)';
       ctx.font = '11px -apple-system, sans-serif';
       ctx.textAlign = 'right';
-      ctx.fillText('CongaNote', canvas.width - padding - 8, canvas.height - padding - 8);
+      ctx.fillText('CongaCode', canvas.width - padding - 8, canvas.height - padding - 8);
     }
 
     resolve(canvas);
@@ -6704,7 +6913,7 @@ function initDbClient() {
   });
 
   browseBtn?.addEventListener('click', async () => {
-    const files = await window.conganote.openFileDialog();
+    const files = await window.congacode.openFileDialog();
     if (files && files[0]) {
       state.dbFilePath = files[0];
       $('#db-filepath').textContent = files[0].split('/').pop();
@@ -6714,7 +6923,7 @@ function initDbClient() {
   openBtn?.addEventListener('click', async () => {
     if (!state.dbFilePath) { showToast('Select a file first', 'warning'); return; }
     try {
-      const result = await window.conganote.dbOpen(state.dbFilePath);
+      const result = await window.congacode.dbOpen(state.dbFilePath);
       if (!result.ok) { showToast(result.error, 'warning'); return; }
       state.dbType = result.type;
       state.dbTables = result.tables || [];
@@ -6767,7 +6976,7 @@ async function runDbQuery(tableName) {
   if (statusEl) statusEl.textContent = 'Running...';
   try {
     const start = Date.now();
-    const result = await window.conganote.dbQuery(state.dbFilePath, query, tableName || query);
+    const result = await window.congacode.dbQuery(state.dbFilePath, query, tableName || query);
     const elapsed = Date.now() - start;
     if (!result.ok) {
       if (statusEl) statusEl.textContent = 'Error: ' + result.error;

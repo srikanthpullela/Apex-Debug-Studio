@@ -1,10 +1,10 @@
 /**
- * CongaNote — Preload Script
+ * CongaCode — Preload Script
  * Secure IPC bridge with fs ops for context menus, global search, quick open, etc.
  */
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('conganote', {
+contextBridge.exposeInMainWorld('congacode', {
   // Dialogs
   openFileDialog: () => ipcRenderer.invoke('dialog:open-file'),
   openFolderDialog: () => ipcRenderer.invoke('dialog:open-folder'),
@@ -58,6 +58,7 @@ contextBridge.exposeInMainWorld('conganote', {
   gitShow: (dp, relPath) => ipcRenderer.invoke('git:show', dp, relPath),
   gitFileLog: (dp, relPath, count) => ipcRenderer.invoke('git:file-log', dp, relPath, count),
   gitShowAt: (dp, commitHash, relPath) => ipcRenderer.invoke('git:show-at', dp, commitHash, relPath),
+  gitCommitFileDiff: (dp, commitHash, relPath) => ipcRenderer.invoke('git:commit-file-diff', dp, commitHash, relPath),
 
   // Terminal
   terminalRun: (command) => ipcRenderer.invoke('terminal:run', command),

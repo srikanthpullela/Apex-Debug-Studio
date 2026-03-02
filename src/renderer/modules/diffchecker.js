@@ -1,5 +1,5 @@
 /* =============================================================
-   Diff Checker — module for CongaNote
+   Diff Checker — module for CongaCode
    Side-by-side or inline diff using Monaco's built-in diff editor
    ============================================================= */
 (function () {
