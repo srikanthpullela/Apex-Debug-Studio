@@ -88,7 +88,9 @@ import { CommandPalette, type PaletteCommand } from "./commandPalette";
 import { SplitView } from "./split";
 import { MacroEngine, type SavedMacro } from "./macros";
 import { PluginManager, PLUGIN_CMD_PREFIX, type AppBridge } from "./plugins/manager";
+import { SandboxRegistry, SANDBOX_CMD_PREFIX } from "./plugins/sandbox";
 import { builtinPlugins } from "./plugins/builtins";
+import { sandboxedPlugins } from "./plugins/samples/sandboxed";
 
 const THEME_META: Record<ThemeMode, { label: string; icon: typeof Sun }> = {
   light: { label: "Light", icon: Sun },
@@ -134,6 +136,7 @@ export class SplecApp {
   split!: SplitView;
   macros!: MacroEngine;
   plugins!: PluginManager;
+  sandbox!: SandboxRegistry;
   private docListeners = new Set<() => void>();
   private outlineVisible = false;
   private minimapOn = false;
@@ -212,8 +215,26 @@ export class SplecApp {
       body: document.querySelector<HTMLElement>("#plugin-dock-body")!,
       status: document.querySelector<HTMLElement>("#plugin-status")!,
     });
+    // Untrusted (third-party-style) plugins run in an isolated iframe sandbox.
+    this.sandbox = new SandboxRegistry(
+      sandboxedPlugins,
+      {
+        getActiveText: () => this.host.view.state.doc.toString(),
+        setActiveText: (text) => this.setActiveDocText(text),
+        getSelection: () => {
+          const s = this.host.view.state.selection.main;
+          return { from: s.from, to: s.to, text: this.host.view.state.sliceDoc(s.from, s.to) };
+        },
+        replaceSelection: (text) => {
+          this.host.view.dispatch(this.host.view.state.replaceSelection(text));
+          this.host.focus();
+        },
+        notify: (msg) => this.setMessage(msg),
+      },
+      () => this.renderMenuPlugins(),
+    );
+    await this.sandbox.init();
     this.wireManagers();
-
     this.renderThemeButton(this.mode);
     this.renderToolbarIcons();
     this.wireChrome();
@@ -755,7 +776,12 @@ export class SplecApp {
       title: e.title,
       run: () => this.runMenuAction(e.act),
     }));
-    return [...base, ...macroCmds, ...pluginCmds];
+    const sandboxCmds = this.sandbox.commandEntries().map((e) => ({
+      id: e.act,
+      title: e.title,
+      run: () => this.runMenuAction(e.act),
+    }));
+    return [...base, ...macroCmds, ...pluginCmds, ...sandboxCmds];
   }
 
   // ---- Theme ---------------------------------------------------------------
@@ -1048,6 +1074,8 @@ export class SplecApp {
       default:
         if (act.startsWith(PLUGIN_CMD_PREFIX)) {
           this.plugins.runCommand(act);
+        } else if (act.startsWith(SANDBOX_CMD_PREFIX)) {
+          this.sandbox.runCommand(act);
         } else if (act.startsWith("macroplay:")) {
           this.macros.playMacro(act.slice("macroplay:".length));
         }
@@ -1145,7 +1173,7 @@ export class SplecApp {
     const wrap = document.querySelector<HTMLElement>("#menu-plugins");
     if (!wrap) return;
     wrap.replaceChildren();
-    const cmds = this.plugins.commandEntries();
+    const cmds = [...this.plugins.commandEntries(), ...this.sandbox.commandEntries()];
     if (cmds.length === 0) {
       const empty = document.createElement("div");
       empty.className = "menu-empty";
@@ -1389,6 +1417,51 @@ export class SplecApp {
           list.textContent = names.join(", ");
           card.append(list);
         }
+      }
+      wrap.append(card);
+    }
+
+    // Untrusted (sandboxed) plugins.
+    for (const p of this.sandbox.list()) {
+      const card = document.createElement("div");
+      card.className = "plugin-card";
+
+      const head = document.createElement("div");
+      head.className = "plugin-card-head";
+      const title = document.createElement("span");
+      title.className = "plugin-card-name";
+      title.textContent = p.name;
+      const badge = document.createElement("span");
+      badge.className = "plugin-badge";
+      badge.textContent = "sandboxed";
+      title.append(" ", badge);
+      const toggle = document.createElement("label");
+      toggle.className = "switch";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = p.enabled;
+      checkbox.addEventListener("change", () => {
+        void this.sandbox.setEnabled(p.id, checkbox.checked).then(() => this.renderPluginsList());
+      });
+      const track = document.createElement("span");
+      track.className = "switch-track";
+      toggle.append(checkbox, track);
+      head.append(title, toggle);
+
+      const desc = document.createElement("p");
+      desc.className = "plugin-card-desc";
+      desc.textContent = p.description;
+      card.append(head, desc);
+
+      if (p.enabled && p.commands.length) {
+        const meta = document.createElement("p");
+        meta.className = "plugin-card-contrib";
+        meta.textContent = `Contributes: ${p.commands.length} command(s)`;
+        card.append(meta);
+        const list = document.createElement("div");
+        list.className = "plugin-card-cmds";
+        list.textContent = p.commands.map((c) => c.title).join(", ");
+        card.append(list);
       }
       wrap.append(card);
     }
