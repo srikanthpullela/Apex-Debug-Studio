@@ -25,21 +25,35 @@ src/plugins/
     jsontools.ts    # sample: JSON pretty‑print / sort‑keys / minify commands
 ```
 
+### Two plugin tiers
+
+Splec Note supports **two** kinds of plugins:
+
+1. **Trusted, bundled plugins** (`builtins.ts`) run in the app's webview realm
+   via `PluginManager`. They use the synchronous `host` API and can render DOM
+   panels directly. These are first-party, vetted code.
+2. **Untrusted, sandboxed plugins** (`samples/sandboxed.ts`, managed by
+   `SandboxRegistry`) run inside a `<iframe sandbox="allow-scripts">` with **no**
+   `allow-same-origin`, so they load in an opaque ("null") origin and **cannot
+   reach the parent DOM, host globals, `localStorage`, or the Tauri IPC bridge**.
+   Their only channel is `postMessage`, brokered by the host against a minimal,
+   **async** API. A runtime self-test disables any sandbox that can see the parent
+   realm. This is the isolation boundary for third-party code.
+
 On launch, `PluginManager` reads `builtins.ts`, and for every plugin that is
-**enabled** (the default), calls its `activate(host)` once. Enable/disable state
-persists via `tauri-plugin-store` (key `pluginStates`) and is editable from
-**Preferences → Macros & Plugins → Manage plugins…**.
+**enabled** (the default), calls its `activate(host)` once. `SandboxRegistry`
+likewise loads each enabled sandboxed plugin into its own iframe. Enable/disable
+state persists via `tauri-plugin-store` (keys `pluginStates` / `sandboxStates`)
+and is editable from **Preferences → Macros & Plugins → Manage plugins…** (where
+sandboxed plugins are marked with a `sandboxed` badge).
 
-### Why bundled rather than dynamically loaded from disk?
+### Trusted (in-realm) vs. sandboxed loading
 
-Loading arbitrary `.js` files from a user folder and `eval`/dynamic‑importing
-them is exactly the unrestricted‑escape risk Phase 6 is meant to avoid. Because
-a plugin runs in the same webview realm as the app, true isolation of *untrusted*
-third‑party code requires a Web Worker or sandboxed `<iframe>` with `postMessage`
-— which can't directly render DOM panels. For Phase 6 we therefore load **vetted,
-bundled** plugins and keep the hard security boundary at Tauri's capability
-system (below). A vetted dynamic loader (Worker/iframe host + explicit capability
-grants) is noted as future hardening.
+Loading arbitrary `.js` from a user folder into the app realm and `eval`-ing it
+is an unrestricted-escape risk. Trusted bundled plugins accept that they are
+first-party code; **untrusted plugins must go through the iframe sandbox**, whose
+async host bridge guarantees they never touch the host realm. Sandboxed plugins
+render panels inside their own iframe document, not the host DOM.
 
 ---
 
@@ -56,10 +70,14 @@ There are two layers:
    object. It exposes document text, selection, simple UI slots, namespaced
    storage, and notifications — and nothing else. No `fs`, no `fetch`, no
    `invoke`, no `window` handed in.
+3. **The iframe sandbox (for untrusted plugins).** Sandboxed plugins additionally
+   run in a null-origin `<iframe sandbox="allow-scripts">`, so even
+   *deliberately* malicious code cannot reach the parent realm, host DOM or Tauri
+   bridge — it can only call the async `host` methods over `postMessage`.
 
-> Bundled samples are trusted code. The model above is what keeps a *misbehaving*
-> plugin from escalating; it is not a guarantee against deliberately malicious
-> same‑realm code, which is why third‑party loading is deferred (see above).
+> Bundled samples are trusted code. Layers 1–2 keep a *misbehaving* trusted
+> plugin from escalating; layer 3 (the iframe sandbox) is what contains
+> deliberately malicious third-party code.
 
 ---
 
@@ -152,9 +170,18 @@ Adds three **commands** — *JSON: Pretty‑Print*, *JSON: Sort Keys*, *JSON: Mi
 `setActiveText` and `notify` (it reports invalid JSON instead of corrupting the
 document).
 
+### Text Kit — sandboxed (`samples/sandboxed.ts`)
+An **untrusted** sample loaded through the iframe sandbox. Registers
+*Markdown → HTML*, *ROT13 selection* and *Reverse selection*. Demonstrates the
+async `host` API over `postMessage` (`registerCommand`, `registerTransform`,
+`getActiveText`/`setActiveText`, `getSelection`/`replaceSelection`, `notify`) and
+proves the isolation boundary: the iframe cannot reach the parent realm.
+
 ---
 
 ## 5. Adding a plugin
+
+### Trusted, bundled plugin
 
 1. Create `src/plugins/samples/myplugin.ts`:
 
@@ -188,11 +215,37 @@ document).
 3. Run the app — your command appears in the palette and the **Plugins** menu,
    and the plugin shows up in **Manage plugins…** with an enable/disable toggle.
 
+### Untrusted, sandboxed plugin
+
+Sandboxed plugins are provided as a **source string** evaluated inside the
+iframe, where a global `host` exposes the **async** API (every method returns a
+Promise). Define it in `src/plugins/samples/<name>.ts` as a `SandboxPluginSource`
+and add it to `sandboxedPlugins`:
+
+```ts
+import type { SandboxPluginSource } from "../sandbox";
+
+export const myUntrusted: SandboxPluginSource = {
+  id: "myuntrusted",
+  name: "My Untrusted Plugin",
+  description: "Runs fully isolated in an iframe.",
+  source: `
+    host.registerTransform({
+      id: "shout", title: "Shout selection", scope: "selection",
+      transform: function (t) { return t.toUpperCase() + "!"; }
+    });
+  `,
+};
+```
+
+The host bridge services its calls; it never receives `window`, `document`, the
+Tauri bridge, or any host global.
+
 ---
 
-## 6. Notes for Phase 7+
+## 6. Possible future work
 
-- Dynamic, vetted loading of third‑party plugins from a user folder (Worker/
-  iframe sandbox + explicit per‑plugin capability grants).
+- Loading sandboxed plugins from a user folder (the iframe boundary already makes
+  this safe; only a discovery/install UI is missing).
 - A richer panel lifecycle (visibility events, persisted active panel).
 - Optional contribution points: editor decorations, language providers.

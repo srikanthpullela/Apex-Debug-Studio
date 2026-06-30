@@ -78,6 +78,14 @@ tauri-plugin-autostart (https://github.com/tauri-apps/plugins-workspace)
    Dual-licensed under the Apache License 2.0 and the MIT License.
    Used to implement the "Open at login" preference (launch at sign-in).
 
+tauri-plugin-updater / tauri-plugin-process
+   Copyright (c) 2017 - Present Tauri Apps Contributors.
+   Dual-licensed under the Apache License 2.0 and the MIT License.
+   Used for auto-update checks/installation and app relaunch.
+
+Other bundled Tauri plugins (store, fs, dialog, window-state) are likewise
+Copyright (c) Tauri Apps Contributors, dual-licensed Apache-2.0 / MIT.
+
 
 -------------------------------------------------------------------------------
 Editor libraries
