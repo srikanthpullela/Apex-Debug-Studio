@@ -1,141 +1,53 @@
 {
-  "name": "congacode",
-  "productName": "CongaCode",
-  "version": "1.0.0",
-  "description": "CongaCode — A modern text editor with auto-save, session persistence, and powerful editing features.",
-  "main": "src/main/main.js",
-  "scripts": {
-    "start": "electron .",
-    "dev": "NODE_ENV=development electron .",
-    "build": "electron-builder --mac",
-    "build:all": "electron-builder --mac --win"
-  },
-  "author": "CongaCode",
+  "name": "splec-note",
+  "productName": "Splec Note",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Splec Note — a lightweight, distinctive cross-platform text & code editor for notes and code.",
+  "type": "module",
   "license": "MIT",
-  "devDependencies": {
-    "electron": "^28.1.0",
-    "electron-builder": "^24.9.1"
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
   },
   "dependencies": {
-    "chokidar": "^3.5.3",
-    "marked": "^17.0.3",
-    "monaco-editor": "^0.45.0",
-    "simple-git": "^3.32.3"
+    "@codemirror/commands": "^6.6.0",
+    "@codemirror/lang-cpp": "^6.0.2",
+    "@codemirror/lang-css": "^6.3.0",
+    "@codemirror/lang-go": "^6.0.1",
+    "@codemirror/lang-html": "^6.4.9",
+    "@codemirror/lang-java": "^6.0.1",
+    "@codemirror/lang-javascript": "^6.2.2",
+    "@codemirror/lang-json": "^6.0.1",
+    "@codemirror/lang-markdown": "^6.3.0",
+    "@codemirror/lang-php": "^6.0.1",
+    "@codemirror/lang-python": "^6.1.6",
+    "@codemirror/lang-rust": "^6.0.1",
+    "@codemirror/lang-sql": "^6.7.1",
+    "@codemirror/lang-xml": "^6.1.0",
+    "@codemirror/lang-yaml": "^6.1.1",
+    "@codemirror/language": "^6.10.2",
+    "@codemirror/legacy-modes": "^6.4.1",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.4.1",
+    "@codemirror/view": "^6.30.0",
+    "@lezer/highlight": "^1.2.1",
+    "@replit/codemirror-indentation-markers": "^6.5.3",
+    "@replit/codemirror-minimap": "^0.5.2",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-autostart": "^2.5.1",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-fs": "^2",
+    "@tauri-apps/plugin-store": "^2",
+    "@tauri-apps/plugin-window-state": "^2",
+    "codemirror": "^6.0.1",
+    "lucide": "^0.456.0"
   },
-  "build": {
-    "appId": "com.congacode.app",
-    "productName": "CongaCode",
-    "asar": true,
-    "directories": {
-      "output": "dist"
-    },
-    "files": [
-      "**/*",
-      "!dist/**",
-      "!build/**",
-      "!.git/**",
-      "!.gitignore",
-      "!README.md",
-      "!CONGACODE.md",
-      "!.nvmrc",
-      "!node_modules/monaco-editor/dev/**",
-      "!node_modules/monaco-editor/esm/**",
-      "!node_modules/monaco-editor/min-maps/**",
-      "!node_modules/electron/**",
-      "!node_modules/electron-builder/**",
-      "!node_modules/app-builder-bin/**",
-      "!node_modules/7zip-bin/**",
-      "!node_modules/typescript/**"
-    ],
-    "asarUnpack": [
-      "node_modules/monaco-editor/min/**"
-    ],
-    "mac": {
-      "category": "public.app-category.developer-tools",
-      "icon": "build/icon.icns",
-      "target": [
-        "dmg",
-        "zip"
-      ],
-      "darkModeSupport": true
-    },
-    "dmg": {
-      "title": "CongaCode",
-      "icon": "build/icon.icns",
-      "contents": [
-        {
-          "x": 130,
-          "y": 220
-        },
-        {
-          "x": 410,
-          "y": 220,
-          "type": "link",
-          "path": "/Applications"
-        }
-      ],
-      "window": {
-        "width": 540,
-        "height": 380
-      }
-    },
-    "win": {
-      "icon": "build/icon.ico",
-      "target": [
-        "nsis",
-        "zip"
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "installerIcon": "build/icon.ico",
-      "uninstallerIcon": "build/icon.ico",
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
-    },
-    "fileAssociations": [
-      {
-        "ext": [
-          "txt",
-          "md",
-          "json",
-          "js",
-          "ts",
-          "jsx",
-          "tsx",
-          "py",
-          "rb",
-          "go",
-          "rs",
-          "java",
-          "c",
-          "cpp",
-          "h",
-          "hpp",
-          "css",
-          "scss",
-          "html",
-          "htm",
-          "xml",
-          "yaml",
-          "yml",
-          "toml",
-          "sql",
-          "sh",
-          "bash",
-          "zsh",
-          "php",
-          "swift",
-          "kt",
-          "scala",
-          "lua",
-          "r",
-          "dart"
-        ],
-        "name": "Source Code",
-        "role": "Editor"
-      }
-    ]
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
   }
 }

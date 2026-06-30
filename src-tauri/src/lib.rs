@@ -4,6 +4,9 @@
 mod search;
 mod session;
 
+#[cfg(target_os = "macos")]
+mod menu;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut builder = tauri::Builder::default()
@@ -21,6 +24,15 @@ pub fn run() {
                 MacosLauncher::LaunchAgent,
                 None,
             ));
+    }
+
+    // Native menu bar (macOS): required for standard Edit shortcuts (Cmd+A/C/V)
+    // to reach the webview, and provides the full app menu.
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .menu(|app| menu::build(app))
+            .on_menu_event(|app, event| menu::on_event(app, event.id().0.as_str()));
     }
 
     builder

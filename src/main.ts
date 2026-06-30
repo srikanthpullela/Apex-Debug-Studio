@@ -5,22 +5,27 @@
 import "./styles.css";
 import {
   AppWindow,
+  Command,
   FilePlus,
   FileX,
+  FileSearch,
   FolderOpen,
   Menu,
   Monitor,
   Moon,
   Redo2,
+  Replace,
   Save,
   SaveAll,
+  Search,
   Settings,
   Sun,
   Undo2,
+  WrapText,
   createElement,
   type IconNode,
 } from "lucide";
-import { redo, undo } from "@codemirror/commands";
+import { redo, selectAll, undo } from "@codemirror/commands";
 import { selectNextOccurrence } from "@codemirror/search";
 import { EditorHost, countText } from "./editorHost";
 import * as T from "./transforms";
@@ -59,7 +64,7 @@ import { renderTabs } from "./tabs";
 import { renderEmptyState } from "./emptystate";
 import { loadPrefs, savePrefs, type Prefs } from "./prefs";
 import { loadRecent } from "./recent";
-import { isAutostartEnabled, setAutostart } from "./backend";
+import { isAutostartEnabled, isTauri, setAutostart } from "./backend";
 import { FileOps } from "./fileops";
 import { SessionManager } from "./session";
 import {
@@ -213,6 +218,7 @@ export class SplecApp {
     this.renderToolbarIcons();
     this.wireChrome();
     this.wireKeyboard();
+    this.wireNativeMenu();
     this.wirePrefsModal();
     this.statusBar.setWhitespaceOn(this.prefs.showWhitespace);
 
@@ -437,11 +443,20 @@ export class SplecApp {
 
   refreshStatus(): void {
     const buf = this.store.active();
+    const pathEl = document.querySelector<HTMLElement>("#doc-path");
+    const wrapBtn = document.querySelector<HTMLElement>("#act-wrap");
+    if (wrapBtn) wrapBtn.classList.toggle("is-on", this.prefs.wordWrap);
     if (!buf) {
       this.statusBar.setEnabled(false);
+      if (pathEl) pathEl.textContent = "";
       return;
     }
     this.statusBar.setEnabled(true);
+    if (pathEl) {
+      pathEl.textContent = buf.path ?? buf.title;
+      pathEl.title = buf.path ?? buf.title;
+      pathEl.classList.toggle("is-unsaved", !buf.path);
+    }
     const info = this.host.cursorInfo();
     const { words, chars } = countText(this.docText(buf));
     this.statusBar.update({
@@ -822,6 +837,11 @@ export class SplecApp {
     ico("#act-close", FileX);
     ico("#act-undo", Undo2);
     ico("#act-redo", Redo2);
+    ico("#act-find", Search);
+    ico("#act-replace", Replace);
+    ico("#act-findfiles", FileSearch);
+    ico("#act-wrap", WrapText);
+    ico("#act-palette", Command);
     ico("#act-newwin", AppWindow);
 
     const menuSlot = document.querySelector<HTMLElement>("#menu-toggle .icon-slot");
@@ -854,6 +874,11 @@ export class SplecApp {
       this.host.focus();
     });
     document.querySelector("#act-newwin")?.addEventListener("click", () => void this.session.openCleanWindow());
+    document.querySelector("#act-find")?.addEventListener("click", () => this.find.open("find"));
+    document.querySelector("#act-replace")?.addEventListener("click", () => this.find.open("replace"));
+    document.querySelector("#act-findfiles")?.addEventListener("click", () => this.findFiles.open());
+    document.querySelector("#act-wrap")?.addEventListener("click", () => this.runMenuAction("wrap"));
+    document.querySelector("#act-palette")?.addEventListener("click", () => this.palette.open());
     document.querySelector("#tab-new")?.addEventListener("click", () => this.newBuffer());
     document.querySelector("#settings-toggle")?.addEventListener("click", () => this.openPrefs());
 
@@ -962,6 +987,11 @@ export class SplecApp {
       }
       case "newWindow": void this.session.openCleanWindow(); break;
       case "prefs": this.openPrefs(); break;
+      // Edit — history & selection (driven from the native macOS menu so the
+      // shortcuts route to CodeMirror's history rather than the webview's.)
+      case "undo": run(undo); break;
+      case "redo": run(redo); break;
+      case "selectAll": run(selectAll); break;
       // Search
       case "find": this.find.open("find"); break;
       case "replace": this.find.open("replace"); break;
@@ -1588,6 +1618,27 @@ export class SplecApp {
     const overlay = document.querySelector<HTMLElement>("#prefs-overlay");
     if (overlay) overlay.hidden = true;
     this.host.focus();
+  }
+
+  // ---- Native menu (macOS) -------------------------------------------------
+
+  /** Listen for native menu selections emitted from the Rust backend. */
+  private wireNativeMenu(): void {
+    if (!isTauri()) return;
+    void import("@tauri-apps/api/event").then(({ listen }) => {
+      void listen<string>("splec-menu", (event) => {
+        const act = event.payload;
+        if (act === "helpWebsite") {
+          this.openWebsite();
+          return;
+        }
+        this.runMenuAction(act);
+      });
+    });
+  }
+
+  private openWebsite(): void {
+    window.open("https://splecdevelopers.com", "_blank");
   }
 
   // ---- Keyboard ------------------------------------------------------------

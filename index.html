@@ -18,7 +18,7 @@
             </span>
           </div>
 
-          <div class="toolbar" role="toolbar" aria-label="File actions">
+          <div class="toolbar" role="toolbar" aria-label="Editor actions">
             <button id="act-new" class="tbtn" type="button" title="New Note  ⌘T" aria-label="New Note"></button>
             <button id="act-open" class="tbtn" type="button" title="Open…  ⌘O" aria-label="Open file"></button>
             <button id="act-save" class="tbtn" type="button" title="Save  ⌘S" aria-label="Save"></button>
@@ -28,8 +28,19 @@
             <button id="act-undo" class="tbtn" type="button" title="Undo  ⌘Z" aria-label="Undo"></button>
             <button id="act-redo" class="tbtn" type="button" title="Redo  ⇧⌘Z" aria-label="Redo"></button>
             <span class="tbar-sep" aria-hidden="true"></span>
+            <button id="act-find" class="tbtn" type="button" title="Find  ⌘F" aria-label="Find"></button>
+            <button id="act-replace" class="tbtn" type="button" title="Replace  ⌘H" aria-label="Replace"></button>
+            <button id="act-findfiles" class="tbtn" type="button" title="Find in Files  ⇧⌘F" aria-label="Find in Files"></button>
+            <span class="tbar-sep" aria-hidden="true"></span>
+            <button id="act-wrap" class="tbtn" type="button" title="Word Wrap" aria-label="Toggle word wrap"></button>
+            <button id="act-palette" class="tbtn" type="button" title="Command Palette  ⇧⌘P" aria-label="Command palette"></button>
+            <span class="tbar-sep" aria-hidden="true"></span>
             <button id="act-newwin" class="tbtn" type="button" title="New Window  ⇧⌘N" aria-label="New window"></button>
           </div>
+        </div>
+
+        <div class="titlebar-center">
+          <span id="doc-path" class="doc-path" aria-live="polite"></span>
         </div>
 
         <div class="titlebar-actions">
