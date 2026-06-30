@@ -2,13 +2,13 @@
 // unsaved-changes guard. Real file IO goes through the Rust backend commands.
 
 import {
-  confirmDialog,
   openFileDialog,
   readTextFile,
   saveFileDialog,
   writeTextFile,
   deleteBackup,
 } from "./backend";
+import { confirm } from "./confirm";
 import { baseName } from "./buffers";
 import { languageIdForFilename } from "./languages";
 import { addRecent } from "./recent";
@@ -109,20 +109,24 @@ export class FileOps {
     const buf = this.app.store.get(id);
     if (!buf) return;
     if (buf.dirty) {
-      const ok = await confirmDialog(
-        `"${buf.title}" has unsaved changes. Close without saving?`,
+      const ok = await confirm(
+        `"${buf.title}" has unsaved changes. If you close it now those changes will be lost.`,
+        { title: "Close without saving?", okLabel: "Close Without Saving", cancelLabel: "Keep Editing", danger: true },
       );
       if (!ok) return;
     }
+    const wasActive = this.app.store.activeIdValue() === id;
     const backup = buf.backup;
     this.app.store.remove(id);
     if (backup) void deleteBackup(backup).catch(() => {});
 
-    const nextActive = this.app.store.activeIdValue();
-    if (nextActive) {
-      await this.app.activate(nextActive);
+    if (wasActive) {
+      // The editor still shows the just-closed buffer; switch onto the
+      // neighbour the store promoted to active (or fall back to empty state).
+      await this.app.showActive();
     } else {
-      this.app.refreshAll();
+      // Active buffer is unchanged — only the tab strip needs to re-render.
+      this.app.refreshTabs();
     }
     this.app.scheduleAutosave();
   }

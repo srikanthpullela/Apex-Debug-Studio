@@ -36,12 +36,21 @@ export function renderTabs(
     const close = document.createElement("button");
     close.className = "tab-close";
     close.type = "button";
+    close.draggable = false;
     close.setAttribute("aria-label", `Close ${buf.title}`);
     close.textContent = "✕";
-    close.addEventListener("click", (e) => {
+    // A draggable parent can otherwise swallow the click as a drag start, so
+    // intercept pointer events on the close button and act on pointerdown.
+    const doClose = (e: Event) => {
+      e.preventDefault();
       e.stopPropagation();
       handlers.onClose(buf.id);
+    };
+    close.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
     });
+    close.addEventListener("mousedown", (e) => e.stopPropagation());
+    close.addEventListener("click", doClose);
 
     tab.append(dot, title, close);
 

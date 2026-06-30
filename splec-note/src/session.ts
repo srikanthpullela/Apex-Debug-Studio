@@ -7,7 +7,6 @@
 import {
   autosaveBackup,
   cleanupBackups,
-  confirmDialog,
   isTauri,
   loadSession,
   readTextFile,
@@ -16,6 +15,7 @@ import {
   type ManifestTab,
   type SessionManifest,
 } from "./backend";
+import { confirm } from "./confirm";
 import { baseName } from "./buffers";
 import type { SplecApp } from "./main";
 
@@ -33,6 +33,7 @@ export class SessionManager {
 
   scheduleAutosave(): void {
     if (!isTauri()) return;
+    if (!this.app.prefs.autosave) return;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = window.setTimeout(() => {
       this.timer = null;
@@ -58,6 +59,7 @@ export class SessionManager {
 
   private async doAutosave(): Promise<void> {
     if (!isTauri()) return;
+    if (!this.app.prefs.autosave) return;
     this.app.syncActiveState();
     const buffers = this.app.store.list();
     // Mirror each buffer's content to its backup file (atomic in the backend).
@@ -173,9 +175,9 @@ export class SessionManager {
       }
       if (!changed) continue;
       const name = baseName(buf.path);
-      const reload = await confirmDialog(
-        `"${name}" changed on disk since you last edited it.\n\n` +
-          `Reload the file from disk? (Cancel keeps your current editor copy.)`,
+      const reload = await confirm(
+        `"${name}" changed on disk since you last edited it. Reload it from disk, or keep the copy you have open here?`,
+        { title: "File changed on disk", okLabel: "Reload from Disk", cancelLabel: "Keep My Copy" },
       );
       if (reload) {
         try {

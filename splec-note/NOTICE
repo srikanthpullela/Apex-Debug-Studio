@@ -67,3 +67,13 @@ Brand assets
 The Splec "S" mark and the "Splec" / "Splec Note" wordmarks are brand assets of
 Splec Developers (https://splecdevelopers.com) and are not covered by the
 open-source license of this repository.
+
+
+-------------------------------------------------------------------------------
+Tauri plugins
+-------------------------------------------------------------------------------
+
+tauri-plugin-autostart (https://github.com/tauri-apps/plugins-workspace)
+   Copyright (c) 2017 - Present Tauri Apps Contributors.
+   Dual-licensed under the Apache License 2.0 and the MIT License.
+   Used to implement the "Open at login" preference (launch at sign-in).

@@ -3,7 +3,24 @@
 // and wires the tab strip, status bar, menu, keyboard shortcuts and empty state.
 
 import "./styles.css";
-import { createElement, FilePlus, FolderOpen, Menu, Monitor, Moon, Save, Sun } from "lucide";
+import {
+  AppWindow,
+  FilePlus,
+  FileX,
+  FolderOpen,
+  Menu,
+  Monitor,
+  Moon,
+  Redo2,
+  Save,
+  SaveAll,
+  Settings,
+  Sun,
+  Undo2,
+  createElement,
+  type IconNode,
+} from "lucide";
+import { redo, undo } from "@codemirror/commands";
 import { EditorHost, countText } from "./editorHost";
 import {
   BufferStore,
@@ -22,6 +39,7 @@ import { renderTabs } from "./tabs";
 import { renderEmptyState } from "./emptystate";
 import { loadPrefs, savePrefs, type Prefs } from "./prefs";
 import { loadRecent } from "./recent";
+import { isAutostartEnabled, setAutostart } from "./backend";
 import { FileOps } from "./fileops";
 import { SessionManager } from "./session";
 import {
@@ -102,10 +120,10 @@ export class SplecApp {
     this.wireKeyboard();
     this.wirePrefsModal();
 
-    // Restore previous session unless launched as a clean window.
+    // Restore previous session unless launched as a clean window or disabled.
     const cleanWindow = new URLSearchParams(location.search).get("new") === "1";
     let restored = false;
-    if (!cleanWindow) {
+    if (!cleanWindow && this.prefs.restoreSession) {
       restored = await this.session.restore();
     }
     if (!restored && this.store.count() === 0) {
@@ -167,6 +185,25 @@ export class SplecApp {
     const buf = this.store.get(id);
     if (!buf) return;
     this.store.setActive(id);
+    if (!buf.state) buf.state = this.host.createState("", []);
+    const langExt = await loadLanguageExtension(buf.language);
+    this.host.show(buf.state, langExt, buf.scrollTop);
+    this.host.focus();
+    this.refreshAll();
+  }
+
+  /**
+   * Show whichever buffer is currently active in the store, with no
+   * short-circuit. Used after closing the active tab: the store has already
+   * moved `activeId` to a neighbour, so we must force the editor + tab strip
+   * to re-render onto that buffer (plain `activate` would early-return).
+   */
+  async showActive(): Promise<void> {
+    const buf = this.store.active();
+    if (!buf) {
+      this.refreshAll();
+      return;
+    }
     if (!buf.state) buf.state = this.host.createState("", []);
     const langExt = await loadLanguageExtension(buf.language);
     this.host.show(buf.state, langExt, buf.scrollTop);
@@ -353,46 +390,75 @@ export class SplecApp {
 
   private renderThemeButton(mode: ThemeMode): void {
     const slot = document.querySelector<HTMLElement>("#theme-toggle .icon-slot");
-    const label = document.querySelector<HTMLElement>("#theme-label");
     const button = document.querySelector<HTMLButtonElement>("#theme-toggle");
     const meta = THEME_META[mode];
     if (slot) slot.replaceChildren(createElement(meta.icon));
-    if (label) label.textContent = meta.label;
     if (button) {
-      button.setAttribute(
-        "aria-label",
-        `Theme: ${meta.label}. Click to switch to ${THEME_META[nextMode(mode)].label}.`,
-      );
+      const tip = `Theme: ${meta.label} — click for ${THEME_META[nextMode(mode)].label}`;
+      button.setAttribute("aria-label", tip);
+      button.setAttribute("title", tip);
     }
+    // Keep the Preferences segmented control in sync if it's mounted.
+    document.querySelectorAll<HTMLButtonElement>("#pref-theme .seg").forEach((seg) => {
+      const on = seg.dataset.mode === mode;
+      seg.classList.toggle("is-active", on);
+      seg.setAttribute("aria-checked", String(on));
+    });
   }
 
   private renderToolbarIcons(): void {
-    const menuSlot = document.querySelector<HTMLElement>("#menu-toggle .icon-slot");
-    if (menuSlot) menuSlot.replaceChildren(createElement(Menu));
-    const ico = (sel: string, icon: typeof Sun) => {
+    const ico = (sel: string, icon: IconNode) => {
       const el = document.querySelector<HTMLButtonElement>(sel);
-      if (el) el.prepend(createElement(icon));
+      if (el) el.replaceChildren(createElement(icon));
     };
     ico("#act-new", FilePlus);
     ico("#act-open", FolderOpen);
     ico("#act-save", Save);
+    ico("#act-saveas", SaveAll);
+    ico("#act-close", FileX);
+    ico("#act-undo", Undo2);
+    ico("#act-redo", Redo2);
+    ico("#act-newwin", AppWindow);
+
+    const menuSlot = document.querySelector<HTMLElement>("#menu-toggle .icon-slot");
+    if (menuSlot) menuSlot.replaceChildren(createElement(Menu));
+    const settingsSlot = document.querySelector<HTMLElement>("#settings-toggle .icon-slot");
+    if (settingsSlot) settingsSlot.replaceChildren(createElement(Settings));
   }
 
   // ---- Chrome wiring -------------------------------------------------------
 
   private wireChrome(): void {
     document.querySelector("#theme-toggle")?.addEventListener("click", () => {
-      const mode = nextMode(this.mode);
-      this.setMode(mode);
-      void saveThemeMode(mode);
+      this.chooseMode(nextMode(this.mode));
     });
 
     document.querySelector("#act-new")?.addEventListener("click", () => this.newBuffer());
     document.querySelector("#act-open")?.addEventListener("click", () => void this.fileOps.openDialog());
     document.querySelector("#act-save")?.addEventListener("click", () => void this.fileOps.save());
+    document.querySelector("#act-saveas")?.addEventListener("click", () => void this.fileOps.saveAs());
+    document.querySelector("#act-close")?.addEventListener("click", () => {
+      const a = this.store.active();
+      if (a) void this.fileOps.close(a.id);
+    });
+    document.querySelector("#act-undo")?.addEventListener("click", () => {
+      undo(this.host.view);
+      this.host.focus();
+    });
+    document.querySelector("#act-redo")?.addEventListener("click", () => {
+      redo(this.host.view);
+      this.host.focus();
+    });
+    document.querySelector("#act-newwin")?.addEventListener("click", () => void this.session.openCleanWindow());
     document.querySelector("#tab-new")?.addEventListener("click", () => this.newBuffer());
+    document.querySelector("#settings-toggle")?.addEventListener("click", () => this.openPrefs());
 
     this.wireMenu();
+  }
+
+  private chooseMode(mode: ThemeMode): void {
+    this.setMode(mode);
+    void saveThemeMode(mode);
   }
 
   private wireMenu(): void {
@@ -480,21 +546,47 @@ export class SplecApp {
       if (e.target === e.currentTarget) this.closePrefs();
     });
 
+    // Appearance — theme segmented control.
+    document.querySelectorAll<HTMLButtonElement>("#pref-theme .seg").forEach((seg) => {
+      seg.addEventListener("click", () => {
+        const mode = seg.dataset.mode as ThemeMode;
+        if (mode) this.chooseMode(mode);
+      });
+    });
+
     const font = document.querySelector<HTMLInputElement>("#pref-font");
     const tab = document.querySelector<HTMLSelectElement>("#pref-tab");
     const wrap = document.querySelector<HTMLInputElement>("#pref-wrap");
+    const restore = document.querySelector<HTMLInputElement>("#pref-restore");
+    const autosave = document.querySelector<HTMLInputElement>("#pref-autosave");
     const apply = () => {
       this.applyPrefs({
+        ...this.prefs,
         fontSize: Number(font?.value ?? this.prefs.fontSize),
         tabSize: Number(tab?.value ?? this.prefs.tabSize),
         wordWrap: Boolean(wrap?.checked),
         defaultLanguage: langSel?.value ?? this.prefs.defaultLanguage,
+        restoreSession: restore ? restore.checked : this.prefs.restoreSession,
+        autosave: autosave ? autosave.checked : this.prefs.autosave,
       });
     };
     font?.addEventListener("change", apply);
     tab?.addEventListener("change", apply);
     wrap?.addEventListener("change", apply);
     langSel?.addEventListener("change", apply);
+    restore?.addEventListener("change", apply);
+    autosave?.addEventListener("change", apply);
+
+    // Open at login is handled by the OS via the autostart plugin; reflect the
+    // real resulting state back into the checkbox.
+    const login = document.querySelector<HTMLInputElement>("#pref-login");
+    login?.addEventListener("change", () => {
+      void (async () => {
+        const result = await setAutostart(login.checked);
+        login.checked = result;
+        this.applyPrefs({ ...this.prefs, openAtLogin: result });
+      })();
+    });
   }
 
   private openPrefs(): void {
@@ -504,7 +596,15 @@ export class SplecApp {
     document.querySelector<HTMLSelectElement>("#pref-tab")!.value = String(this.prefs.tabSize);
     document.querySelector<HTMLInputElement>("#pref-wrap")!.checked = this.prefs.wordWrap;
     document.querySelector<HTMLSelectElement>("#pref-lang")!.value = this.prefs.defaultLanguage;
+    document.querySelector<HTMLInputElement>("#pref-restore")!.checked = this.prefs.restoreSession;
+    document.querySelector<HTMLInputElement>("#pref-autosave")!.checked = this.prefs.autosave;
+    this.renderThemeButton(this.mode); // syncs the segmented control
     overlay.hidden = false;
+    // Reflect the OS-level autostart state (may differ from saved pref).
+    void (async () => {
+      const login = document.querySelector<HTMLInputElement>("#pref-login");
+      if (login) login.checked = await isAutostartEnabled();
+    })();
   }
 
   private closePrefs(): void {

@@ -108,3 +108,27 @@ export async function confirmDialog(message: string, title = "Splec Note"): Prom
   const { ask } = await import("@tauri-apps/plugin-dialog");
   return ask(message, { title, kind: "warning" });
 }
+
+// ---- Launch at login (via plugin-autostart) ------------------------------
+
+export async function isAutostartEnabled(): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+    return await isEnabled();
+  } catch {
+    return false;
+  }
+}
+
+export async function setAutostart(enabled: boolean): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    const mod = await import("@tauri-apps/plugin-autostart");
+    if (enabled) await mod.enable();
+    else await mod.disable();
+    return await mod.isEnabled();
+  } catch {
+    return false;
+  }
+}

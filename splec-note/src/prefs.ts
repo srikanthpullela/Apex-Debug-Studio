@@ -8,6 +8,12 @@ export interface Prefs {
   tabSize: number;
   wordWrap: boolean;
   defaultLanguage: string;
+  /** Continuously mirror buffers to backups (the "never lose work" engine). */
+  autosave: boolean;
+  /** Reopen the previous session (incl. unsaved untitled tabs) on launch. */
+  restoreSession: boolean;
+  /** Launch Splec Note automatically when you log in. */
+  openAtLogin: boolean;
 }
 
 export const DEFAULT_PREFS: Prefs = {
@@ -15,6 +21,9 @@ export const DEFAULT_PREFS: Prefs = {
   tabSize: 2,
   wordWrap: false,
   defaultLanguage: "plaintext",
+  autosave: true,
+  restoreSession: true,
+  openAtLogin: false,
 };
 
 const STORE_FILE = "splec-settings.json";
@@ -44,6 +53,10 @@ function sanitize(p: Partial<Prefs> | null | undefined): Prefs {
   merged.fontSize = Math.min(28, Math.max(10, Math.round(merged.fontSize)));
   merged.tabSize = Math.min(8, Math.max(1, Math.round(merged.tabSize)));
   merged.wordWrap = Boolean(merged.wordWrap);
+  merged.autosave = merged.autosave === undefined ? true : Boolean(merged.autosave);
+  merged.restoreSession =
+    merged.restoreSession === undefined ? true : Boolean(merged.restoreSession);
+  merged.openAtLogin = Boolean(merged.openAtLogin);
   if (typeof merged.defaultLanguage !== "string") merged.defaultLanguage = "plaintext";
   return merged;
 }

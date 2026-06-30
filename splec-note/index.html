@@ -13,35 +13,34 @@
       <header class="titlebar">
         <div class="titlebar-left">
           <div class="brand" title="Splec Note">
-            <span class="brand-mark" aria-hidden="true">
-              <svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
-                <defs>
-                  <linearGradient id="brandStroke" x1="150" y1="120" x2="360" y2="400" gradientUnits="userSpaceOnUse">
-                    <stop offset="0" stop-color="#9db4ff" />
-                    <stop offset="1" stop-color="#7c5cff" />
-                  </linearGradient>
-                </defs>
-                <path
-                  d="M338 168 C300 132 232 130 204 160 C176 190 196 232 246 252 C306 276 332 308 318 344 C302 384 226 392 182 356"
-                  fill="none" stroke="url(#brandStroke)" stroke-width="34"
-                  stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            </span>
             <span class="wordmark">
               <span class="wordmark-splec">Splec</span><span class="wordmark-note">Note</span>
             </span>
           </div>
 
-          <div class="toolbar">
-            <button id="act-new" class="tool-btn" type="button" title="New Note (Cmd/Ctrl+T)">New</button>
-            <button id="act-open" class="tool-btn" type="button" title="Open… (Cmd/Ctrl+O)">Open</button>
-            <button id="act-save" class="tool-btn" type="button" title="Save (Cmd/Ctrl+S)">Save</button>
+          <div class="toolbar" role="toolbar" aria-label="File actions">
+            <button id="act-new" class="tbtn" type="button" title="New Note  ⌘T" aria-label="New Note"></button>
+            <button id="act-open" class="tbtn" type="button" title="Open…  ⌘O" aria-label="Open file"></button>
+            <button id="act-save" class="tbtn" type="button" title="Save  ⌘S" aria-label="Save"></button>
+            <button id="act-saveas" class="tbtn" type="button" title="Save As…  ⇧⌘S" aria-label="Save As"></button>
+            <button id="act-close" class="tbtn" type="button" title="Close Tab  ⌘W" aria-label="Close tab"></button>
+            <span class="tbar-sep" aria-hidden="true"></span>
+            <button id="act-undo" class="tbtn" type="button" title="Undo  ⌘Z" aria-label="Undo"></button>
+            <button id="act-redo" class="tbtn" type="button" title="Redo  ⇧⌘Z" aria-label="Redo"></button>
+            <span class="tbar-sep" aria-hidden="true"></span>
+            <button id="act-newwin" class="tbtn" type="button" title="New Window  ⇧⌘N" aria-label="New window"></button>
           </div>
         </div>
 
         <div class="titlebar-actions">
+          <button id="theme-toggle" class="icon-btn icon-only" type="button" aria-label="Toggle theme" title="Theme">
+            <span class="icon-slot" aria-hidden="true"></span>
+          </button>
+          <button id="settings-toggle" class="icon-btn icon-only" type="button" aria-label="Preferences" title="Preferences  ⌘,">
+            <span class="icon-slot" aria-hidden="true"></span>
+          </button>
           <div class="menu-wrap">
-            <button id="menu-toggle" class="icon-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Menu">
+            <button id="menu-toggle" class="icon-btn icon-only" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Menu" title="Menu">
               <span class="icon-slot" aria-hidden="true"></span>
             </button>
             <div id="app-menu" class="menu" role="menu" hidden>
@@ -59,11 +58,6 @@
               <button class="menu-item" data-act="prefs" role="menuitem">Preferences…<span class="menu-key">⌘,</span></button>
             </div>
           </div>
-
-          <button id="theme-toggle" class="icon-btn" type="button" aria-label="Toggle theme">
-            <span class="icon-slot" aria-hidden="true"></span>
-            <span id="theme-label" class="icon-btn-label">Light</span>
-          </button>
         </div>
       </header>
 
@@ -102,34 +96,84 @@
     </div>
 
     <div id="prefs-overlay" class="modal-overlay" hidden>
-      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="prefs-title">
-        <div class="modal-head">
-          <h2 id="prefs-title" class="modal-title">
-            <span class="wordmark-splec">Splec</span> Preferences
-          </h2>
-          <button id="prefs-close" class="icon-btn" type="button" aria-label="Close">✕</button>
+      <div class="prefs" role="dialog" aria-modal="true" aria-labelledby="prefs-title">
+        <div class="prefs-head">
+          <h2 id="prefs-title" class="prefs-title">Preferences</h2>
+          <button id="prefs-close" class="prefs-close" type="button" aria-label="Close">✕</button>
         </div>
-        <div class="modal-body">
-          <label class="field">
-            <span class="field-label">Font size</span>
-            <input id="pref-font" class="field-input" type="number" min="10" max="28" step="1" />
-          </label>
-          <label class="field">
-            <span class="field-label">Tab size</span>
-            <select id="pref-tab" class="field-input">
-              <option value="2">2</option>
-              <option value="4">4</option>
-              <option value="8">8</option>
-            </select>
-          </label>
-          <label class="field field-row">
-            <span class="field-label">Word wrap</span>
-            <input id="pref-wrap" type="checkbox" />
-          </label>
-          <label class="field">
-            <span class="field-label">Default new-file language</span>
-            <select id="pref-lang" class="field-input"></select>
-          </label>
+        <div class="prefs-body">
+          <section class="prefs-group">
+            <h3 class="prefs-group-title">Appearance</h3>
+            <div class="prefs-card">
+              <div class="prefs-row">
+                <span class="prefs-row-label">Theme</span>
+                <div id="pref-theme" class="segmented" role="radiogroup" aria-label="Theme">
+                  <button class="seg" type="button" data-mode="light" role="radio">Light</button>
+                  <button class="seg" type="button" data-mode="dark" role="radio">Dark</button>
+                  <button class="seg" type="button" data-mode="system" role="radio">System</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="prefs-group">
+            <h3 class="prefs-group-title">Editor</h3>
+            <div class="prefs-card">
+              <div class="prefs-row">
+                <span class="prefs-row-label">Font size</span>
+                <input id="pref-font" class="prefs-input prefs-num" type="number" min="10" max="28" step="1" />
+              </div>
+              <div class="prefs-row">
+                <span class="prefs-row-label">Tab size</span>
+                <select id="pref-tab" class="prefs-input">
+                  <option value="2">2 spaces</option>
+                  <option value="4">4 spaces</option>
+                  <option value="8">8 spaces</option>
+                </select>
+              </div>
+              <div class="prefs-row">
+                <span class="prefs-row-label">Word wrap</span>
+                <label class="switch"><input id="pref-wrap" type="checkbox" /><span class="switch-track"></span></label>
+              </div>
+              <div class="prefs-row">
+                <span class="prefs-row-label">Default new-file language</span>
+                <select id="pref-lang" class="prefs-input"></select>
+              </div>
+            </div>
+          </section>
+
+          <section class="prefs-group">
+            <h3 class="prefs-group-title">Session</h3>
+            <div class="prefs-card">
+              <div class="prefs-row">
+                <span class="prefs-row-label">
+                  Reopen unsaved items on launch
+                  <span class="prefs-row-help">Restores every tab — including unsaved notes — exactly as you left them.</span>
+                </span>
+                <label class="switch"><input id="pref-restore" type="checkbox" /><span class="switch-track"></span></label>
+              </div>
+              <div class="prefs-row">
+                <span class="prefs-row-label">
+                  Autosave (never lose work)
+                  <span class="prefs-row-help">Continuously mirrors open buffers to a backup store.</span>
+                </span>
+                <label class="switch"><input id="pref-autosave" type="checkbox" /><span class="switch-track"></span></label>
+              </div>
+            </div>
+          </section>
+
+          <section class="prefs-group">
+            <h3 class="prefs-group-title">General</h3>
+            <div class="prefs-card">
+              <div class="prefs-row">
+                <span class="prefs-row-label">
+                  Open at login
+                  <span class="prefs-row-help">Launch Splec Note automatically when you sign in.</span>
+                </span>
+                <label class="switch"><input id="pref-login" type="checkbox" /><span class="switch-track"></span></label>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
     </div>

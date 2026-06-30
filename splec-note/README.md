@@ -35,14 +35,21 @@ Vite**, and the **CodeMirror 6** editor engine.
   and switchable from the status-bar picker.
 - **Recent files** (persisted) surfaced in the menu and on the empty-state start
   screen.
-- **Preferences** (persisted): theme, font size, tab size, word wrap, and the
-  default new-file language. Light mode stays the default.
+- **Compact icon toolbar** (Notepad++-style): New, Open, Save, Save As, Close,
+  Undo, Redo and New Window as tightly-grouped icon buttons with tooltips.
+- **Native-style Preferences panel** (persisted), grouped into sections:
+  - *Appearance* — Light / Dark / System theme (segmented control).
+  - *Editor* — font size, tab size, word wrap, default new-file language.
+  - *Session* — reopen unsaved items on launch, autosave on/off.
+  - *General* — open at login (via `tauri-plugin-autostart`).
+  Light mode stays the default.
 - **Deliberate Splec design system** — not a generic VS Code clone:
   - Brand purple `#7c5cff`, periwinkle `#9db4ff`, dark canvas `#06070d`.
   - Bundled fonts (no hot-linking): **Dancing Script** (the *Splec* logotype),
     **Space Grotesk** (display/UI headings), **Inter** (UI body), **JetBrains
     Mono** (editor).
-  - Rounded panels/tabs, soft depth, the Splec "S" mark + wordmark.
+  - Rounded panels/tabs, soft depth, and the *Splec Note* wordmark in the
+    header (the script-"S" mark lives in the app icon and start screen).
 - **Light / Dark / System theming.** Light is the default; dark uses the
   `#06070d` Splec canvas. Your choice is persisted via `tauri-plugin-store` and
   survives restarts.

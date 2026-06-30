@@ -10,10 +10,16 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init());
 
-    // window-state is desktop-only.
+    // window-state and autostart are desktop-only.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        builder = builder.plugin(tauri_plugin_window_state::Builder::new().build());
+        use tauri_plugin_autostart::MacosLauncher;
+        builder = builder
+            .plugin(tauri_plugin_window_state::Builder::new().build())
+            .plugin(tauri_plugin_autostart::init(
+                MacosLauncher::LaunchAgent,
+                None,
+            ));
     }
 
     builder
