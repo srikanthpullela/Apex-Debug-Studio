@@ -4,9 +4,10 @@ A lightweight, distinctive cross-platform text & code editor — great for **bot
 note-taking and coding**. Built with **Tauri 2** (Rust + web), **TypeScript +
 Vite**, and the **CodeMirror 6** editor engine.
 
-> **Phase 0 scaffold.** This is the foundation: project setup, design system,
-> branding, theming, and a single working editor pane. File operations, tabs,
-> session persistence, find/replace, etc. arrive in later phases.
+> **Phases 0–2.** Scaffold + design system + branding (Phase 0), a tabbed
+> multi-document editor with full file operations (Phase 1), and a
+> "never lose work" session-persistence engine (Phase 2). Find/replace and
+> later features arrive in subsequent phases.
 
 <p>
   <img src="../branding/source-assets/apple-touch-icon.png" width="72" alt="Splec mark" />
@@ -15,9 +16,27 @@ Vite**, and the **CodeMirror 6** editor engine.
 ## Highlights
 
 - **Native-feeling, small footprint** via Tauri (no Chromium bundle).
+- **Tabbed multi-document editing.** Multiple buffers, each a tab with a dirty
+  dot (●), close button, drag-to-reorder, and a Splec-purple active indicator.
+  `+` / `Cmd-T` for a new note, `Cmd-W` to close (guarded), `Cmd-Tab` to cycle.
+- **Full file operations** through Tauri `fs`/`dialog`: New, Open (native
+  multi-select), Save, Save As, Close — each tab tracks its real path, language,
+  encoding (UTF-8), and EOL, with an unsaved-changes guard on close/quit.
+- **Never lose work (session persistence).** Every open buffer — *including
+  unsaved, untitled scratch notes* — is continuously mirrored to a backup file
+  in the app data dir, and an ordered manifest records tab order, cursor,
+  selection and scroll. On relaunch (or after a crash) every tab is rebuilt
+  exactly, with the previously active tab reselected. Implemented in the Rust
+  backend with **atomic writes** (temp file + rename) and a forced flush on quit.
 - **CodeMirror 6** editor: line numbers, active-line highlight, bracket
-  matching, undo/history, and syntax highlighting for **Markdown / JavaScript /
-  TypeScript / JSON** (switchable from the status bar).
+  matching, undo/history, word-wrap toggle, and lazy-loaded syntax highlighting
+  for **20+ languages** (JS/TS/JSON/Markdown/HTML/CSS/Python/Rust/C-C++/Go/Java/
+  PHP/SQL/YAML/XML/shell/Ruby/TOML/Lua/Swift/…), auto-detected by file extension
+  and switchable from the status-bar picker.
+- **Recent files** (persisted) surfaced in the menu and on the empty-state start
+  screen.
+- **Preferences** (persisted): theme, font size, tab size, word wrap, and the
+  default new-file language. Light mode stays the default.
 - **Deliberate Splec design system** — not a generic VS Code clone:
   - Brand purple `#7c5cff`, periwinkle `#9db4ff`, dark canvas `#06070d`.
   - Bundled fonts (no hot-linking): **Dancing Script** (the *Splec* logotype),
@@ -29,6 +48,18 @@ Vite**, and the **CodeMirror 6** editor engine.
   survives restarts.
 - **Plugins wired:** `store`, `window-state`, `fs`, `dialog` (with capability
   permissions in `src-tauri/capabilities/default.json`).
+
+## Keyboard shortcuts
+
+| Action | Shortcut |
+| --- | --- |
+| New note | `Cmd/Ctrl-T` or `Cmd/Ctrl-N` |
+| Open file(s) | `Cmd/Ctrl-O` |
+| Save / Save As | `Cmd/Ctrl-S` / `Cmd/Ctrl-Shift-S` |
+| Close tab (guarded) | `Cmd/Ctrl-W` |
+| Cycle tabs | `Cmd/Ctrl-Tab` / `Cmd/Ctrl-Shift-Tab` |
+| New (clean) window | `Cmd/Ctrl-Shift-N` |
+| Preferences | `Cmd/Ctrl-,` |
 
 ## Prerequisites
 
@@ -83,21 +114,63 @@ npx tauri icon ../branding/splec-icon-1024.png
 
 ```
 splec-note/
-├─ index.html              # app shell (titlebar, tabstrip, editor, statusbar)
+├─ index.html              # app shell (titlebar, tabstrip, editor, statusbar, modals)
 ├─ src/
-│  ├─ main.ts              # wires editor + theme toggle + language picker
-│  ├─ editor.ts            # CodeMirror 6 setup + brand light/dark syntax themes
+│  ├─ main.ts              # SplecApp orchestrator: buffers, tabs, chrome, shortcuts
+│  ├─ editorHost.ts        # one CodeMirror view + per-buffer state; brand syntax themes
+│  ├─ buffers.ts           # Buffer model + BufferStore (ordering, active tab)
+│  ├─ tabs.ts              # tab strip rendering (dirty dot, close, drag-reorder)
+│  ├─ fileops.ts           # New/Open/Save/Save As/Close + unsaved-changes guard
+│  ├─ session.ts           # autosave debounce/flush, restore-on-launch, reconcile
+│  ├─ backend.ts           # typed wrappers around the Rust commands + dialogs
+│  ├─ languages.ts         # lazy-loaded language packs + extension detection
+│  ├─ statusbar.ts         # line/col, language, encoding, EOL, word/char counts
+│  ├─ emptystate.ts        # branded start screen (New Note / Open / recent)
+│  ├─ prefs.ts             # preferences (font size, tab size, wrap, default lang)
+│  ├─ recent.ts            # recent-files list (persisted)
 │  ├─ theme.ts             # Light/Dark/System modes, persisted via plugin-store
 │  ├─ styles.css           # design tokens + app chrome (both themes)
 │  ├─ fonts.css            # @font-face for the bundled fonts
 │  └─ assets/fonts/        # locally bundled woff2 files
 ├─ src-tauri/
-│  ├─ src/lib.rs           # Tauri builder + plugin registration
+│  ├─ src/lib.rs           # Tauri builder + plugin & command registration
+│  ├─ src/session.rs       # session/backup engine (atomic IO + unit tests)
 │  ├─ tauri.conf.json      # app config, bundle targets (mac + win), icons
 │  ├─ capabilities/        # permission grants for the main window
 │  └─ icons/               # generated icon set
 └─ NOTICE                  # font + icon attributions
 ```
+
+## Session persistence (on-disk layout)
+
+Everything lives under the OS app-data dir for `com.splec.note`
+(macOS: `~/Library/Application Support/com.splec.note/`):
+
+```
+com.splec.note/
+├─ session.json                       # ordered manifest of open tabs (+ active id)
+└─ AutoSave/
+   └─ YYYY-MM-DD/                      # dated subfolders, like Notepad++/CongaCode
+      ├─ <buffer-id>.txt              # live mirror of one buffer (named OR untitled)
+      └─ …
+```
+
+- The frontend owns the manifest *shape*; the Rust backend treats it as opaque
+  JSON, so the two stay decoupled. Each manifest tab records: real path (or
+  `null` for untitled), backup path, language, encoding, EOL, dirty flag, cursor
+  & selection offsets, and scroll position.
+- **Autosave** debounces ~500 ms after edits and also flushes on tab switch,
+  window blur, visibility change, and app quit (the close request is intercepted
+  to force a final flush). **All backend writes are atomic** (temp file +
+  rename), so a crash mid-write can't corrupt a backup.
+- **Restore-on-launch** rebuilds every tab from the manifest + backups —
+  including untitled buffers that were never saved — restoring cursor/scroll and
+  reselecting the previously active tab. `File ▸ New Window` (`Cmd-Shift-N`)
+  opens a clean window that skips restore (`?new=1`).
+- **External-change detection:** on launch, real files whose on-disk mtime
+  changed since last edit prompt *reload vs. keep your editor copy* — never a
+  silent discard. A retention policy (default 14 days) prunes old untitled
+  backups so storage doesn't grow unbounded.
 
 ## License
 
