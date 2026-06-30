@@ -235,6 +235,9 @@ export class SplecApp {
     this.session.startAutosaveLifecycle();
     void this.session.cleanup();
 
+    // Silent, production-only update check (no-op without a release server).
+    void this.checkForUpdates(false);
+
     watchSystemTheme(
       () => this.mode,
       (sys) => this.setMode("system", sys),
@@ -1644,6 +1647,10 @@ export class SplecApp {
           this.openWebsite();
           return;
         }
+        if (act === "checkUpdates") {
+          void this.checkForUpdates(true);
+          return;
+        }
         this.runMenuAction(act);
       });
     });
@@ -1651,6 +1658,34 @@ export class SplecApp {
 
   private openWebsite(): void {
     window.open("https://splecdevelopers.com", "_blank");
+  }
+
+  /**
+   * Check the configured updater endpoint for a newer release. Silent on
+   * startup (prod only); when invoked manually it reports "up to date".
+   * Network/endpoint errors are swallowed so a missing release server never
+   * disrupts the editor.
+   */
+  async checkForUpdates(manual = false): Promise<void> {
+    if (!isTauri()) {
+      if (manual) this.setMessage("Updates are only available in the desktop app.");
+      return;
+    }
+    if (!manual && !import.meta.env.PROD) return;
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check();
+      if (update) {
+        this.setMessage(`Update available: v${update.version}. Downloading…`);
+        await update.downloadAndInstall();
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        await relaunch();
+      } else if (manual) {
+        this.setMessage("Splec Note is up to date.");
+      }
+    } catch (err) {
+      if (manual) this.setMessage(`Update check failed: ${String(err)}`);
+    }
   }
 
   // ---- Keyboard ------------------------------------------------------------

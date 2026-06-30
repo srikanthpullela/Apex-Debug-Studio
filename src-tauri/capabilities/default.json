@@ -8,6 +8,8 @@
     "store:default",
     "dialog:default",
     "autostart:default",
+    "updater:default",
+    "process:default",
     {
       "identifier": "fs:default",
       "allow": [

@@ -39,10 +39,37 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "txt", "text", "log", "md", "markdown", "mdown", "json", "jsonc",
+          "js", "mjs", "cjs", "jsx", "ts", "tsx", "py", "pyw", "rb", "go",
+          "rs", "java", "c", "h", "cpp", "cc", "cxx", "hpp", "hh", "cs",
+          "php", "css", "scss", "sass", "less", "html", "htm", "xml", "svg",
+          "yaml", "yml", "toml", "ini", "cfg", "conf", "sql", "sh", "bash",
+          "zsh", "swift", "kt", "kts", "lua", "pl", "r", "dart", "vue",
+          "svelte", "csv", "tsv", "env", "gitignore", "dockerfile", "make"
+        ],
+        "name": "Splec Note Document",
+        "description": "Text or source file opened with Splec Note",
+        "role": "Editor"
+      }
+    ],
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
         "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlFMEUyMjk0QkRDOEEzMjcKUldRbm84aTlsQ0lPbnFlQUt1b21CdzA4UXlmU012cWdDWDd2eE5EY3A0M3Fkdkx6c1NTMkxFQ2kK",
+      "endpoints": [
+        "https://splecdevelopers.com/splec-note/updates/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }
