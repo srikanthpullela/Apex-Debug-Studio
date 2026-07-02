@@ -56,6 +56,10 @@ const debugState = {
   orgQueryCache: new Map(),    // normalized SOQL string → { records, error, soql }
   orgRunning: false,           // True while the entry method is executing in the org
   orgActivity: null,           // Parsed result of the last "Run in Org" execution
+  // Replay mode — step through a recorded org execution (from the debug log)
+  replayMode: false,           // When true, step controls walk the recorded timeline
+  replayTimeline: [],          // Array of recorded steps { file, line, depth, frames }
+  replayIndex: 0,              // Current position in the timeline
 };
 
 /* ================================================================
@@ -1116,6 +1120,9 @@ function stopDebugSession() {
   debugState.paused = false;
   debugState.callStack = [];
   debugState.stepMode = null;
+  debugState.replayMode = false;
+  debugState.replayTimeline = [];
+  debugState.replayIndex = 0;
   clearCurrentLineHighlight();
   hideDebugUI();
   addConsoleEntry('info', '⏹ Debug session ended');
@@ -1416,6 +1423,65 @@ function parseApexLog(log) {
   return out;
 }
 
+/** Best-effort: ensure the running user has a FINEST trace flag so the org emits
+ *  STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT events (needed for line-by-line replay).
+ *  Uses the Tooling API. Trace flags auto-expire; they are debug-logging setup only
+ *  and never touch business data. Returns true if a flag is in place. */
+async function ensureFinestLogging(orgAlias) {
+  const folder = window.state?.folderPath;
+  const run = (cmd) => window.congacode.sfExec(cmd, folder, 60000);
+  const jparse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+  try {
+    // 1. Resolve the running user's Id.
+    const disp = jparse((await run(`sf org display --json --target-org ${orgAlias}`)).stdout);
+    const username = disp?.result?.username;
+    if (!username) return false;
+    const uq = jparse((await run(`sf data query --json --target-org ${orgAlias} -q "SELECT Id FROM User WHERE Username = '${username}'"`)).stdout);
+    const userId = uq?.result?.records?.[0]?.Id;
+    if (!userId) return false;
+
+    // 2. Find or create a FINEST DebugLevel.
+    let dlId;
+    const dlq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id FROM DebugLevel WHERE DeveloperName = 'CongaCodeFinest'"`)).stdout);
+    dlId = dlq?.result?.records?.[0]?.Id;
+    if (!dlId) {
+      const created = jparse((await run(`sf data create record --use-tooling-api --sobject DebugLevel --target-org ${orgAlias} --json --values "DeveloperName=CongaCodeFinest MasterLabel=CongaCodeFinest ApexCode=FINEST ApexProfiling=INFO Callout=INFO Database=FINEST System=FINE Validation=INFO Visualforce=INFO Workflow=INFO"`)).stdout);
+      dlId = created?.result?.id;
+    }
+    if (!dlId) return false;
+
+    // 3. Replace any existing developer-log trace flags for this user with a fresh 1h one.
+    const tfq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id FROM TraceFlag WHERE TracedEntityId = '${userId}' AND LogType = 'DEVELOPER_LOG'"`)).stdout);
+    for (const tf of (tfq?.result?.records || [])) {
+      await run(`sf data delete record --use-tooling-api --sobject TraceFlag --record-id ${tf.Id} --target-org ${orgAlias} --json`);
+    }
+    const now = new Date();
+    const start = now.toISOString();
+    const exp = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+    const created = jparse((await run(`sf data create record --use-tooling-api --sobject TraceFlag --target-org ${orgAlias} --json --values "TracedEntityId=${userId} DebugLevelId=${dlId} LogType=DEVELOPER_LOG StartDate=${start} ExpirationDate=${exp}"`)).stdout);
+    return !!(created?.result?.id);
+  } catch { return false; }
+}
+
+/** Fetch the most recent Apex debug log body from the org (used to get FINEST detail). */
+async function fetchLatestApexLog(orgAlias) {
+  const folder = window.state?.folderPath;
+  const run = (cmd) => window.congacode.sfExec(cmd, folder, 60000);
+  try {
+    const list = JSON.parse((await run(`sf apex log list --json --target-org ${orgAlias}`)).stdout);
+    const recs = list?.result || [];
+    if (!recs.length) return null;
+    recs.sort((a, b) => new Date(b.StartTime || 0) - new Date(a.StartTime || 0));
+    const id = recs[0].Id || recs[0].id;
+    if (!id) return null;
+    const got = JSON.parse((await run(`sf apex log get --log-id ${id} --json --target-org ${orgAlias}`)).stdout);
+    const r = got?.result;
+    if (Array.isArray(r)) return r[0]?.log || null;
+    if (typeof r === 'string') return r;
+    return r?.log || null;
+  } catch { return null; }
+}
+
 /** Execute the entry method against the connected org (read-only) and show activity. */
 async function runEntryMethodInOrg() {
   if (!debugState.active) { window.showToast?.('Start a debug session first', 'warning'); return; }
@@ -1447,6 +1513,11 @@ async function runEntryMethodInOrg() {
   renderOrgActivityPanel();
   switchToOrgTab();
   addConsoleEntry('info', `▶ Running ${className}.${methodName}() in org "${org.org}" (savepoint + rollback)…`);
+
+  // Ensure the org emits FINEST logs so replay can reconstruct real variable values.
+  addConsoleEntry('info', '⚙ Enabling FINEST Apex logging (temporary 1h trace flag, debug-only)…');
+  const finestOn = await ensureFinestLogging(org.org);
+  if (!finestOn) addConsoleEntry('info', '⚠ Could not auto-enable FINEST logging (needs "View/Manage All Data" or Tooling access). Stepping may lack variable values.');
 
   try {
     const paths = await window.congacode.getPaths?.();
@@ -1480,6 +1551,31 @@ async function runEntryMethodInOrg() {
         addConsoleEntry('error', `Org execution error: ${parsed.error.split('@')[0]}`);
       }
       addConsoleEntry('info', `↩ Rolled back — org "${org.org}" was not modified. SOQL: ${parsed.soql.length}, DML: ${parsed.dml.length} (simulated/rolled back).`);
+
+      // Stage 2: build a step-by-step replay timeline from the debug log.
+      if (parsed.status !== 'error' || (res.logs && res.logs.length)) {
+        try {
+          const classIndex = await buildClassIndex();
+          let logForReplay = res.logs || '';
+          let timeline = buildReplayTimeline(logForReplay, classIndex);
+          // If the inline log lacks FINEST detail, fetch the full recorded log.
+          if (!timeline.hasDetail && finestOn) {
+            const full = await fetchLatestApexLog(org.org);
+            if (full) {
+              logForReplay = full;
+              timeline = buildReplayTimeline(full, classIndex);
+            }
+          }
+          if (timeline.steps.length && timeline.hasDetail) {
+            addConsoleEntry('info', `🎬 Reconstructed ${timeline.steps.length} steps from the org log.`);
+            enterReplayMode(timeline);
+          } else if (logForReplay) {
+            addConsoleEntry('info', '⚠ Replay needs FINEST logs (STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT). Set the running user\'s Apex debug level to FINEST in Setup → Debug Logs, then Run in Org again.');
+          }
+        } catch (re) {
+          addConsoleEntry('error', `Replay build failed: ${re?.message || re}`);
+        }
+      }
     }
   } catch (e) {
     debugState.orgActivity = { error: e?.message || String(e) };
@@ -1566,6 +1662,190 @@ function renderOrgActivityPanel() {
   }
 
   container.innerHTML = html;
+}
+
+/* ================================================================
+   REPLAY ENGINE — reconstruct a step-by-step timeline from the
+   org's Apex debug log, with real variable values at every line.
+   ================================================================ */
+
+/** Parse a debug-log value token into a JS value (objects, refs, primitives). */
+function parseLogValue(raw, addrMap) {
+  if (raw === undefined || raw === null) return null;
+  let v = String(raw).trim();
+  if (v === '') return '';
+  if (/^0x[0-9a-fA-F]+$/.test(v)) return addrMap.has(v) ? addrMap.get(v) : `→ ${v}`;
+  if (v === 'null') return null;
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  if (/^-?\d+$/.test(v)) return parseInt(v, 10);
+  if (/^-?\d+\.\d+$/.test(v)) return parseFloat(v);
+  if ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']'))) {
+    try { return JSON.parse(v); } catch { /* fallthrough */ }
+  }
+  if (v.startsWith('"') && v.endsWith('"')) {
+    try { return JSON.parse(v); } catch { return v.slice(1, -1); }
+  }
+  return v; // raw string (e.g. a Datetime like "2024-01-01 10:00:00")
+}
+
+/**
+ * Build a replay timeline from an Apex debug log.
+ * Requires the log to contain STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT (FINEST).
+ * @returns { steps: [...], returnRaw, hasDetail }
+ */
+function buildReplayTimeline(log, classIndex) {
+  const result = { steps: [], returnRaw: null, hasDetail: false };
+  if (!log) return result;
+  const clsIdx = classIndex || {};
+  const lines = log.split('\n');
+  const stack = [];        // frames: { className, methodName, file, line, variables }
+  const addrMap = new Map();
+
+  const top = () => stack[stack.length - 1];
+  const resolveFile = (cls) => cls ? (clsIdx[cls] || clsIdx[cls.toLowerCase()] || null) : null;
+
+  const snapshot = (lineNo, kind) => {
+    if (!stack.length) return;
+    const t = top();
+    if (lineNo != null) t.line = lineNo;
+    const frames = stack.map(f => ({
+      className: f.className,
+      methodName: f.methodName,
+      file: f.file,
+      line: f.line,
+      variables: JSON.parse(JSON.stringify(f.variables || {})),
+      classFields: {},
+      statements: [{ line: f.line }],
+      pc: 0,
+    }));
+    result.steps.push({ file: t.file, line: t.line, depth: stack.length, frames, kind });
+  };
+
+  for (const raw of lines) {
+    const parts = raw.split('|');
+    if (parts.length < 2) continue;
+    const ev = parts[1];
+    const lineNo = (parts[2] && /\[(\d+)\]/.test(parts[2])) ? parseInt(parts[2].match(/\[(\d+)\]/)[1], 10) : null;
+
+    switch (ev) {
+      case 'METHOD_ENTRY':
+      case 'CONSTRUCTOR_ENTRY': {
+        const qname = parts.slice(4).join('|').trim() || parts.slice(3).join('|').trim();
+        const namePart = qname.split('(')[0].trim();
+        const segs = namePart.split('.');
+        const methodName = segs[segs.length - 1] || qname;
+        const topClass = segs[0];
+        stack.push({ className: topClass, methodName, file: resolveFile(topClass), line: lineNo || 0, variables: {} });
+        break;
+      }
+      case 'METHOD_EXIT':
+      case 'CONSTRUCTOR_EXIT':
+        if (stack.length) stack.pop();
+        break;
+      case 'VARIABLE_SCOPE_BEGIN': {
+        const name = parts[3];
+        if (top() && name && !(name in top().variables)) top().variables[name] = null;
+        break;
+      }
+      case 'VARIABLE_ASSIGNMENT': {
+        result.hasDetail = true;
+        const name = parts[3];
+        // value = fields after name, minus a trailing 0x address if present
+        let addr = null;
+        let valParts = parts.slice(4);
+        if (valParts.length && /^0x[0-9a-fA-F]+$/.test(valParts[valParts.length - 1])) {
+          addr = valParts[valParts.length - 1];
+          valParts = valParts.slice(0, -1);
+        }
+        const val = parseLogValue(valParts.join('|'), addrMap);
+        if (top() && name) {
+          top().variables[name] = val;
+          if (addr && val && typeof val === 'object') addrMap.set(addr, val);
+        }
+        break;
+      }
+      case 'STATEMENT_EXECUTE':
+        result.hasDetail = true;
+        if (top() && top().file) snapshot(lineNo, 'statement');
+        break;
+      case 'USER_DEBUG': {
+        const msg = parts.slice(4).join('|');
+        if (msg.startsWith('__CC_RET__')) result.returnRaw = msg.slice('__CC_RET__'.length);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return result;
+}
+
+/** Enter replay mode using a built timeline. */
+function enterReplayMode(timeline) {
+  if (!timeline.steps.length) return false;
+  debugState.replayMode = true;
+  debugState.replayTimeline = timeline.steps;
+  debugState.replayIndex = 0;
+  debugState.active = true;
+  debugState.paused = true;
+  addConsoleEntry('info', `🎬 Replay mode — stepping ${timeline.steps.length} recorded statements with real org values. Use Step/Continue.`);
+  replayGoto(0);
+  return true;
+}
+
+/** Move the replay cursor to a specific step and refresh the UI. */
+async function replayGoto(index) {
+  const steps = debugState.replayTimeline;
+  if (!steps.length) return;
+  index = Math.max(0, Math.min(index, steps.length - 1));
+  debugState.replayIndex = index;
+  const step = steps[index];
+  debugState.callStack = step.frames;
+  debugState.currentFile = step.file;
+  debugState.currentLine = step.line;
+  if (step.file) {
+    await navigateToFile(step.file, step.line);
+    highlightCurrentLine();
+  }
+  updateDebugPanels();
+}
+
+/** True if a step's file+line has an active breakpoint. */
+function stepHasBreakpoint(step) {
+  if (!step || !step.file) return false;
+  const bps = debugState.breakpoints.get(step.file);
+  return !!(bps && bps.has(step.line));
+}
+
+/** Advance the replay cursor forward to the first step matching a predicate. */
+async function replayAdvance(predicate, stopAtBreakpoints) {
+  const steps = debugState.replayTimeline;
+  let i = debugState.replayIndex + 1;
+  for (; i < steps.length; i++) {
+    if (stopAtBreakpoints && stepHasBreakpoint(steps[i])) break;
+    if (predicate(steps[i])) break;
+  }
+  if (i >= steps.length) {
+    await replayGoto(steps.length - 1);
+    addConsoleEntry('info', '✓ End of recorded execution reached.');
+    if (debugState.orgActivity?.returnValue !== undefined) {
+      addConsoleEntry('info', `return → ${formatValue(debugState.orgActivity.returnValue)}`);
+    }
+    return;
+  }
+  await replayGoto(i);
+}
+
+async function replayStepInto() { await replayAdvance(() => true, true); }
+async function replayContinue() { await replayAdvance(() => false, true); }
+async function replayStepOver() {
+  const depth = debugState.replayTimeline[debugState.replayIndex]?.depth ?? 1;
+  await replayAdvance((s) => s.depth <= depth, true);
+}
+async function replayStepOut() {
+  const depth = debugState.replayTimeline[debugState.replayIndex]?.depth ?? 1;
+  await replayAdvance((s) => s.depth < depth, true);
 }
 
 /**
@@ -2105,6 +2385,7 @@ function assignProperty(scope, path, value) {
 
 async function debugContinue() {
   if (!debugState.active) return;
+  if (debugState.replayMode) { await replayContinue(); return; }
   debugState.paused = false;
   debugState.stepMode = 'continue';
 
@@ -2125,6 +2406,7 @@ async function debugContinue() {
 
 async function debugStepOver() {
   if (!debugState.active || !debugState.paused) return;
+  if (debugState.replayMode) { await replayStepOver(); return; }
   debugState.stepMode = 'stepOver';
   debugState.stepDepth = debugState.callStack.length;
   debugState.paused = false;
@@ -2141,6 +2423,7 @@ async function debugStepOver() {
 
 async function debugStepInto() {
   if (!debugState.active || !debugState.paused) return;
+  if (debugState.replayMode) { await replayStepInto(); return; }
   debugState.stepMode = 'stepInto';
   debugState.stepDepth = debugState.callStack.length;
   debugState.paused = false;
@@ -2157,6 +2440,7 @@ async function debugStepInto() {
 
 async function debugStepOut() {
   if (!debugState.active || !debugState.paused) return;
+  if (debugState.replayMode) { await replayStepOut(); return; }
   debugState.stepMode = 'stepOut';
   debugState.stepDepth = debugState.callStack.length;
   debugState.paused = false;
