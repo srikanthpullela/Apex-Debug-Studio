@@ -54,6 +54,8 @@ const debugState = {
   liveOrgMode: false,          // When true, SOQL runs against the connected org
   orgFetching: false,          // True while an org call is in flight
   orgQueryCache: new Map(),    // normalized SOQL string → { records, error, soql }
+  orgRunning: false,           // True while the entry method is executing in the org
+  orgActivity: null,           // Parsed result of the last "Run in Org" execution
 };
 
 /* ================================================================
@@ -1048,6 +1050,7 @@ async function startDebugSession(filePath, methodName, requestParams) {
   debugState.classIndex = null; // refresh on next use
   debugState.classFieldsCache.clear();
   debugState.orgQueryCache.clear();
+  debugState.orgActivity = null;
 
   // Parse class-level fields
   const classFields = parseClassFields(source);
@@ -1215,14 +1218,24 @@ async function runLiveQuery(rawQuery, scope) {
 function updateLiveOrgIndicator() {
   const checkbox = _$('#dbg-liveorg-checkbox');
   const status = _$('#dbg-liveorg-status');
+  const runBtn = _$('#dbg-btn-run-org');
   const org = getActiveOrg();
   const connected = !!(org && org.connected && org.org);
   if (checkbox) {
     checkbox.disabled = !connected;
     checkbox.checked = debugState.liveOrgMode && connected;
   }
+  if (runBtn) {
+    const canRun = connected && debugState.liveOrgMode && debugState.active && !debugState.orgRunning;
+    runBtn.disabled = !canRun;
+    runBtn.textContent = debugState.orgRunning ? '⏳ Running…' : '▶ Run in Org';
+    runBtn.classList.toggle('active', debugState.liveOrgMode && connected);
+  }
   if (status) {
-    if (debugState.orgFetching) {
+    if (debugState.orgRunning) {
+      status.textContent = '⏳ executing in org…';
+      status.className = 'dbg-liveorg-status fetching';
+    } else if (debugState.orgFetching) {
       status.textContent = '⏳ querying org…';
       status.className = 'dbg-liveorg-status fetching';
     } else if (!connected) {
@@ -1252,6 +1265,307 @@ function toggleLiveOrgMode() {
     ? `⚡ Live Org mode ON — SOQL will query "${getActiveOrg().org}" (DML stays simulated)`
     : '○ Live Org mode OFF — SOQL returns simulated (empty) results');
   updateLiveOrgIndicator();
+}
+
+/* ================================================================
+   ORG REPLAY — execute the entry method against the org (read-only)
+   Wrapped in savepoint + rollback so nothing is persisted. Parses the
+   returned debug log into "Org Activity" (SOQL, DML, debug, limits).
+   ================================================================ */
+
+/** Escape a JS string for embedding inside an Apex single-quoted string literal. */
+function escapeApexString(s) {
+  return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '');
+}
+
+/** Extract signature info (return type, static flag, params) for a method. */
+function getEntrySignature(source, methodName) {
+  const lines = source.split('\n');
+  const re = new RegExp(
+    `((?:public|private|protected|global)\\s+(?:(static)\\s+)?(?:override\\s+)?(?:testMethod\\s+)?([\\w<>\\[\\],.\\s]+?)\\s+${escapeRegex(methodName)}\\s*\\()`,
+    'i'
+  );
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(re);
+    if (m && !/\b(class|interface|enum|trigger)\b/i.test(lines[i])) {
+      let sigText = '';
+      for (let j = i; j < Math.min(i + 6, lines.length); j++) {
+        sigText += lines[j] + ' ';
+        if (sigText.includes(')')) break;
+      }
+      const paramsPart = sigText.match(/\(([^)]*)\)/);
+      const params = [];
+      if (paramsPart && paramsPart[1].trim()) {
+        for (const p of paramsPart[1].split(',')) {
+          const parts = p.trim().split(/\s+/);
+          if (parts.length >= 2) params.push({ type: parts.slice(0, -1).join(' '), name: parts[parts.length - 1] });
+        }
+      }
+      return { returnType: (m[3] || '').trim(), isStatic: !!m[2], params };
+    }
+  }
+  return null;
+}
+
+/** Build the anonymous Apex that runs the entry method inside a savepoint/rollback. */
+function buildEntryApex(className, sig, argValues) {
+  const argDecls = [];
+  const argNames = [];
+  (sig.params || []).forEach((p, idx) => {
+    const val = argValues[idx];
+    const json = (val === undefined) ? 'null' : JSON.stringify(val);
+    const varName = `__cc_a${idx}`;
+    argNames.push(varName);
+    // Use the declared param type as the deserialize target so typed DOs reconstruct.
+    argDecls.push(`    ${p.type} ${varName} = (${p.type}) JSON.deserialize('${escapeApexString(json)}', ${p.type}.class);`);
+  });
+
+  const invoker = sig.isStatic
+    ? `${className}.${sig.__methodName}(${argNames.join(', ')})`
+    : `new ${className}().${sig.__methodName}(${argNames.join(', ')})`;
+
+  const isVoid = /^void$/i.test(sig.returnType || '');
+  const callLine = isVoid
+    ? `    ${invoker};`
+    : `    __cc_ret = (Object)( ${invoker} );`;
+
+  return [
+    `Savepoint __cc_sp = Database.setSavepoint();`,
+    `Object __cc_ret;`,
+    `String __cc_status = 'ok';`,
+    `String __cc_err = '';`,
+    `try {`,
+    ...argDecls,
+    callLine,
+    `} catch (Exception __cc_e) {`,
+    `    __cc_status = 'error';`,
+    `    __cc_err = __cc_e.getTypeName() + ': ' + __cc_e.getMessage() + ' @ ' + __cc_e.getStackTraceString();`,
+    `} finally {`,
+    `    try { Database.rollback(__cc_sp); } catch (Exception __cc_re) {}`,
+    `}`,
+    `String __cc_out;`,
+    `try { __cc_out = JSON.serialize(__cc_ret); } catch (Exception __cc_se) { __cc_out = '"<unserializable>"'; }`,
+    `System.debug(LoggingLevel.ERROR, '__CC_STATUS__' + __cc_status);`,
+    `System.debug(LoggingLevel.ERROR, '__CC_ERR__' + __cc_err);`,
+    `System.debug(LoggingLevel.ERROR, '__CC_RET__' + __cc_out);`,
+  ].join('\n');
+}
+
+/** Parse a Salesforce Apex debug log into structured Org Activity. */
+function parseApexLog(log) {
+  const out = { soql: [], dml: [], debug: [], methods: [], limits: {}, exceptions: [], status: null, error: null, returnValue: undefined, returnRaw: null, truncated: false };
+  if (!log) return out;
+  const lines = log.split('\n');
+  let pendingSoql = null;
+  for (const raw of lines) {
+    const parts = raw.split('|');
+    if (parts.length < 2) continue;
+    const ev = parts[1];
+    const lineNo = (parts[2] && parts[2].match(/\[(\d+)\]/)) ? parseInt(parts[2].match(/\[(\d+)\]/)[1]) : null;
+    switch (ev) {
+      case 'SOQL_EXECUTE_BEGIN':
+        pendingSoql = { line: lineNo, query: parts.slice(4).join('|').trim(), rows: null };
+        break;
+      case 'SOQL_EXECUTE_END': {
+        const rowsM = raw.match(/Rows:(\d+)/);
+        if (pendingSoql) { pendingSoql.rows = rowsM ? parseInt(rowsM[1]) : null; out.soql.push(pendingSoql); pendingSoql = null; }
+        break;
+      }
+      case 'DML_BEGIN': {
+        const op = (raw.match(/Op:(\w+)/) || [])[1] || '';
+        const type = (raw.match(/Type:([\w.]+)/) || [])[1] || '';
+        const rows = (raw.match(/Rows:(\d+)/) || [])[1];
+        out.dml.push({ line: lineNo, op, type, rows: rows ? parseInt(rows) : null });
+        break;
+      }
+      case 'USER_DEBUG': {
+        const msg = parts.slice(4).join('|');
+        if (msg.startsWith('__CC_STATUS__')) out.status = msg.slice('__CC_STATUS__'.length);
+        else if (msg.startsWith('__CC_ERR__')) out.error = msg.slice('__CC_ERR__'.length) || null;
+        else if (msg.startsWith('__CC_RET__')) out.returnRaw = msg.slice('__CC_RET__'.length);
+        else out.debug.push({ line: lineNo, msg });
+        break;
+      }
+      case 'METHOD_ENTRY': {
+        const name = parts.slice(4).join('|').trim();
+        if (name) out.methods.push({ line: lineNo, name });
+        break;
+      }
+      case 'EXCEPTION_THROWN':
+      case 'FATAL_ERROR':
+        out.exceptions.push({ line: lineNo, msg: parts.slice(2).join('|').trim() });
+        break;
+      default:
+        break;
+    }
+  }
+  // Governor limits (from the cumulative usage block)
+  const soqlM = log.match(/Number of SOQL queries:\s*(\d+)\s*out of\s*(\d+)/);
+  if (soqlM) out.limits.soql = `${soqlM[1]}/${soqlM[2]}`;
+  const dmlM = log.match(/Number of DML statements:\s*(\d+)\s*out of\s*(\d+)/);
+  if (dmlM) out.limits.dml = `${dmlM[1]}/${dmlM[2]}`;
+  const rowsM = log.match(/Number of query rows:\s*(\d+)\s*out of\s*(\d+)/);
+  if (rowsM) out.limits.rows = `${rowsM[1]}/${rowsM[2]}`;
+  const cpuM = log.match(/Maximum CPU time:\s*(\d+)\s*out of\s*(\d+)/);
+  if (cpuM) out.limits.cpu = `${cpuM[1]}/${cpuM[2]} ms`;
+  // Detect a truncated return value
+  if (out.returnRaw != null) {
+    try { out.returnValue = JSON.parse(out.returnRaw); }
+    catch { out.truncated = true; out.returnValue = out.returnRaw; }
+  }
+  return out;
+}
+
+/** Execute the entry method against the connected org (read-only) and show activity. */
+async function runEntryMethodInOrg() {
+  if (!debugState.active) { window.showToast?.('Start a debug session first', 'warning'); return; }
+  if (!liveOrgAvailable()) { window.showToast?.('Enable Live Org and connect an org first', 'warning'); return; }
+  if (debugState.orgRunning) return;
+
+  const filePath = debugState.entryFile;
+  const methodName = debugState.entryMethod;
+  const org = getActiveOrg();
+  const source = await window.congacode.readFile(filePath);
+  if (!source) { window.showToast?.('Could not read entry file', 'error'); return; }
+
+  const sig = getEntrySignature(source, methodName);
+  if (!sig) { window.showToast?.(`Could not parse signature for ${methodName}`, 'error'); return; }
+  sig.__methodName = methodName;
+
+  const className = filePath.split('/').pop().replace(/\.(cls|trigger)$/, '');
+  const argValues = (debugState.parsedRequest?.params) || [];
+
+  // Warn if the method appears to make callouts (can't be rolled back)
+  if (/\b(HttpRequest|Http\s*\(|\.send\s*\(|WebServiceCallout|Messaging\.sendEmail)\b/.test(source)) {
+    addConsoleEntry('info', '⚠ Entry class references callouts/email — those side effects cannot be rolled back.');
+  }
+
+  const apex = buildEntryApex(className, sig, argValues);
+
+  debugState.orgRunning = true;
+  updateLiveOrgIndicator();
+  renderOrgActivityPanel();
+  switchToOrgTab();
+  addConsoleEntry('info', `▶ Running ${className}.${methodName}() in org "${org.org}" (savepoint + rollback)…`);
+
+  try {
+    const paths = await window.congacode.getPaths?.();
+    const dir = paths?.congacodeDir || paths?.home || '.';
+    const tmpFile = `${dir}/.cc_debug_run.apex`;
+    await window.congacode.writeFile(tmpFile, apex);
+
+    const cmd = `sf apex run --file "${tmpFile}" --json --target-org ${org.org}`;
+    const { stdout, stderr } = await window.congacode.sfExec(cmd, window.state?.folderPath, 180000);
+
+    let cli = null;
+    try { cli = JSON.parse(stdout); } catch { /* non-JSON */ }
+    if (!cli) {
+      debugState.orgActivity = { error: (stderr || stdout || 'No response from sf CLI').split('\n').slice(0, 5).join('\n') };
+    } else {
+      const res = cli.result || {};
+      const parsed = parseApexLog(res.logs || '');
+      parsed.compiled = res.compiled;
+      parsed.success = res.success;
+      parsed.compileProblem = res.compileProblem || null;
+      parsed.exceptionMessage = res.exceptionMessage || null;
+      if (!parsed.error && res.exceptionMessage) parsed.error = res.exceptionMessage;
+      parsed.org = org.org;
+      parsed.entry = `${className}.${methodName}`;
+      debugState.orgActivity = parsed;
+
+      // Surface the real return value into the console
+      if (parsed.returnValue !== undefined && parsed.status !== 'error') {
+        addConsoleEntry('info', `✓ Returned from org: ${formatValue(parsed.returnValue)}${parsed.truncated ? ' (log-truncated)' : ''}`);
+      } else if (parsed.error) {
+        addConsoleEntry('error', `Org execution error: ${parsed.error.split('@')[0]}`);
+      }
+      addConsoleEntry('info', `↩ Rolled back — org "${org.org}" was not modified. SOQL: ${parsed.soql.length}, DML: ${parsed.dml.length} (simulated/rolled back).`);
+    }
+  } catch (e) {
+    debugState.orgActivity = { error: e?.message || String(e) };
+    addConsoleEntry('error', `Run in Org failed: ${e?.message || e}`);
+  } finally {
+    debugState.orgRunning = false;
+    updateLiveOrgIndicator();
+    renderOrgActivityPanel();
+  }
+}
+
+/** Switch the debug bottom panel to the Org Activity tab. */
+function switchToOrgTab() {
+  const tab = _$('#debug-panel .dbg-panel-tab[data-tab="dbg-orgactivity"]');
+  if (tab) tab.click();
+}
+
+/** Render the Org Activity panel from debugState.orgActivity. */
+function renderOrgActivityPanel() {
+  const container = _$('#dbg-orgactivity-body');
+  if (!container) return;
+
+  if (debugState.orgRunning) {
+    container.innerHTML = '<div class="dbg-org-loader"><span class="dbg-spinner"></span> Executing in org… fetching real data (this can take a moment).</div>';
+    return;
+  }
+
+  const a = debugState.orgActivity;
+  if (!a) {
+    container.innerHTML = '<div class="dbg-empty">Enable ⚡ Live Org and click "Run in Org" to execute the entry method against the connected org (read-only — changes are rolled back).</div>';
+    return;
+  }
+  if (a.error && !a.entry) {
+    container.innerHTML = `<div class="dbg-org-error">✕ ${_esc(a.error)}</div>`;
+    return;
+  }
+
+  let html = '';
+  html += `<div class="dbg-org-summary">`;
+  html += `<div class="dbg-org-head">⚡ ${_esc(a.entry || '')} <span class="dbg-org-org">@ ${_esc(a.org || '')}</span></div>`;
+  if (a.compileProblem) html += `<div class="dbg-org-error">Compile error: ${_esc(a.compileProblem)}</div>`;
+  if (a.status === 'error' || (a.error && a.entry)) html += `<div class="dbg-org-error">Runtime error: ${_esc((a.error || a.exceptionMessage || '').split('@')[0])}</div>`;
+  html += `<div class="dbg-org-badges">`;
+  html += `<span class="dbg-org-badge">SOQL ${a.soql?.length || 0}</span>`;
+  html += `<span class="dbg-org-badge">DML ${a.dml?.length || 0}</span>`;
+  html += `<span class="dbg-org-badge">Debug ${a.debug?.length || 0}</span>`;
+  if (a.limits?.soql) html += `<span class="dbg-org-badge muted">Queries ${_esc(a.limits.soql)}</span>`;
+  if (a.limits?.cpu) html += `<span class="dbg-org-badge muted">CPU ${_esc(a.limits.cpu)}</span>`;
+  html += `</div>`;
+  html += `<div class="dbg-org-note">↩ Executed in a savepoint and rolled back — the org was not modified.</div>`;
+  html += `</div>`;
+
+  // Return value
+  if (a.returnValue !== undefined) {
+    html += `<div class="dbg-org-section"><div class="dbg-org-title">Return value${a.truncated ? ' (log-truncated)' : ''}</div>`;
+    html += `<pre class="dbg-org-json">${_esc(typeof a.returnValue === 'string' ? a.returnValue : JSON.stringify(a.returnValue, null, 2))}</pre></div>`;
+  }
+
+  // SOQL
+  if (a.soql?.length) {
+    html += `<div class="dbg-org-section"><div class="dbg-org-title">SOQL queries (${a.soql.length})</div>`;
+    for (const q of a.soql) {
+      html += `<div class="dbg-org-row"><span class="dbg-org-rows">${q.rows != null ? q.rows + ' rows' : ''}</span><code>${_esc(q.query)}</code></div>`;
+    }
+    html += `</div>`;
+  }
+
+  // DML
+  if (a.dml?.length) {
+    html += `<div class="dbg-org-section"><div class="dbg-org-title">DML (${a.dml.length}) — rolled back</div>`;
+    for (const d of a.dml) {
+      html += `<div class="dbg-org-row"><span class="dbg-org-dml">${_esc(d.op)}</span> <code>${_esc(d.type)}</code> <span class="dbg-org-rows">${d.rows != null ? d.rows + ' rows' : ''}</span></div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Debug lines
+  if (a.debug?.length) {
+    html += `<div class="dbg-org-section"><div class="dbg-org-title">System.debug (${a.debug.length})</div>`;
+    for (const d of a.debug.slice(0, 200)) {
+      html += `<div class="dbg-org-row"><span class="dbg-org-line">L${d.line ?? '?'}</span> <span>${_esc(d.msg)}</span></div>`;
+    }
+    html += `</div>`;
+  }
+
+  container.innerHTML = html;
 }
 
 /**
@@ -2082,6 +2396,7 @@ function updateDebugPanels() {
   renderCallStackPanel();
   renderConsolePanel();
   renderBreakpointsPanel();
+  renderOrgActivityPanel();
   updateLiveOrgIndicator();
 }
 
@@ -2904,6 +3219,7 @@ function initApexDebugger() {
 
   // Live Org toggle
   _$('#dbg-liveorg-checkbox')?.addEventListener('change', toggleLiveOrgMode);
+  _$('#dbg-btn-run-org')?.addEventListener('click', runEntryMethodInOrg);
 
   // Wire up request modal
   _$('#dbg-modal-start')?.addEventListener('click', startDebugFromModal);

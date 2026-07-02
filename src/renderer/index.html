@@ -1269,6 +1269,7 @@
         <span class="dbg-liveorg-text">⚡ Live Org</span>
       </label>
       <span id="dbg-liveorg-status" class="dbg-liveorg-status disconnected">no org connected</span>
+      <button id="dbg-btn-run-org" class="dbg-runorg-btn" title="Execute the entry method against the connected org (read-only — any DML is rolled back) and capture real data + org activity">▶ Run in Org</button>
     </div>
   </div>
 
@@ -1282,6 +1283,7 @@
         <button class="dbg-panel-tab" data-tab="dbg-callstack">Call Stack</button>
         <button class="dbg-panel-tab" data-tab="dbg-console">Console</button>
         <button class="dbg-panel-tab" data-tab="dbg-breakpoints">Breakpoints</button>
+        <button class="dbg-panel-tab" data-tab="dbg-orgactivity">⚡ Org</button>
       </div>
       <div class="dbg-panel-actions">
         <button id="dbg-console-clear" class="tool-hdr-btn" title="Clear Console">⌫</button>
@@ -1319,6 +1321,11 @@
       <div id="dbg-breakpoints" class="dbg-tab-content">
         <div id="dbg-breakpoints-body" class="dbg-scroll-body">
           <div class="dbg-empty">No breakpoints set</div>
+        </div>
+      </div>
+      <div id="dbg-orgactivity" class="dbg-tab-content">
+        <div id="dbg-orgactivity-body" class="dbg-scroll-body">
+          <div class="dbg-empty">Enable ⚡ Live Org and click "Run in Org" to execute the entry method against the connected org (read-only — changes are rolled back).</div>
         </div>
       </div>
     </div>
