@@ -1138,6 +1138,33 @@ async function startDebugSession(filePath, methodName, requestParams) {
   if (Object.keys(classFieldVars).length > 0) {
     addConsoleEntry('info', `  Class fields: ${Object.keys(classFieldVars).join(', ')}`);
   }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // PRIMARY ENGINE = REAL EXECUTION REPLAY (the "V8 for Apex" path).
+  // Apex runs on Salesforce servers, so — exactly like Salesforce's own Apex
+  // Replay Debugger and Chrome DevTools' model — we execute the method ONCE in
+  // the org (wrapped in a savepoint + rollback, read-only), capture the FINEST
+  // trace, and reconstruct the real execution: every line that actually ran, in
+  // real branch/loop order, with real variable values, the full call stack
+  // (incl. private + cross-class methods) and static/global state. The user then
+  // steps through that with full breakpoints/step-into/over/out + scope + hover.
+  //
+  // The local statement simulator set up above is only a FALLBACK PREVIEW for
+  // when no org is connected (it can only guess values/branches).
+  // ─────────────────────────────────────────────────────────────────────────
+  if (liveOrgAvailable()) {
+    debugState.liveOrgMode = true;
+    updateLiveOrgIndicator();
+    addConsoleEntry('info', '⚡ Live Org connected — executing the method in the org and reconstructing its REAL execution to step through (savepoint + rollback, nothing is modified)…');
+    await runEntryMethodInOrg();  // runs in org → builds timeline → enterReplayMode() on success
+    if (debugState.replayMode) {
+      addConsoleEntry('info', '✅ Real-execution replay ready. Step Over / Into / Out and Continue now walk the actual run with real values. Set breakpoints and hover any variable.');
+    } else {
+      addConsoleEntry('info', '⚠ Could not reconstruct the real execution (see the error above — usually FINEST logging not enabled or a compile/auth issue). Falling back to a LOCAL PREVIEW that guesses values. Fix the issue, then Restart.');
+    }
+  } else {
+    addConsoleEntry('info', 'ℹ No org connected — this is a LOCAL PREVIEW that only guesses values and branches. Connect an org and enable Live Org for real, V8-style debugging of the actual execution.');
+  }
 }
 
 function stopDebugSession() {
@@ -1650,13 +1677,18 @@ async function ensureFinestLogging(orgAlias) {
     const userId = uq?.result?.records?.[0]?.Id;
     if (!userId) return false;
 
-    // 2. Find or create a FINEST DebugLevel.
+    // 2. Find or create a FINEST DebugLevel. ApexCode=FINEST is what emits the
+    //    STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT events the replay engine needs.
     let dlId;
     const dlq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id FROM DebugLevel WHERE DeveloperName = 'CongaCodeFinest'"`)).stdout);
     dlId = dlq?.result?.records?.[0]?.Id;
     if (!dlId) {
-      const created = jparse((await run(`sf data create record --use-tooling-api --sobject DebugLevel --target-org ${orgAlias} --json --values "DeveloperName=CongaCodeFinest MasterLabel=CongaCodeFinest ApexCode=FINEST ApexProfiling=NONE Callout=NONE Database=INFO System=INFO Validation=NONE Visualforce=NONE Workflow=NONE"`)).stdout);
+      const created = jparse((await run(`sf data create record --use-tooling-api --sobject DebugLevel --target-org ${orgAlias} --json --values "DeveloperName=CongaCodeFinest MasterLabel=CongaCodeFinest ApexCode=FINEST ApexProfiling=NONE Callout=NONE Database=FINEST System=FINE Validation=NONE Visualforce=NONE Workflow=NONE"`)).stdout);
       dlId = created?.result?.id;
+    } else {
+      // Ensure a pre-existing level is really at FINEST (it may have been created
+      // wrong in an earlier build), otherwise the log won't contain step detail.
+      await run(`sf data update record --use-tooling-api --sobject DebugLevel --record-id ${dlId} --target-org ${orgAlias} --json --values "ApexCode=FINEST Database=FINEST System=FINE"`);
     }
     if (!dlId) return false;
 
@@ -1777,19 +1809,30 @@ async function runEntryMethodInOrg() {
           const classIndex = await buildClassIndex();
           let logForReplay = res.logs || '';
           let timeline = buildReplayTimeline(logForReplay, classIndex);
-          // If the inline log lacks FINEST detail, fetch the full recorded log.
-          if (!timeline.hasDetail && finestOn) {
+
+          // The inline `sf apex run` log is frequently empty or truncated, so the
+          // authoritative source is the full ApexLog recorded on the server. When
+          // FINEST is on, always fetch it and use whichever reconstructs MORE steps.
+          if (finestOn && (!timeline.hasDetail || !timeline.steps.length || (res.logs || '').length < 4000)) {
+            addConsoleEntry('info', '⏳ Fetching the full recorded FINEST log from the org…');
             const full = await fetchLatestApexLog(org.org);
-            if (full) {
-              logForReplay = full;
-              timeline = buildReplayTimeline(full, classIndex);
+            if (full && full.length) {
+              const fullTimeline = buildReplayTimeline(full, classIndex);
+              if (fullTimeline.steps.length >= timeline.steps.length) {
+                logForReplay = full;
+                timeline = fullTimeline;
+              }
             }
           }
           if (timeline.steps.length && timeline.hasDetail) {
             addConsoleEntry('info', `🎬 Reconstructed ${timeline.steps.length} steps from the org log.`);
             enterReplayMode(timeline);
+          } else if (!finestOn) {
+            addConsoleEntry('error', '⚠ FINEST logging is not enabled for the running user, so the real execution can\'t be reconstructed. It needs the "View All Data"/Tooling permission to auto-enable, or set the running user\'s Apex debug level to FINEST (ApexCode=FINEST) in Setup → Debug Logs, then Restart.');
           } else if (logForReplay) {
-            addConsoleEntry('info', '⚠ Replay needs FINEST logs (STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT). Set the running user\'s Apex debug level to FINEST in Setup → Debug Logs, then Run in Org again.');
+            addConsoleEntry('info', `⚠ The org log came back without step detail (${logForReplay.length}b). Replay needs STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT (ApexCode=FINEST). Confirm the CongaCodeFinest debug level is FINEST and Restart.`);
+          } else {
+            addConsoleEntry('info', '⚠ The org returned an empty log. If the method compiled, enable FINEST for the running user and Restart.');
           }
         } catch (re) {
           addConsoleEntry('error', `Replay build failed: ${re?.message || re}`);
