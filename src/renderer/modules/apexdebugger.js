@@ -565,6 +565,19 @@ function evaluateExpression(expr, scope) {
     return obj;
   }
 
+  // Built-in Datetime/Date/System clock helpers — resolvable locally without the org.
+  // Datetime.now() is just the server clock; getTime() yields epoch milliseconds (a Long).
+  // These must run BEFORE the greedy static-call matcher, which would otherwise swallow
+  // the trailing .getTime() chain and return an ISO string instead of the numeric Long.
+  {
+    const nowGetTime = expr.match(/^(?:System|Datetime)\s*\.\s*now\s*\(\s*\)\s*\.\s*getTime\s*\(\s*\)$/);
+    if (nowGetTime) return Date.now();
+    const nowCall = expr.match(/^(?:System|Datetime)\s*\.\s*now\s*\(\s*\)$/);
+    if (nowCall) return new Date().toISOString();
+    const todayCall = expr.match(/^(?:System|Date)\s*\.\s*today\s*\(\s*\)$/);
+    if (todayCall) return new Date().toISOString().split('T')[0];
+  }
+
   // Static method calls: Type.method(args) — common Apex static methods
   const staticCallMatch = expr.match(/^(\w+)\.(valueOf|parseInt|isBlank|isNotBlank|isNumeric|format|now|today|newInstance|getGlobalDescribe|join)\s*\((.*)\)$/);
   if (staticCallMatch) {
@@ -634,7 +647,7 @@ function evaluateExpression(expr, scope) {
 
   // Method call: obj.method(args) or ClassName.method(args)
   // Extended list of known Apex collection/string methods
-  const methodCallMatch = expr.match(/^([\w.[\]]+)\.(size|isEmpty|add|addAll|put|putAll|get|remove|contains|containsKey|containsAll|clear|clone|sort|intValue|longValue|doubleValue|toString|toLowerCase|toUpperCase|trim|length|substring|split|replace|replaceAll|startsWith|endsWith|indexOf|lastIndexOf|charAt|equals|equalsIgnoreCase|valueOf|values|keySet|format|abbreviate|capitalize|center|deleteWhitespace|isBlank|isNotBlank|isNumeric|join|left|mid|right|repeat|reverse|stripHtmlTags)\s*\((.*)\)\s*$/);
+  const methodCallMatch = expr.match(/^([\w.[\]]+)\.(size|isEmpty|add|addAll|put|putAll|get|remove|contains|containsKey|containsAll|clear|clone|sort|intValue|longValue|doubleValue|toString|toLowerCase|toUpperCase|trim|length|substring|split|replace|replaceAll|startsWith|endsWith|indexOf|lastIndexOf|charAt|equals|equalsIgnoreCase|valueOf|values|keySet|format|abbreviate|capitalize|center|deleteWhitespace|isBlank|isNotBlank|isNumeric|join|left|mid|right|repeat|reverse|stripHtmlTags|getTime|day|month|year)\s*\((.*)\)\s*$/);
   if (methodCallMatch) {
     const obj = resolveProperty(scope, methodCallMatch[1]);
     const method = methodCallMatch[2];
@@ -907,6 +920,13 @@ function simulateMethodCall(obj, method, args) {
     case 'isBlank': return typeof obj === 'string' ? obj.trim().length === 0 : true;
     case 'isNotBlank': return typeof obj === 'string' ? obj.trim().length > 0 : false;
     case 'join': return Array.isArray(obj) ? obj.join(args[0] || ',') : String(obj);
+    case 'getTime': {
+      const t = (obj instanceof Date ? obj : new Date(obj)).getTime();
+      return isNaN(t) ? null : t;
+    }
+    case 'day': { const d = new Date(obj); return isNaN(d.getTime()) ? null : d.getUTCDate(); }
+    case 'month': { const d = new Date(obj); return isNaN(d.getTime()) ? null : d.getUTCMonth() + 1; }
+    case 'year': { const d = new Date(obj); return isNaN(d.getTime()) ? null : d.getUTCFullYear(); }
     default: return undefined;
   }
 }
