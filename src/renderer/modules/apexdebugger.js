@@ -1188,6 +1188,40 @@ function parseSfJson(stdout) {
   try { return JSON.parse(stdout.slice(start, end + 1)); } catch { return null; }
 }
 
+/** Strip sf CLI noise (update-available warnings, `›` banner lines, blank lines). */
+function cleanSfNoise(text) {
+  if (!text) return '';
+  return String(text)
+    .split('\n')
+    .filter(l => {
+      const t = l.trim().replace(/^[›»>]\s*/, '');
+      if (!t) return false;
+      if (/^Warning:\s*@salesforce\/cli update available/i.test(t)) return false;
+      if (/update available from [\d.]+ to [\d.]+/i.test(t)) return false;
+      return true;
+    })
+    .join('\n')
+    .trim();
+}
+
+/**
+ * Extract the most meaningful error text from an sf CLI invocation.
+ * Prefers the parsed JSON's message/compileProblem, then cleaned stderr/stdout,
+ * so the real cause (auth, compile, runtime) is shown instead of the update banner.
+ */
+function sfErrorText(cli, stderr, stdout, fallback) {
+  if (cli) {
+    if (cli.status && cli.status !== 0 && cli.message) return String(cli.message).split('\n')[0];
+    const r = cli.result || cli.data || {};
+    if (r.compileProblem) return `Compile error: ${r.compileProblem}`;
+    if (r.exceptionMessage) return r.exceptionMessage;
+    if (cli.message && !r.success) return String(cli.message).split('\n')[0];
+  }
+  const cleaned = cleanSfNoise(stderr) || cleanSfNoise(stdout);
+  if (cleaned) return cleaned.split('\n')[0];
+  return fallback || 'Org returned no result';
+}
+
 /** Format a JS value as a SOQL literal for bind-variable substitution. */
 function toSoqlLiteral(val) {
   if (val === null || val === undefined) return 'null';
@@ -1255,7 +1289,7 @@ async function runLiveQuery(rawQuery, scope) {
     if (parsed && parsed.status === 0 && parsed.result) {
       result.records = (parsed.result.records || []).map(cleanSObject);
     } else {
-      result.error = (parsed && parsed.message) || (stderr || stdout || 'Query failed').split('\n')[0];
+      result.error = sfErrorText(parsed, stderr, stdout, 'Query failed');
     }
   } catch (e) {
     result.error = e?.message || String(e);
@@ -1299,7 +1333,7 @@ async function _runSoqlOnce(soql) {
     if (parsed && parsed.status === 0 && parsed.result) {
       result.records = (parsed.result.records || []).map(cleanSObject);
     } else {
-      result.error = (parsed && parsed.message) || (stderr || stdout || 'Query failed').split('\n')[0];
+      result.error = sfErrorText(parsed, stderr, stdout, 'Query failed');
     }
   } catch (e) {
     result.error = e?.message || String(e);
@@ -4248,8 +4282,13 @@ async function _runEvalApex(resolvedExpr) {
     const cli = parseSfJson(stdout);
     const res = (cli && (cli.result || cli.data)) || {};
     const log = res.logs || '';
-    if (res.compiled === false) {
-      return { error: `Compile failed: ${res.compileProblem || (cli && cli.message) || 'unknown'}`, compileFailed: true, resolvedExpr };
+    // Auth / CLI-level failure (e.g. IP restriction) → surface the real message.
+    if (cli && cli.status && cli.status !== 0 && !res.logs) {
+      return { error: sfErrorText(cli, stderr, stdout, 'Org command failed'), resolvedExpr };
+    }
+    const compileProblem = res.compileProblem || (res.compiled === false ? (cli && cli.message) : null);
+    if (res.compiled === false || compileProblem) {
+      return { error: `Compile failed: ${compileProblem || 'unknown'}`, compileFailed: true, resolvedExpr };
     }
     let raw = null, evalErr = '';
     for (const line of log.split('\n')) {
@@ -4264,7 +4303,8 @@ async function _runEvalApex(resolvedExpr) {
       try { value = JSON.parse(raw); } catch { value = raw; }
       return { value, resolvedExpr };
     }
-    return { error: (stderr || 'Org returned no result (log may be truncated or logging disabled)').split('\n')[0], resolvedExpr };
+    // No markers and no clear failure flag — report the real reason, not the update banner.
+    return { error: sfErrorText(cli, stderr, stdout, 'Org returned no debug output (is FINEST logging enabled for the running user?)'), resolvedExpr };
   } catch (e) {
     return { error: e?.message || String(e), resolvedExpr };
   }
