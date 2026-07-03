@@ -1532,13 +1532,19 @@ async function runEntryMethodInOrg() {
     try { cli = JSON.parse(stdout); } catch { /* non-JSON */ }
     if (!cli) {
       debugState.orgActivity = { error: (stderr || stdout || 'No response from sf CLI').split('\n').slice(0, 5).join('\n') };
+      addConsoleEntry('error', `sf CLI returned non-JSON. stdout(${(stdout||'').length}b): ${(stdout||'').slice(0,300)} | stderr: ${(stderr||'').slice(0,300)}`);
     } else {
       const res = cli.result || {};
-      const parsed = parseApexLog(res.logs || '');
+      const rawLog = res.logs || '';
+      // Diagnostics — surface exactly what the org returned.
+      addConsoleEntry('info', `sf apex run: success=${res.success} compiled=${res.compiled} logLen=${rawLog.length}b${res.compileProblem ? ' compileProblem=' + res.compileProblem : ''}${res.exceptionMessage ? ' exception=' + res.exceptionMessage : ''}`);
+      if (cli.status && cli.status !== 0) addConsoleEntry('error', `sf CLI status ${cli.status}: ${cli.message || ''} ${(stderr||'').slice(0,300)}`);
+      const parsed = parseApexLog(rawLog);
       parsed.compiled = res.compiled;
       parsed.success = res.success;
       parsed.compileProblem = res.compileProblem || null;
       parsed.exceptionMessage = res.exceptionMessage || null;
+      parsed.rawLog = rawLog;
       if (!parsed.error && res.exceptionMessage) parsed.error = res.exceptionMessage;
       parsed.org = org.org;
       parsed.entry = `${className}.${methodName}`;
@@ -1627,6 +1633,17 @@ function renderOrgActivityPanel() {
   html += `</div>`;
   html += `<div class="dbg-org-note">↩ Executed in a savepoint and rolled back — the org was not modified.</div>`;
   html += `</div>`;
+
+  // Diagnostics — when nothing was parsed, show the raw log so we can see why.
+  const nothingParsed = !(a.soql?.length) && !(a.dml?.length) && !(a.debug?.length) && a.returnValue === undefined;
+  if (nothingParsed && a.rawLog != null) {
+    const raw = a.rawLog;
+    html += `<div class="dbg-org-section"><div class="dbg-org-title">Raw org log (${raw.length} bytes) — no SOQL/DML/debug/return parsed</div>`;
+    html += raw.length
+      ? `<pre class="dbg-org-json" style="max-height:320px;overflow:auto">${_esc(raw.slice(0, 6000))}${raw.length > 6000 ? '\n… (truncated)' : ''}</pre>`
+      : `<div class="dbg-org-note">The org returned an empty log. The anonymous Apex may have failed to compile (check the request param types) or the debug level is NONE. Enable FINEST for the running user, or paste this panel's console diagnostics.</div>`;
+    html += `</div>`;
+  }
 
   // Return value
   if (a.returnValue !== undefined) {
