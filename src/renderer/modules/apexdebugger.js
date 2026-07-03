@@ -1174,6 +1174,20 @@ function liveOrgAvailable() {
   return !!(o && o.connected && o.org);
 }
 
+/**
+ * Robustly parse JSON from `sf` CLI stdout. The CLI can prepend noise such as
+ * "› Warning: @salesforce/cli update available…" before the JSON payload, which
+ * breaks a naive JSON.parse. This slices from the first '{' to the last '}'.
+ */
+function parseSfJson(stdout) {
+  if (!stdout) return null;
+  try { return JSON.parse(stdout); } catch { /* fall through to slice */ }
+  const start = stdout.indexOf('{');
+  const end = stdout.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try { return JSON.parse(stdout.slice(start, end + 1)); } catch { return null; }
+}
+
 /** Format a JS value as a SOQL literal for bind-variable substitution. */
 function toSoqlLiteral(val) {
   if (val === null || val === undefined) return 'null';
@@ -1195,8 +1209,8 @@ function buildLiveQuery(rawQuery, scope) {
   let q = (rawQuery || '').trim();
   const m = q.match(/^\[([\s\S]*)\]\s*;?$/);
   q = (m ? m[1] : q.replace(/^\[/, '').replace(/\]\s*;?$/, '')).trim();
-  // Replace SOQL bind expressions like :varName or :obj.field with real values.
-  q = q.replace(/:([A-Za-z_]\w*(?:\.\w+)*)/g, (whole, expr) => {
+  // Replace SOQL bind expressions like :varName or : obj.field with real values.
+  q = q.replace(/:\s*([A-Za-z_]\w*(?:\.\w+)*)/g, (whole, expr) => {
     const val = resolveProperty(scope, expr);
     if (val === undefined) return whole; // leave unresolved — surface the error
     return toSoqlLiteral(val);
@@ -1237,8 +1251,7 @@ async function runLiveQuery(rawQuery, scope) {
   let result = { records: [], error: null, soql };
   try {
     const { stdout, stderr } = await window.congacode.sfExec(cmd, folder, 60000);
-    let parsed = null;
-    try { parsed = JSON.parse(stdout); } catch { /* non-JSON output */ }
+    const parsed = parseSfJson(stdout);
     if (parsed && parsed.status === 0 && parsed.result) {
       result.records = (parsed.result.records || []).map(cleanSObject);
     } else {
@@ -1282,8 +1295,7 @@ async function _runSoqlOnce(soql) {
   let result = { records: [], error: null, soql };
   try {
     const { stdout, stderr } = await window.congacode.sfExec(cmd, folder, 60000);
-    let parsed = null;
-    try { parsed = JSON.parse(stdout); } catch { /* non-JSON */ }
+    const parsed = parseSfJson(stdout);
     if (parsed && parsed.status === 0 && parsed.result) {
       result.records = (parsed.result.records || []).map(cleanSObject);
     } else {
@@ -1336,7 +1348,7 @@ async function evaluateSoqlInOrg(rawQuery, frame) {
   const m = q.match(/^\[([\s\S]*)\]\s*;?$/);
   q = (m ? m[1] : q.replace(/^\[/, '').replace(/\]\s*;?$/, '')).trim();
 
-  const binds = [...new Set([...q.matchAll(/:([A-Za-z_]\w*(?:\.\w+)*)/g)].map(x => x[1]))];
+  const binds = [...new Set([...q.matchAll(/:\s*([A-Za-z_]\w*(?:\.\w+)*)/g)].map(x => x[1]))];
   const unresolved = [];
   for (const b of binds) {
     let val = resolveProperty(scope, b);
@@ -1348,7 +1360,7 @@ async function evaluateSoqlInOrg(rawQuery, frame) {
     if (val === undefined) { unresolved.push(b); continue; }
     const lit = toSoqlLiteral(val);
     if (lit == null) { unresolved.push(b); continue; }
-    q = q.replace(new RegExp(':' + escapeRegex(b) + '\\b', 'g'), lit);
+    q = q.replace(new RegExp(':\\s*' + escapeRegex(b) + '\\b', 'g'), lit);
   }
   if (unresolved.length) {
     return { error: `Can't resolve bind variable(s): ${unresolved.join(', ')}. They reference runtime objects — set a value in the Console or run the whole method with ▶ Run in Org.`, soql: q, unresolved };
@@ -1404,10 +1416,20 @@ function toggleLiveOrgMode() {
   }
   debugState.liveOrgMode = !debugState.liveOrgMode;
   debugState.orgQueryCache.clear();
-  addConsoleEntry('info', debugState.liveOrgMode
-    ? `⚡ Live Org mode ON — SOQL will query "${getActiveOrg().org}" (DML stays simulated)`
-    : '○ Live Org mode OFF — SOQL returns simulated (empty) results');
+  if (debugState.orgEvalCache) debugState.orgEvalCache.clear();
   updateLiveOrgIndicator();
+
+  if (debugState.liveOrgMode) {
+    addConsoleEntry('info', `⚡ Live Org ON — hovering/console now pull real values from "${getActiveOrg().org}" on demand.`);
+    // Auto-capture the full picture: replay the entry method once so every line's
+    // real values are ready without a separate "Run in Org" click.
+    if (debugState.active && !debugState.orgRunning && !debugState.replayMode) {
+      addConsoleEntry('info', '↻ Auto-running the method in the org to capture real values for every line…');
+      runEntryMethodInOrg();
+    }
+  } else {
+    addConsoleEntry('info', '○ Live Org OFF — values come from the local simulator (org not queried).');
+  }
 }
 
 /* ================================================================
@@ -1575,7 +1597,7 @@ function parseApexLog(log) {
 async function ensureFinestLogging(orgAlias) {
   const folder = window.state?.folderPath;
   const run = (cmd) => window.congacode.sfExec(cmd, folder, 60000);
-  const jparse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+  const jparse = (s) => parseSfJson(s);
   try {
     // 1. Resolve the running user's Id.
     const disp = jparse((await run(`sf org display --json --target-org ${orgAlias}`)).stdout);
@@ -1613,13 +1635,13 @@ async function fetchLatestApexLog(orgAlias) {
   const folder = window.state?.folderPath;
   const run = (cmd) => window.congacode.sfExec(cmd, folder, 60000);
   try {
-    const list = JSON.parse((await run(`sf apex log list --json --target-org ${orgAlias}`)).stdout);
+    const list = parseSfJson((await run(`sf apex log list --json --target-org ${orgAlias}`)).stdout);
     const recs = list?.result || [];
     if (!recs.length) return null;
     recs.sort((a, b) => new Date(b.StartTime || 0) - new Date(a.StartTime || 0));
     const id = recs[0].Id || recs[0].id;
     if (!id) return null;
-    const got = JSON.parse((await run(`sf apex log get --log-id ${id} --json --target-org ${orgAlias}`)).stdout);
+    const got = parseSfJson((await run(`sf apex log get --log-id ${id} --json --target-org ${orgAlias}`)).stdout);
     const r = got?.result;
     if (Array.isArray(r)) return r[0]?.log || null;
     if (typeof r === 'string') return r;
@@ -1673,8 +1695,7 @@ async function runEntryMethodInOrg() {
     const cmd = `sf apex run --file "${tmpFile}" --json --target-org ${org.org}`;
     const { stdout, stderr } = await window.congacode.sfExec(cmd, window.state?.folderPath, 180000);
 
-    let cli = null;
-    try { cli = JSON.parse(stdout); } catch { /* non-JSON */ }
+    let cli = parseSfJson(stdout);
     if (!cli) {
       debugState.orgActivity = { error: (stderr || stdout || 'No response from sf CLI').split('\n').slice(0, 5).join('\n') };
       addConsoleEntry('error', `sf CLI returned non-JSON. stdout(${(stdout||'').length}b): ${(stdout||'').slice(0,300)} | stderr: ${(stderr||'').slice(0,300)}`);
@@ -4203,6 +4224,52 @@ function buildEvalApex(resolvedExpr) {
   ].join('\n');
 }
 
+/** Prefix a leading managed-package Apex class reference with the namespace (ns.Class…). */
+function applyNamespaceToApex(expr, ns) {
+  if (!ns) return expr;
+  const m = expr.match(/^([A-Za-z_]\w*)\s*\./);
+  if (!m) return expr;
+  const head = m[1];
+  if (isApexTypeName(head) || head === ns) return expr;
+  return ns + '.' + expr;
+}
+
+/** Run one anonymous-Apex evaluation of a resolved expression. Returns { value?, error?, compileFailed?, resolvedExpr }. */
+async function _runEvalApex(resolvedExpr) {
+  const org = getActiveOrg();
+  const apex = buildEvalApex(resolvedExpr);
+  try {
+    const paths = await window.congacode.getPaths?.();
+    const dir = paths?.congacodeDir || paths?.home || '.';
+    const tmpFile = `${dir}/.cc_debug_eval.apex`;
+    await window.congacode.writeFile(tmpFile, apex);
+    const cmd = `sf apex run --file "${tmpFile}" --json --target-org ${org.org}`;
+    const { stdout, stderr } = await window.congacode.sfExec(cmd, window.state?.folderPath, 60000);
+    const cli = parseSfJson(stdout);
+    const res = (cli && (cli.result || cli.data)) || {};
+    const log = res.logs || '';
+    if (res.compiled === false) {
+      return { error: `Compile failed: ${res.compileProblem || (cli && cli.message) || 'unknown'}`, compileFailed: true, resolvedExpr };
+    }
+    let raw = null, evalErr = '';
+    for (const line of log.split('\n')) {
+      const pipe = line.split('|');
+      const msg = pipe.length >= 5 ? pipe.slice(4).join('|') : '';
+      if (msg.startsWith('__CC_EVAL__')) raw = msg.slice('__CC_EVAL__'.length);
+      else if (msg.startsWith('__CC_EVALERR__')) evalErr = msg.slice('__CC_EVALERR__'.length);
+    }
+    if (evalErr) return { error: evalErr, resolvedExpr };
+    if (raw != null) {
+      let value;
+      try { value = JSON.parse(raw); } catch { value = raw; }
+      return { value, resolvedExpr };
+    }
+    return { error: (stderr || 'Org returned no result (log may be truncated or logging disabled)').split('\n')[0], resolvedExpr };
+  } catch (e) {
+    return { error: e?.message || String(e), resolvedExpr };
+  }
+}
+
 /**
  * Evaluate an expression against the connected org using the given frame's
  * bindings. Cached per resolved-expression. Returns { value?, error?, resolvedExpr }.
@@ -4221,45 +4288,21 @@ async function evaluateInOrg(expr, frame) {
     return debugState.orgEvalCache.get(resolvedExpr);
   }
 
-  const org = getActiveOrg();
-  const apex = buildEvalApex(resolvedExpr);
-  let result;
-  try {
-    const paths = await window.congacode.getPaths?.();
-    const dir = paths?.congacodeDir || paths?.home || '.';
-    const tmpFile = `${dir}/.cc_debug_eval.apex`;
-    await window.congacode.writeFile(tmpFile, apex);
-    const cmd = `sf apex run --file "${tmpFile}" --json --target-org ${org.org}`;
-    const { stdout, stderr } = await window.congacode.sfExec(cmd, window.state?.folderPath, 60000);
-    let cli = null;
-    try { cli = JSON.parse(stdout); } catch { /* non-JSON */ }
-    const res = (cli && (cli.result || cli.data)) || {};
-    const log = res.logs || '';
-    if (res.compiled === false) {
-      result = { error: `Compile failed: ${res.compileProblem || (cli && cli.message) || 'unknown'}`, resolvedExpr };
-    } else {
-      let raw = null, evalErr = '';
-      for (const line of log.split('\n')) {
-        const pipe = line.split('|');
-        const msg = pipe.length >= 5 ? pipe.slice(4).join('|') : '';
-        if (msg.startsWith('__CC_EVAL__')) raw = msg.slice('__CC_EVAL__'.length);
-        else if (msg.startsWith('__CC_EVALERR__')) evalErr = msg.slice('__CC_EVALERR__'.length);
-      }
-      if (evalErr) {
-        result = { error: evalErr, resolvedExpr };
-      } else if (raw != null) {
-        let value;
-        try { value = JSON.parse(raw); } catch { value = raw; }
-        result = { value, resolvedExpr };
-      } else {
-        result = { error: (stderr || 'Org returned no result (log may be truncated or logging disabled)').split('\n')[0], resolvedExpr };
-      }
+  let result = await _runEvalApex(resolvedExpr);
+  // Managed-package Apex classes may need the namespace prefix
+  // (e.g. SObjectConstants → Apttus_Config2.SObjectConstants). Retry once.
+  if (result.compileFailed) {
+    const ns = await getPackageNamespace();
+    const nsExpr = applyNamespaceToApex(resolvedExpr, ns);
+    if (ns && nsExpr !== resolvedExpr) {
+      const r2 = await _runEvalApex(nsExpr);
+      if (!r2.error) result = r2;
     }
-  } catch (e) {
-    result = { error: e?.message || String(e), resolvedExpr };
   }
-  debugState.orgEvalCache.set(resolvedExpr, result);
-  return result;
+  const out = result.error ? { error: result.error, resolvedExpr: result.resolvedExpr || resolvedExpr }
+                           : { value: result.value, resolvedExpr: result.resolvedExpr || resolvedExpr };
+  debugState.orgEvalCache.set(resolvedExpr, out);
+  return out;
 }
 
 /** Console-triggered org evaluation: runs the expression in the org and prints the result. */
