@@ -592,6 +592,21 @@ function evaluateExpression(expr, scope) {
     if (todayCall) return new Date().toISOString().split('T')[0];
   }
 
+  // Common Apex null/empty utility predicates (e.g. SystemUtil.nullOrEmpty(x),
+  // String.isBlank(x)). These appear constantly in guard conditions; evaluating
+  // them correctly lets branch selection during local method interpretation match
+  // the real code path instead of defaulting to null/false.
+  const emptyUtil = expr.match(/^[A-Za-z_][\w.]*\.(nullOrEmpty|isNullOrEmpty|isEmpty|isBlank)\s*\((.+)\)$/);
+  if (emptyUtil) {
+    const v = evaluateExpression(emptyUtil[2].trim(), scope);
+    return isApexEmpty(v);
+  }
+  const notEmptyUtil = expr.match(/^[A-Za-z_][\w.]*\.(isNotBlank|isNotEmpty)\s*\((.+)\)$/);
+  if (notEmptyUtil) {
+    const v = evaluateExpression(notEmptyUtil[2].trim(), scope);
+    return !isApexEmpty(v);
+  }
+
   // Static method calls: Type.method(args) — common Apex static methods
   const staticCallMatch = expr.match(/^(\w+)\.(valueOf|parseInt|isBlank|isNotBlank|isNumeric|format|now|today|newInstance|getGlobalDescribe|join)\s*\((.*)\)$/);
   if (staticCallMatch) {
@@ -731,10 +746,161 @@ function splitArgs(argsStr) {
   return result;
 }
 
+/** Apex-style emptiness test for null/empty utility predicates. */
+function isApexEmpty(v) {
+  if (v === null || v === undefined) return true;
+  if (typeof v === 'string') return v.trim().length === 0;
+  if (Array.isArray(v)) return v.length === 0;
+  if (v instanceof Set) return v.size === 0;
+  if (typeof v === 'object') return Object.keys(v).filter(k => !k.startsWith('__')).length === 0;
+  return false;
+}
+
 /**
- * Parse class-level fields from source code.
- * Returns { publicFields: {name: {type, value}}, privateFields: {...}, staticFields: {...}, allFields: {...} }
+ * Pure, side-effect-free interpreter for a parsed Apex block. Operates on a plain
+ * `scope` object (no debugState mutation) and returns a control-flow signal:
+ *   {} normal, {returned:true,value}, {broke:true}, {continued:true}, {threw:true}.
+ * This is what lets hover evaluate a real getter like primaryLineItemSO() against
+ * the already-resolved receiver object, honoring its if/else + loops (V8-style).
  */
+function interpretApexBlock(statements, scope, depth) {
+  for (const stmt of statements || []) {
+    const r = interpretApexStmt(stmt, scope, depth);
+    if (r && (r.returned || r.broke || r.continued || r.threw)) return r;
+  }
+  return {};
+}
+
+function interpretApexStmt(stmt, scope, depth) {
+  switch (stmt.type) {
+    case 'declaration': {
+      let v = stmt._directValue !== undefined ? stmt._directValue
+        : (stmt.expression != null ? evaluateExpression(stmt.expression, scope) : undefined);
+      if (v === undefined) v = defaultForApexType(stmt.varType);
+      scope[stmt.varName] = v;
+      return {};
+    }
+    case 'assignment': {
+      const v = evaluateExpression(stmt.expression, scope);
+      assignProperty(scope, stmt.varName, v);
+      return {};
+    }
+    case 'declWithCall':
+    case 'assignWithCall': {
+      // Best-effort: rebuild the call and evaluate it (handles known collection/util calls).
+      const callExpr = `${stmt.className ? stmt.className + '.' : ''}${stmt.methodName}(${stmt.argsRaw || ''})`;
+      let v = evaluateExpression(callExpr, scope);
+      if (v === undefined && stmt.varType) v = defaultForApexType(stmt.varType);
+      scope[stmt.varName] = v === undefined ? null : v;
+      return {};
+    }
+    case 'conditional': {
+      const cond = evaluateExpression(stmt.condition, scope);
+      if (cond) return interpretApexBlock(stmt.thenBlock || [], scope, depth);
+      if (stmt.elseBlock && stmt.elseBlock.length) return interpretApexBlock(stmt.elseBlock, scope, depth);
+      return {};
+    }
+    case 'switch': {
+      const sv = evaluateExpression(stmt.switchExpr, scope);
+      let elseCase = null;
+      for (const wc of stmt.whenCases || []) {
+        if (/^else$/i.test(wc.value)) { elseCase = wc; continue; }
+        const vals = wc.value.split(',').map(x => evaluateExpression(x.trim(), scope));
+        if (vals.some(x => x == sv)) return interpretApexBlock(wc.body, scope, depth);
+      }
+      if (elseCase) return interpretApexBlock(elseCase.body, scope, depth);
+      return {};
+    }
+    case 'return':
+      return { returned: true, value: stmt.expression != null ? evaluateExpression(stmt.expression, scope) : null };
+    case 'break': return { broke: true };
+    case 'continue': return { continued: true };
+    case 'throw': return { threw: true };
+    case 'try':
+      return interpretApexBlock(stmt.body || [], scope, depth);
+    case 'loop': {
+      if (stmt.loopType === 'for') {
+        const fe = stmt.loopExpr && stmt.loopExpr.match(/^\s*([\w<>\[\],.\s]+?)\s+(\w+)\s*:\s*(.+)$/);
+        if (fe) {
+          const coll = evaluateExpression(fe[3].trim(), scope);
+          const arr = Array.isArray(coll) ? coll : (coll instanceof Set ? [...coll] : []);
+          let n = 0;
+          for (const item of arr) {
+            if (n++ > 5000) break;
+            scope[fe[2]] = item;
+            const r = interpretApexBlock(stmt.body || [], scope, depth);
+            if (r.returned || r.threw) return r;
+            if (r.broke) break;
+          }
+        }
+        return {};
+      }
+      if (stmt.loopType === 'while') {
+        let guard = 0;
+        while (evaluateExpression(stmt.condition, scope) && guard++ < 5000) {
+          const r = interpretApexBlock(stmt.body || [], scope, depth);
+          if (r.returned || r.threw) return r;
+          if (r.broke) break;
+        }
+        return {};
+      }
+      return {};
+    }
+    default:
+      return {};
+  }
+}
+
+/**
+ * Evaluate a user-defined instance method locally against an already-resolved
+ * receiver object. Finds the method source (by the receiver's declared/inferred
+ * type, its outer class, or the current frame's class), parses the body, and
+ * interprets it with the receiver's fields as `this`-scope + bound params.
+ * Returns the method's return value, or undefined if it can't be evaluated
+ * locally (e.g. it does SOQL/DML and needs the org).
+ */
+async function evaluateUserMethodLocally(receiverObj, methodName, argValues, typeHint, depth = 0) {
+  if (depth > 3) return undefined;
+  if (receiverObj == null || typeof receiverObj !== 'object' || Array.isArray(receiverObj) || receiverObj instanceof Set) return undefined;
+
+  const names = [];
+  const push = (n) => { if (n && !names.includes(n)) names.push(n); };
+  const t = typeHint || receiverObj.__type__;
+  if (t) {
+    const bare = String(t).replace(/<.*>/, '').replace(/\[\s*\]$/, '').trim();
+    push(bare);
+    if (bare.includes('.')) { push(bare.split('.')[0]); push(bare.split('.').pop()); }
+  }
+  const cf = debugState.callStack && debugState.callStack[debugState.callStack.length - 1];
+  if (cf && cf.className) push(cf.className);
+
+  let methodInfo = null, source = null;
+  for (const n of names) {
+    let file;
+    try { file = await resolveClassFile(n); } catch { file = null; }
+    if (!file) continue;
+    let src;
+    try { src = await window.congacode.readFile(file); } catch { continue; }
+    if (!src) continue;
+    const mi = findMethodInSource(src, methodName);
+    if (mi) { methodInfo = mi; source = src; break; }
+  }
+  if (!methodInfo) return undefined;
+
+  const lines = source.split('\n');
+  const stmts = parseApexStatements(lines, methodInfo.startLine, methodInfo.endLine);
+  // Receiver fields become the method's `this`-scope; then bind the parameters.
+  const scope = Object.assign({}, receiverObj);
+  (methodInfo.params || []).forEach((p, i) => { scope[p.name] = argValues[i]; });
+  try {
+    const r = interpretApexBlock(stmts, scope, depth + 1);
+    return r && r.returned ? r.value : undefined;
+  } catch (_) {
+    return undefined;
+  }
+}
+
+
 function parseClassFields(source) {
   const lines = source.split('\n');
   const fields = { publicFields: {}, privateFields: {}, staticFields: {}, allFields: {} };
@@ -2437,6 +2603,9 @@ async function executeCurrentStatement() {
         if (forEachMatch) {
           const iterVar = forEachMatch[2];
           const collectionExpr = forEachMatch[3].trim();
+          // Track the loop variable's declared element type (e.g. RemoteCPQ.LineItemDO)
+          // so hover can resolve instance-method calls on it.
+          if (forEachMatch[1]) (frame.varTypes || (frame.varTypes = {}))[iterVar] = forEachMatch[1].trim();
           const items = await resolveLoopCollection(collectionExpr, scope, frame, stmt.line);
           addConsoleEntry('loop', `for (${iterVar} : ${collectionExpr}) — ${items.length} iterations`, stmt.line);
           // Unroll loop: insert body for each item
@@ -2628,13 +2797,23 @@ async function executeCurrentStatement() {
         const didStepIn = await stepIntoMethod(resolvedClass, stmt.methodName, stmt.argsRaw, frame, stmt.varName);
         if (didStepIn) return true;
       }
-      // Not stepping in — try evaluating as a known method, else set null
+      // Not stepping in — try known method, else interpret the user method locally
+      // against the resolved receiver, else set null.
       const existingObj = stmt.className ? resolveProperty(scope, stmt.className) : null;
       if (existingObj && typeof existingObj === 'object') {
-        const simResult = simulateMethodCall(existingObj, stmt.methodName, stmt.argsRaw ? splitArgs(stmt.argsRaw).map(a => evaluateExpression(a.trim(), scope)) : []);
+        const exArgs = stmt.argsRaw ? splitArgs(stmt.argsRaw).map(a => evaluateExpression(a.trim(), scope)) : [];
+        const simResult = simulateMethodCall(existingObj, stmt.methodName, exArgs);
         if (simResult !== undefined) {
           assignProperty(frame.variables, stmt.varName, simResult);
           addConsoleEntry('call', `${stmt.varName} = ${formatValue(resolveProperty(frame.variables, stmt.varName))}`, stmt.line);
+          frame.pc++;
+          break;
+        }
+        const typeHint = (frame.varTypes && frame.varTypes[stmt.className]) || existingObj.__type__;
+        const userRes = await evaluateUserMethodLocally(existingObj, stmt.methodName, exArgs, typeHint, 0);
+        if (userRes !== undefined) {
+          assignProperty(frame.variables, stmt.varName, userRes);
+          addConsoleEntry('call', `${stmt.varName} = ${formatValue(userRes)}  (computed from live object)`, stmt.line);
           frame.pc++;
           break;
         }
@@ -2651,13 +2830,25 @@ async function executeCurrentStatement() {
         const didStepIn = await stepIntoMethod(resolvedClass, stmt.methodName, stmt.argsRaw, frame, stmt.varName);
         if (didStepIn) return true;
       }
-      // Not stepping in — try evaluating as a known method, else set null
+      // Not stepping in — try evaluating as a known method, else interpret the
+      // user method locally against the resolved receiver, else set null.
       const declObj = stmt.className ? resolveProperty(scope, stmt.className) : null;
       if (declObj && typeof declObj === 'object') {
-        const simResult = simulateMethodCall(declObj, stmt.methodName, stmt.argsRaw ? splitArgs(stmt.argsRaw).map(a => evaluateExpression(a.trim(), scope)) : []);
+        const declArgs = stmt.argsRaw ? splitArgs(stmt.argsRaw).map(a => evaluateExpression(a.trim(), scope)) : [];
+        const simResult = simulateMethodCall(declObj, stmt.methodName, declArgs);
         if (simResult !== undefined) {
           frame.variables[stmt.varName] = simResult;
+          if (stmt.varType) (frame.varTypes || (frame.varTypes = {}))[stmt.varName] = stmt.varType;
           addConsoleEntry('call', `${stmt.varName} = ${formatValue(frame.variables[stmt.varName])}`, stmt.line);
+          frame.pc++;
+          break;
+        }
+        const typeHint = (frame.varTypes && frame.varTypes[stmt.className]) || declObj.__type__;
+        const userRes = await evaluateUserMethodLocally(declObj, stmt.methodName, declArgs, typeHint, 0);
+        if (userRes !== undefined) {
+          frame.variables[stmt.varName] = userRes;
+          if (stmt.varType) (frame.varTypes || (frame.varTypes = {}))[stmt.varName] = stmt.varType;
+          addConsoleEntry('call', `${stmt.varName} = ${formatValue(userRes)}  (computed from live object)`, stmt.line);
           frame.pc++;
           break;
         }
@@ -3881,6 +4072,36 @@ function looksLikeParamList(argsStr) {
 }
 
 /**
+ * Infer a local variable's declared Apex type by reading the source above the
+ * cursor — the same way a developer would. Recognizes for-each loop variables,
+ * plain declarations, and method parameters. Returns e.g. "RemoteCPQ.LineItemDO".
+ */
+function inferVarTypeFromSource(model, uptoLine, varName) {
+  if (!model || !varName || /[.[\]()]/.test(varName)) return null;
+  const v = escapeRegex(varName);
+  const typeCore = '([A-Za-z_][\\w.]*(?:\\s*<[^>]*>)?(?:\\s*\\[\\s*\\])?)';
+  const patterns = [
+    new RegExp(`\\bfor\\s*\\(\\s*(?:final\\s+)?${typeCore}\\s+${v}\\s*:`),        // for-each
+    new RegExp(`(?:^\\s*|[({,;]\\s*)(?:final\\s+)?${typeCore}\\s+${v}\\s*(?:[=;)]|:)`), // decl / param
+  ];
+  const skip = new Set(['return', 'new', 'else', 'if', 'while', 'for', 'instanceof']);
+  const total = model.getLineCount ? model.getLineCount() : uptoLine;
+  const end = Math.min(uptoLine, total);
+  let best = null;
+  for (let ln = 1; ln <= end; ln++) {
+    const text = model.getLineContent(ln);
+    if (!text.includes(varName)) continue;
+    for (const re of patterns) {
+      const m = text.match(re);
+      if (m && m[1] && !skip.has(m[1].trim().toLowerCase())) {
+        best = m[1].replace(/\s+/g, '').trim(); // closest (latest) declaration wins
+      }
+    }
+  }
+  return best;
+}
+
+/**
  * Register the hover provider that shows debug info during active sessions.
  * Shows Chrome DevTools-style value tooltips on variable hover.
  */
@@ -3994,10 +4215,21 @@ function registerDebugHoverProvider() {
 
       const topFrame = debugState.callStack[debugState.callStack.length - 1];
 
+      // Look up a variable's declared Apex type across the call stack.
+      const lookupVarType = (name) => {
+        if (!name || /[.[\]()]/.test(name)) return null;
+        for (let fi = debugState.callStack.length - 1; fi >= 0; fi--) {
+          const vt = debugState.callStack[fi].varTypes;
+          if (vt && name in vt) return vt[name];
+        }
+        return null;
+      };
+
       // Build a Monaco hover payload for a resolved value.
       const makeHover = (displayPath, val, opts = {}) => {
         const contents = [];
-        const typeName = getValueTypeName(val);
+        const declaredType = opts.declaredType || lookupVarType(displayPath);
+        const typeName = getValueTypeName(val, declaredType);
         const tag = opts.realOrg ? ' · _real org value_' : '';
         contents.push({ value: `**\`${displayPath}\`** : *${typeName}*${tag}` });
         if (val === null) {
@@ -4065,28 +4297,61 @@ function registerDebugHoverProvider() {
         lines.push('_Step into this method (F11) to watch it execute with real values._');
         return { range: wordRange, contents: [{ value: lines.join('\n\n') }] };
       }
-      const canOrgEval = liveOrgAvailable() && topFrame && (callExpr || fullPath.includes('.'));
-      if (canOrgEval) {
-        const cache = debugState.orgEvalCache;
-        const rw = (() => { try { return rewriteExprForOrg(orgExpr, topFrame); } catch { return null; } })();
-        if (rw && cache && cache.has(rw.resolvedExpr)) {
-          const cached = cache.get(rw.resolvedExpr);
-          if (cached.error) return errHover(orgExpr, cached.error);
-          return makeHover(orgExpr, cached.value, { realOrg: true, range: wordRange });
-        }
-        return evaluateInOrg(orgExpr, topFrame).then((r) => {
-          if (r.error) {
-            addConsoleEntry('info', `${orgExpr} → (org eval) ${r.error}`);
-            return errHover(orgExpr, r.error);
+
+      // Fallback org-eval, wrapped so local interpretation can defer to it.
+      const orgEvalHover = () => {
+        const canOrgEval = liveOrgAvailable() && topFrame && (callExpr || fullPath.includes('.'));
+        if (canOrgEval) {
+          const cache = debugState.orgEvalCache;
+          const rw = (() => { try { return rewriteExprForOrg(orgExpr, topFrame); } catch { return null; } })();
+          if (rw && cache && cache.has(rw.resolvedExpr)) {
+            const cached = cache.get(rw.resolvedExpr);
+            if (cached.error) return errHover(orgExpr, cached.error);
+            return makeHover(orgExpr, cached.value, { realOrg: true, range: wordRange });
           }
-          addConsoleEntry('result', `${orgExpr} → ${formatValue(r.value)}  (real org value)`);
-          return makeHover(orgExpr, r.value, { realOrg: true, range: wordRange });
-        }).catch(() => null);
+          return evaluateInOrg(orgExpr, topFrame).then((r) => {
+            if (r.error) {
+              addConsoleEntry('info', `${orgExpr} → (org eval) ${r.error}`);
+              return errHover(orgExpr, r.error);
+            }
+            addConsoleEntry('result', `${orgExpr} → ${formatValue(r.value)}  (real org value)`);
+            return makeHover(orgExpr, r.value, { realOrg: true, range: wordRange });
+          }).catch(() => null);
+        }
+        // Local null with no org available → still show the null.
+        if (value === null) return makeHover(resolvedPath || fullPath, null);
+        return null;
+      };
+
+      // 3.5) Instance method call on an already-resolved object → interpret the
+      // method locally against that object (honors its if/else + loops, V8-style).
+      // e.g. lineItemDO.primaryLineItemSO() returns chargeLines[0].lineItemSO.
+      const instCall = callExpr && callExpr.match(/^([A-Za-z_][\w.[\]]*)\.(\w+)\s*\((.*)\)$/);
+      if (instCall) {
+        const recvPath = instCall[1], methodNm = instCall[2], argsRaw = instCall[3];
+        let recvObj, recvFrameScope;
+        for (let fi = debugState.callStack.length - 1; fi >= 0; fi--) {
+          const frame = debugState.callStack[fi];
+          const s = { ...(frame.classFields || {}), ...frame.variables };
+          const o = resolveProperty(s, recvPath);
+          if (o !== undefined) { recvObj = o; recvFrameScope = s; break; }
+        }
+        if (recvObj && typeof recvObj === 'object') {
+          const typeHint = inferVarTypeFromSource(model, position.lineNumber, recvPath)
+            || lookupVarType(recvPath) || recvObj.__type__;
+          const argVals = argsRaw && argsRaw.trim()
+            ? splitArgs(argsRaw).map(a => evaluateExpression(a.trim(), recvFrameScope)) : [];
+          return evaluateUserMethodLocally(recvObj, methodNm, argVals, typeHint, 0).then((res) => {
+            if (res !== undefined) {
+              addConsoleEntry('result', `${callExpr} → ${formatValue(res)}  (computed from live object)`);
+              return makeHover(callExpr, res, { realOrg: true, range: wordRange });
+            }
+            return orgEvalHover();
+          }).catch(() => orgEvalHover());
+        }
       }
 
-      // 4) Local null with no org available → still show the null.
-      if (value === null) return makeHover(resolvedPath || fullPath, null);
-      return null;
+      return orgEvalHover();
     }
   });
 }
