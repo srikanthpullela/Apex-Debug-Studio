@@ -60,6 +60,7 @@ const debugState = {
   replayMode: false,           // When true, step controls walk the recorded timeline
   replayTimeline: [],          // Array of recorded steps { file, line, depth, frames }
   replayIndex: 0,              // Current position in the timeline
+  replayFatalError: null,      // Uncatchable error that ended the recorded run, if any
 };
 
 /* ================================================================
@@ -1123,6 +1124,7 @@ function stopDebugSession() {
   debugState.replayMode = false;
   debugState.replayTimeline = [];
   debugState.replayIndex = 0;
+  debugState.replayFatalError = null;
   clearCurrentLineHighlight();
   hideDebugUI();
   addConsoleEntry('info', '⏹ Debug session ended');
@@ -1314,14 +1316,16 @@ function getEntrySignature(source, methodName) {
   return null;
 }
 
-/** Build the anonymous Apex that runs the entry method inside a savepoint/rollback. */
+/** Build the anonymous Apex that runs the entry method inside a savepoint/rollback.
+ *  NOTE: Apex identifiers may not contain two consecutive underscores, so local
+ *  variables use a "ccDbg" camelCase prefix (the __CC_*__ tokens are string markers). */
 function buildEntryApex(className, sig, argValues) {
   const argDecls = [];
   const argNames = [];
   (sig.params || []).forEach((p, idx) => {
     const val = argValues[idx];
     const json = (val === undefined) ? 'null' : JSON.stringify(val);
-    const varName = `__cc_a${idx}`;
+    const varName = `ccDbgA${idx}`;
     argNames.push(varName);
     // Use the declared param type as the deserialize target so typed DOs reconstruct.
     argDecls.push(`    ${p.type} ${varName} = (${p.type}) JSON.deserialize('${escapeApexString(json)}', ${p.type}.class);`);
@@ -1334,27 +1338,27 @@ function buildEntryApex(className, sig, argValues) {
   const isVoid = /^void$/i.test(sig.returnType || '');
   const callLine = isVoid
     ? `    ${invoker};`
-    : `    __cc_ret = (Object)( ${invoker} );`;
+    : `    ccDbgRet = (Object)( ${invoker} );`;
 
   return [
-    `Savepoint __cc_sp = Database.setSavepoint();`,
-    `Object __cc_ret;`,
-    `String __cc_status = 'ok';`,
-    `String __cc_err = '';`,
+    `Savepoint ccDbgSp = Database.setSavepoint();`,
+    `Object ccDbgRet;`,
+    `String ccDbgStatus = 'ok';`,
+    `String ccDbgErr = '';`,
     `try {`,
     ...argDecls,
     callLine,
-    `} catch (Exception __cc_e) {`,
-    `    __cc_status = 'error';`,
-    `    __cc_err = __cc_e.getTypeName() + ': ' + __cc_e.getMessage() + ' @ ' + __cc_e.getStackTraceString();`,
+    `} catch (Exception ccDbgE) {`,
+    `    ccDbgStatus = 'error';`,
+    `    ccDbgErr = ccDbgE.getTypeName() + ': ' + ccDbgE.getMessage() + ' @ ' + ccDbgE.getStackTraceString();`,
     `} finally {`,
-    `    try { Database.rollback(__cc_sp); } catch (Exception __cc_re) {}`,
+    `    try { Database.rollback(ccDbgSp); } catch (Exception ccDbgRe) {}`,
     `}`,
-    `String __cc_out;`,
-    `try { __cc_out = JSON.serialize(__cc_ret); } catch (Exception __cc_se) { __cc_out = '"<unserializable>"'; }`,
-    `System.debug(LoggingLevel.ERROR, '__CC_STATUS__' + __cc_status);`,
-    `System.debug(LoggingLevel.ERROR, '__CC_ERR__' + __cc_err);`,
-    `System.debug(LoggingLevel.ERROR, '__CC_RET__' + __cc_out);`,
+    `String ccDbgOut;`,
+    `try { ccDbgOut = JSON.serialize(ccDbgRet); } catch (Exception ccDbgSe) { ccDbgOut = '"<unserializable>"'; }`,
+    `System.debug(LoggingLevel.ERROR, '__CC_STATUS__' + ccDbgStatus);`,
+    `System.debug(LoggingLevel.ERROR, '__CC_ERR__' + ccDbgErr);`,
+    `System.debug(LoggingLevel.ERROR, '__CC_RET__' + ccDbgOut);`,
   ].join('\n');
 }
 
@@ -1420,6 +1424,13 @@ function parseApexLog(log) {
     try { out.returnValue = JSON.parse(out.returnRaw); }
     catch { out.truncated = true; out.returnValue = out.returnRaw; }
   }
+  // If our markers never ran (e.g. an uncatchable System.LimitException killed the
+  // transaction), surface the fatal error so the panel/console explains the outcome.
+  if (out.status == null && out.exceptions.length) {
+    out.status = 'error';
+    if (!out.error) out.error = out.exceptions[0].msg.replace(/^FATAL_ERROR\|?/, '').trim();
+    out.uncatchable = true;
+  }
   return out;
 }
 
@@ -1445,7 +1456,7 @@ async function ensureFinestLogging(orgAlias) {
     const dlq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id FROM DebugLevel WHERE DeveloperName = 'CongaCodeFinest'"`)).stdout);
     dlId = dlq?.result?.records?.[0]?.Id;
     if (!dlId) {
-      const created = jparse((await run(`sf data create record --use-tooling-api --sobject DebugLevel --target-org ${orgAlias} --json --values "DeveloperName=CongaCodeFinest MasterLabel=CongaCodeFinest ApexCode=FINEST ApexProfiling=INFO Callout=INFO Database=FINEST System=FINE Validation=INFO Visualforce=INFO Workflow=INFO"`)).stdout);
+      const created = jparse((await run(`sf data create record --use-tooling-api --sobject DebugLevel --target-org ${orgAlias} --json --values "DeveloperName=CongaCodeFinest MasterLabel=CongaCodeFinest ApexCode=FINEST ApexProfiling=NONE Callout=NONE Database=INFO System=INFO Validation=NONE Visualforce=NONE Workflow=NONE"`)).stdout);
       dlId = created?.result?.id;
     }
     if (!dlId) return false;
@@ -1534,18 +1545,22 @@ async function runEntryMethodInOrg() {
       debugState.orgActivity = { error: (stderr || stdout || 'No response from sf CLI').split('\n').slice(0, 5).join('\n') };
       addConsoleEntry('error', `sf CLI returned non-JSON. stdout(${(stdout||'').length}b): ${(stdout||'').slice(0,300)} | stderr: ${(stderr||'').slice(0,300)}`);
     } else {
-      const res = cli.result || {};
+      // On success the payload is under result; on compile failure it's under data.
+      const res = cli.result || cli.data || {};
       const rawLog = res.logs || '';
       // Diagnostics — surface exactly what the org returned.
       addConsoleEntry('info', `sf apex run: success=${res.success} compiled=${res.compiled} logLen=${rawLog.length}b${res.compileProblem ? ' compileProblem=' + res.compileProblem : ''}${res.exceptionMessage ? ' exception=' + res.exceptionMessage : ''}`);
-      if (cli.status && cli.status !== 0) addConsoleEntry('error', `sf CLI status ${cli.status}: ${cli.message || ''} ${(stderr||'').slice(0,300)}`);
+      if (res.compiled === false && res.compileProblem) {
+        addConsoleEntry('error', `Compile failed (line ${res.line}): ${res.compileProblem}`);
+      }
       const parsed = parseApexLog(rawLog);
       parsed.compiled = res.compiled;
       parsed.success = res.success;
-      parsed.compileProblem = res.compileProblem || null;
+      parsed.compileProblem = res.compileProblem || (cli.name === 'executeCompileFailure' ? (cli.message || 'Compilation failed') : null);
       parsed.exceptionMessage = res.exceptionMessage || null;
       parsed.rawLog = rawLog;
       if (!parsed.error && res.exceptionMessage) parsed.error = res.exceptionMessage;
+      if (!parsed.error && parsed.compileProblem) { parsed.error = parsed.compileProblem; parsed.status = 'error'; }
       parsed.org = org.org;
       parsed.entry = `${className}.${methodName}`;
       debugState.orgActivity = parsed;
@@ -1712,31 +1727,50 @@ function parseLogValue(raw, addrMap) {
  * @returns { steps: [...], returnRaw, hasDetail }
  */
 function buildReplayTimeline(log, classIndex) {
-  const result = { steps: [], returnRaw: null, hasDetail: false };
+  const result = { steps: [], returnRaw: null, hasDetail: false, fatalError: null };
   if (!log) return result;
   const clsIdx = classIndex || {};
   const lines = log.split('\n');
-  const stack = [];        // frames: { className, methodName, file, line, variables }
+  const stack = [];        // frames: { className, methodName, file, line, variables, classFields }
   const addrMap = new Map();
 
   const top = () => stack[stack.length - 1];
   const resolveFile = (cls) => cls ? (clsIdx[cls] || clsIdx[cls.toLowerCase()] || null) : null;
 
-  const snapshot = (lineNo, kind) => {
+  // Resolve a qualified Apex name (possibly namespaced) to { className, methodName, file }.
+  // Handles: "Ns.Class.method(args)", "Class.method", "Ns.Outer.Inner.method",
+  //          constructors "Ns.Class.Class()". Namespace segments won't resolve to a
+  //          file, so we scan the class path L→R and pick the first segment that maps
+  //          to a workspace file (that's the top-level class the code lives in).
+  const resolveQualified = (qname) => {
+    const beforeParen = String(qname).split('(')[0].trim();
+    const segs = beforeParen.split('.').filter(Boolean);
+    const methodName = segs.length ? segs[segs.length - 1] : qname;
+    const classSegs = segs.slice(0, -1);
+    let file = null, className = classSegs[classSegs.length - 1] || methodName;
+    for (const s of classSegs) { const f = resolveFile(s); if (f) { file = f; className = s; break; } }
+    return { className, methodName, file };
+  };
+
+  // Shallow snapshot: variable VALUES are replaced (never mutated) on reassignment,
+  // so a shallow copy of each frame's maps preserves history cheaply (no deep clone).
+  const snapshot = (lineNo) => {
     if (!stack.length) return;
     const t = top();
     if (lineNo != null) t.line = lineNo;
+    if (!t.file) return; // no source to show — skip (steps focus on user's files)
     const frames = stack.map(f => ({
       className: f.className,
       methodName: f.methodName,
       file: f.file,
       line: f.line,
-      variables: JSON.parse(JSON.stringify(f.variables || {})),
-      classFields: {},
+      variables: { ...(f.variables || {}) },
+      classFields: { ...(f.classFields || {}) },
       statements: [{ line: f.line }],
       pc: 0,
     }));
-    result.steps.push({ file: t.file, line: t.line, depth: stack.length, frames, kind });
+    result.steps.push({ file: t.file, line: t.line, depth: stack.length });
+    result.steps[result.steps.length - 1].frames = frames;
   };
 
   for (const raw of lines) {
@@ -1746,14 +1780,18 @@ function buildReplayTimeline(log, classIndex) {
     const lineNo = (parts[2] && /\[(\d+)\]/.test(parts[2])) ? parseInt(parts[2].match(/\[(\d+)\]/)[1], 10) : null;
 
     switch (ev) {
-      case 'METHOD_ENTRY':
-      case 'CONSTRUCTOR_ENTRY': {
+      case 'METHOD_ENTRY': {
+        // parts: ts|METHOD_ENTRY|[line]|id|Ns.Class.method(args)
         const qname = parts.slice(4).join('|').trim() || parts.slice(3).join('|').trim();
-        const namePart = qname.split('(')[0].trim();
-        const segs = namePart.split('.');
-        const methodName = segs[segs.length - 1] || qname;
-        const topClass = segs[0];
-        stack.push({ className: topClass, methodName, file: resolveFile(topClass), line: lineNo || 0, variables: {} });
+        const r = resolveQualified(qname);
+        stack.push({ className: r.className, methodName: r.methodName, file: r.file, line: lineNo || 0, variables: {}, classFields: {} });
+        break;
+      }
+      case 'CONSTRUCTOR_ENTRY': {
+        // parts: ts|CONSTRUCTOR_ENTRY|[line]|id|<init>(args)|Ns.Class
+        const typeName = (parts[5] || parts[4] || '').trim();
+        const r = resolveQualified(typeName + '.<init>');
+        stack.push({ className: r.className, methodName: r.className, file: r.file, line: lineNo || 0, variables: {}, classFields: {} });
         break;
       }
       case 'METHOD_EXIT':
@@ -1761,8 +1799,9 @@ function buildReplayTimeline(log, classIndex) {
         if (stack.length) stack.pop();
         break;
       case 'VARIABLE_SCOPE_BEGIN': {
+        // ts|VARIABLE_SCOPE_BEGIN|[line]|name|type|...
         const name = parts[3];
-        if (top() && name && !(name in top().variables)) top().variables[name] = null;
+        if (top() && name && !name.includes('.') && !(name in top().variables)) top().variables[name] = null;
         break;
       }
       case 'VARIABLE_ASSIGNMENT': {
@@ -1777,20 +1816,29 @@ function buildReplayTimeline(log, classIndex) {
         }
         const val = parseLogValue(valParts.join('|'), addrMap);
         if (top() && name) {
-          top().variables[name] = val;
+          if (name.includes('.')) {
+            // Qualified name → a class static/instance field. Store under short name.
+            const short = name.split('.').pop();
+            top().classFields[short] = val;
+          } else {
+            top().variables[name] = val;
+          }
           if (addr && val && typeof val === 'object') addrMap.set(addr, val);
         }
         break;
       }
       case 'STATEMENT_EXECUTE':
         result.hasDetail = true;
-        if (top() && top().file) snapshot(lineNo, 'statement');
+        snapshot(lineNo);
         break;
       case 'USER_DEBUG': {
         const msg = parts.slice(4).join('|');
         if (msg.startsWith('__CC_RET__')) result.returnRaw = msg.slice('__CC_RET__'.length);
         break;
       }
+      case 'FATAL_ERROR':
+        if (!result.fatalError) result.fatalError = parts.slice(2).join('|').trim();
+        break;
       default:
         break;
     }
@@ -1804,9 +1852,13 @@ function enterReplayMode(timeline) {
   debugState.replayMode = true;
   debugState.replayTimeline = timeline.steps;
   debugState.replayIndex = 0;
+  debugState.replayFatalError = timeline.fatalError || null;
   debugState.active = true;
   debugState.paused = true;
   addConsoleEntry('info', `🎬 Replay mode — stepping ${timeline.steps.length} recorded statements with real org values. Use Step/Continue.`);
+  if (timeline.fatalError) {
+    addConsoleEntry('error', `⚠ Execution ended with an uncatchable error: ${timeline.fatalError.split('\n')[0]}. You can still step through everything up to that point.`);
+  }
   replayGoto(0);
   return true;
 }
@@ -1845,7 +1897,11 @@ async function replayAdvance(predicate, stopAtBreakpoints) {
   }
   if (i >= steps.length) {
     await replayGoto(steps.length - 1);
-    addConsoleEntry('info', '✓ End of recorded execution reached.');
+    if (debugState.replayFatalError) {
+      addConsoleEntry('error', `■ Execution stopped here — ${debugState.replayFatalError.split('\n')[0]}`);
+    } else {
+      addConsoleEntry('info', '✓ End of recorded execution reached.');
+    }
     if (debugState.orgActivity?.returnValue !== undefined) {
       addConsoleEntry('info', `return → ${formatValue(debugState.orgActivity.returnValue)}`);
     }
