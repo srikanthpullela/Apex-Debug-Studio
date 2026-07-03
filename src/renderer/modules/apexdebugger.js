@@ -1746,6 +1746,42 @@ function parseLogValue(raw, addrMap) {
   return v; // raw string (e.g. a Datetime like "2024-01-01 10:00:00")
 }
 
+/** Regex for a heap-address string as stored by parseLogValue (bare or "→ 0x..."). */
+const ADDR_RE = /^(?:→ )?(0x[0-9a-fA-F]+)$/;
+
+/**
+ * Recursively replace heap-address placeholder strings with their real objects
+ * from addrMap. Uses memoization + a seen-set so shared/cyclic references are
+ * handled once and cheaply (the timeline shares nested object references across
+ * many shallow frame snapshots).
+ */
+function resolveAddresses(value, addrMap, seen, memo, depth) {
+  if (depth > 24) return value;
+  if (typeof value === 'string') {
+    const m = value.match(ADDR_RE);
+    if (m && addrMap.has(m[1])) {
+      return resolveAddresses(addrMap.get(m[1]), addrMap, seen, memo, depth + 1);
+    }
+    return value;
+  }
+  if (!value || typeof value !== 'object') return value;
+  if (memo.has(value)) return memo.get(value);
+  if (seen.has(value)) return value; // cycle guard
+  seen.add(value);
+  memo.set(value, value); // resolve in place so shared refs update everywhere
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      value[i] = resolveAddresses(value[i], addrMap, seen, memo, depth + 1);
+    }
+  } else {
+    for (const k of Object.keys(value)) {
+      value[k] = resolveAddresses(value[k], addrMap, seen, memo, depth + 1);
+    }
+  }
+  seen.delete(value);
+  return value;
+}
+
 /**
  * Build a replay timeline from an Apex debug log.
  * Requires the log to contain STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT (FINEST).
@@ -1866,6 +1902,25 @@ function buildReplayTimeline(log, classIndex) {
         break;
       default:
         break;
+    }
+  }
+
+  // Final pass: now that addrMap is fully populated, resolve heap-address
+  // placeholders (e.g. request.lineItems = "0x43f5d50") into their real objects.
+  // Object references are shared across shallow frame snapshots, so a single
+  // memoized walk resolves them everywhere at once.
+  if (result.steps.length) {
+    const memo = new Map();
+    const seen = new Set();
+    for (const step of result.steps) {
+      for (const f of step.frames) {
+        for (const k of Object.keys(f.variables)) {
+          f.variables[k] = resolveAddresses(f.variables[k], addrMap, seen, memo, 0);
+        }
+        for (const k of Object.keys(f.classFields)) {
+          f.classFields[k] = resolveAddresses(f.classFields[k], addrMap, seen, memo, 0);
+        }
+      }
     }
   }
   return result;
@@ -2687,7 +2742,10 @@ function addConsoleEntry(type, message, line) {
 function formatValue(val) {
   if (val === null) return 'null';
   if (val === undefined) return 'undefined';
-  if (typeof val === 'string') return `"${val.length > 80 ? val.substring(0, 80) + '...' : val}"`;
+  if (typeof val === 'string') {
+    if (ADDR_RE.test(val)) return '‹ref: not in log›';
+    return `"${val.length > 80 ? val.substring(0, 80) + '...' : val}"`;
+  }
   if (typeof val === 'number' || typeof val === 'boolean') return String(val);
   if (Array.isArray(val)) return `List (${val.length} items)`;
   if (val instanceof Set) return `Set (${val.size} items)`;
@@ -2702,7 +2760,10 @@ function formatValue(val) {
 function formatValueShort(val) {
   if (val === null) return 'null';
   if (val === undefined) return 'undefined';
-  if (typeof val === 'string') return `"${val.length > 20 ? val.substring(0, 20) + '...' : val}"`;
+  if (typeof val === 'string') {
+    if (ADDR_RE.test(val)) return '‹ref›';
+    return `"${val.length > 20 ? val.substring(0, 20) + '...' : val}"`;
+  }
   if (typeof val === 'number' || typeof val === 'boolean') return String(val);
   if (Array.isArray(val)) return `[${val.length}]`;
   if (typeof val === 'object') return `{...}`;
