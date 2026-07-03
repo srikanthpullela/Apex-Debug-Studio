@@ -2175,6 +2175,67 @@ async function replayStepOut() {
 }
 
 /**
+ * Whether a branch/condition expression should be resolved against the org.
+ * True when Live Org is on and the local guess is unreliable — i.e. the value
+ * is null/undefined, or the expression contains a method call whose result the
+ * local simulator can't compute (e.g. SystemUtil.isFieldExpressionEnabled()).
+ */
+function conditionNeedsOrg(expr, localVal) {
+  if (!(debugState.liveOrgMode && liveOrgAvailable())) return false;
+  if (localVal === undefined || localVal === null) return true;
+  return /[A-Za-z_][\w.]*\s*\(/.test(String(expr || ''));
+}
+
+/**
+ * Resolve a boolean branch condition, preferring the REAL org value when the
+ * local simulator can't compute it. This makes `if`/`while`/ternaries honour
+ * true/false exactly like the running org (Chrome-style), not a guess.
+ */
+async function resolveBranchCondition(expr, scope, frame, line) {
+  const local = evaluateExpression(expr, scope);
+  if (frame && conditionNeedsOrg(expr, local)) {
+    debugState.orgFetching = true; updateLiveOrgIndicator();
+    try {
+      const r = await evaluateInOrg(expr, frame);
+      if (!r.error && r.value != null) {
+        const b = typeof r.value === 'boolean' ? r.value : !!r.value;
+        addConsoleEntry('branch', `↳ ${expr} → ${b} (real org value)`, line);
+        return b;
+      }
+      if (r.error) addConsoleEntry('info', `↳ couldn't resolve "${expr}" in org (${r.error.split('\n')[0]}); using local value ${!!local}`, line);
+    } catch (e) {
+      addConsoleEntry('info', `↳ org eval failed for "${expr}": ${e?.message || e}`, line);
+    } finally {
+      debugState.orgFetching = false; updateLiveOrgIndicator();
+    }
+  }
+  return !!local;
+}
+
+/**
+ * Resolve a loop's collection, preferring REAL org data when the local value is
+ * empty/unknown, so `for (x : coll)` iterates the true number of times.
+ */
+async function resolveLoopCollection(expr, scope, frame, line) {
+  const local = evaluateExpression(expr, scope);
+  const localArr = Array.isArray(local)
+    ? local
+    : (local && typeof local === 'object' ? Object.values(local) : null);
+  if ((!localArr || localArr.length === 0) && frame && debugState.liveOrgMode && liveOrgAvailable()) {
+    debugState.orgFetching = true; updateLiveOrgIndicator();
+    try {
+      const r = await evaluateInOrg(expr, frame);
+      if (!r.error && Array.isArray(r.value)) {
+        addConsoleEntry('loop', `↳ ${expr} → ${r.value.length} item(s) (real org value)`, line);
+        return r.value;
+      }
+    } catch (_) { /* fall back to local */ }
+    finally { debugState.orgFetching = false; updateLiveOrgIndicator(); }
+  }
+  return localArr || [];
+}
+
+/**
  * Execute the current statement and advance the program counter.
  * Returns true if execution should pause (breakpoint, step, or end of method).
  */
@@ -2244,7 +2305,7 @@ async function executeCurrentStatement() {
       break;
 
     case 'conditional': {
-      const condResult = evaluateExpression(stmt.condition, scope);
+      const condResult = await resolveBranchCondition(stmt.condition, scope, frame, stmt.line);
       addConsoleEntry('branch', `if (${stmt.condition}) → ${condResult ? 'true' : 'false'}`, stmt.line);
       if (condResult && stmt.thenBlock.length > 0) {
         // Insert then-block statements at current position
@@ -2316,8 +2377,7 @@ async function executeCurrentStatement() {
         if (forEachMatch) {
           const iterVar = forEachMatch[2];
           const collectionExpr = forEachMatch[3].trim();
-          const collection = evaluateExpression(collectionExpr, scope);
-          const items = Array.isArray(collection) ? collection : (collection != null && typeof collection === 'object' ? Object.values(collection) : []);
+          const items = await resolveLoopCollection(collectionExpr, scope, frame, stmt.line);
           addConsoleEntry('loop', `for (${iterVar} : ${collectionExpr}) — ${items.length} iterations`, stmt.line);
           // Unroll loop: insert body for each item
           const expanded = [];
@@ -2397,7 +2457,7 @@ async function executeCurrentStatement() {
         }
       } else if (stmt.loopType === 'while') {
         // While loop — unroll with condition check, max 50 iterations
-        const condResult = evaluateExpression(stmt.condition, scope);
+        const condResult = await resolveBranchCondition(stmt.condition, scope, frame, stmt.line);
         if (condResult && stmt.body.length > 0) {
           addConsoleEntry('loop', `while (${stmt.condition}) → true, entering loop`, stmt.line);
           const bodyClone = JSON.parse(JSON.stringify(stmt.body));
@@ -2628,7 +2688,12 @@ async function executeCurrentStatement() {
 }
 
 async function stepIntoMethod(className, methodName, argsRaw, currentFrame, assignVar) {
-  const filePath = await resolveClassFile(className);
+  let filePath = await resolveClassFile(className);
+  // Same-class (often private) method: the class name may not resolve on its own
+  // (inner classes, bare calls) — fall back to the current frame's own file.
+  if (!filePath && currentFrame && (!className || className === currentFrame.className)) {
+    filePath = currentFrame.file;
+  }
   if (!filePath) return false;
 
   try {
