@@ -142,22 +142,172 @@
     }
   }
 
+  /* ================= DOM (XML) support ================= */
+  function decodeXmlEntities(str) {
+    return String(str)
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+      .replace(/&#(\d+);/g, (m, d) => String.fromCharCode(+d))
+      .replace(/&#x([0-9a-fA-F]+);/g, (m, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/&amp;/g, '&');
+  }
+  function encodeXmlEntities(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  // Lightweight, dependency-free recursive-descent XML parser. Returns the root
+  // ApexXmlnode (ELEMENT) or null. Handles elements, attributes, text, CDATA,
+  // comments, processing instructions, self-closing tags and simple namespaces.
+  function parseXml(input) {
+    if (input == null) return null;
+    const s = String(input);
+    const n = s.length;
+    let i = 0;
+    const skipSpace = () => { while (i < n && /\s/.test(s[i])) i++; };
+    const parseName = () => { const start = i; while (i < n && !/[\s\/>=?]/.test(s[i])) i++; return s.slice(start, i); };
+    function parseAttributes() {
+      const attrs = [];
+      for (;;) {
+        skipSpace();
+        if (i >= n) break;
+        const c = s[i];
+        if (c === '>' || c === '/' || c === '?') break;
+        const name = parseName();
+        if (!name) { i++; continue; }
+        skipSpace();
+        let value = '';
+        if (s[i] === '=') {
+          i++; skipSpace();
+          const q = s[i];
+          if (q === '"' || q === "'") {
+            i++; const vs = i;
+            while (i < n && s[i] !== q) i++;
+            value = s.slice(vs, i); i++;
+          }
+        }
+        attrs.push({ name, value: decodeXmlEntities(value) });
+      }
+      return attrs;
+    }
+    function makeNode(rawName, attrs) {
+      const idx = rawName.indexOf(':');
+      const prefix = idx >= 0 ? rawName.slice(0, idx) : null;
+      const local = idx >= 0 ? rawName.slice(idx + 1) : rawName;
+      let namespace = null;
+      for (const a of attrs) {
+        if (a.name === 'xmlns' && !prefix) namespace = a.value;
+        else if (prefix && a.name === 'xmlns:' + prefix) namespace = a.value;
+      }
+      return new ApexXmlnode({
+        nodeType: 'ELEMENT', name: local, prefix, namespace,
+        attributes: attrs.filter(a => a.name !== 'xmlns' && a.name.indexOf('xmlns:') !== 0),
+        children: [], text: '',
+      });
+    }
+    function parseElement() {
+      i++; // consume '<'
+      const rawName = parseName();
+      const attrs = parseAttributes();
+      skipSpace();
+      const node = makeNode(rawName, attrs);
+      if (s[i] === '/') { i++; if (s[i] === '>') i++; return node; }
+      if (s[i] === '>') i++;
+      for (;;) {
+        if (i >= n) break;
+        if (s[i] === '<') {
+          if (s[i + 1] === '/') { i += 2; parseName(); skipSpace(); if (s[i] === '>') i++; break; }
+          if (s.startsWith('<!--', i)) { const e = s.indexOf('-->', i); i = e < 0 ? n : e + 3; continue; }
+          if (s.startsWith('<![CDATA[', i)) {
+            const e = s.indexOf(']]>', i + 9); const txt = s.slice(i + 9, e < 0 ? n : e); i = e < 0 ? n : e + 3;
+            node.text += txt; node.children.push(new ApexXmlnode({ nodeType: 'CDATA', text: txt })); continue;
+          }
+          if (s.startsWith('<?', i)) { const e = s.indexOf('?>', i); i = e < 0 ? n : e + 2; continue; }
+          const child = parseElement();
+          if (child) { child.parent = node; node.children.push(child); }
+          continue;
+        }
+        const ts = i; while (i < n && s[i] !== '<') i++;
+        const decoded = decodeXmlEntities(s.slice(ts, i));
+        if (decoded.trim().length) { node.text += decoded; node.children.push(new ApexXmlnode({ nodeType: 'TEXT', text: decoded })); }
+      }
+      return node;
+    }
+    for (;;) {
+      skipSpace();
+      if (i >= n) return null;
+      if (s.startsWith('<?', i)) { const e = s.indexOf('?>', i); i = e < 0 ? n : e + 2; continue; }
+      if (s.startsWith('<!--', i)) { const e = s.indexOf('-->', i); i = e < 0 ? n : e + 3; continue; }
+      if (s.startsWith('<!', i)) { const e = s.indexOf('>', i); i = e < 0 ? n : e + 1; continue; }
+      if (s[i] === '<') return parseElement();
+      i++;
+    }
+  }
+  function serializeXml(node) {
+    if (!node) return '';
+    if (node.nodeType === 'TEXT') return encodeXmlEntities(node.text);
+    if (node.nodeType === 'CDATA') return '<![CDATA[' + node.text + ']]>';
+    const tag = node.prefix ? node.prefix + ':' + node.name : node.name;
+    let attrs = '';
+    if (node.namespace) attrs += node.prefix ? ` xmlns:${node.prefix}="${encodeXmlEntities(node.namespace)}"` : ` xmlns="${encodeXmlEntities(node.namespace)}"`;
+    for (const a of node.attributes || []) attrs += ` ${a.name}="${encodeXmlEntities(a.value)}"`;
+    const kids = (node.children || []);
+    if (!kids.length && !node.text) return `<${tag}${attrs}/>`;
+    const inner = kids.length ? kids.map(serializeXml).join('') : encodeXmlEntities(node.text || '');
+    return `<${tag}${attrs}>${inner}</${tag}>`;
+  }
+  class ApexXmlnode {
+    constructor(o) {
+      this.nodeType = 'ELEMENT'; this.name = ''; this.prefix = null; this.namespace = null;
+      this.attributes = []; this.children = []; this.text = ''; this.parent = null;
+      Object.assign(this, o);
+    }
+    elementChildren() { return this.children.filter(c => c.nodeType === 'ELEMENT'); }
+    findAttr(name, ns) {
+      const lk = String(name).toLowerCase();
+      return this.attributes.find(a => a.name.toLowerCase() === lk) || null;
+    }
+  }
+  class ApexDomDocument {
+    constructor() { this.root = null; }
+  }
+
   /* ================= SObject helpers ================= */
   function isSObject(v) {
     return v !== null && typeof v === 'object' && !Array.isArray(v)
       && !(v instanceof ApexMap) && !(v instanceof ApexSet) && !(v instanceof ApexObject)
-      && !(v instanceof ApexDate) && !(v instanceof ApexDatetime) && !(v instanceof ApexError);
+      && !(v instanceof ApexDate) && !(v instanceof ApexDatetime) && !(v instanceof ApexError)
+      && !(v instanceof ApexXmlnode) && !(v instanceof ApexDomDocument);
   }
   function sobjGet(rec, field) {
     if (rec == null) return undefined;
     if (field in rec) return rec[field];
     const lk = field.toLowerCase();
     for (const k of Object.keys(rec)) if (k.toLowerCase() === lk) return rec[k];
+    // Namespace-tolerant: source uses bare `Field__c` but the org returns
+    // `Namespace__Field__c` (and vice versa). Match on the unqualified suffix.
+    const bare = stripNs(lk);
+    for (const k of Object.keys(rec)) {
+      if (k === 'attributes') continue;
+      if (stripNs(k.toLowerCase()) === bare) return rec[k];
+    }
     return undefined;
+  }
+  function stripNs(name) {
+    // Split on the managed-package separator "__". A namespaced custom field looks
+    // like ns__Field__c (3+ segments); a bare custom field is Field__c (2 segments);
+    // a standard field is Id/Name (1 segment). Only strip a leading namespace when
+    // there are 3+ segments, keeping the true field name + suffix intact.
+    const parts = name.split('__');
+    if (parts.length >= 3) return parts.slice(1).join('__');
+    return name;
   }
   function sobjSet(rec, field, value) {
     const lk = field.toLowerCase();
     for (const k of Object.keys(rec)) if (k.toLowerCase() === lk) { rec[k] = value; return; }
+    const bare = stripNs(lk);
+    for (const k of Object.keys(rec)) {
+      if (k === 'attributes') continue;
+      if (stripNs(k.toLowerCase()) === bare) { rec[k] = value; return; }
+    }
     rec[field] = value;
   }
   function sobjType(rec) {
@@ -200,6 +350,8 @@
     if (v instanceof ApexDate) return 'Date';
     if (v instanceof ApexDatetime) return 'Datetime';
     if (v instanceof ApexError) return v.apexType;
+    if (v instanceof ApexDomDocument) return 'DOM.Document';
+    if (v instanceof ApexXmlnode) return 'DOM.XmlNode';
     if (v instanceof ApexObject) return v.classInfo.name;
     if (isSObject(v)) return sobjType(v);
     return 'Object';
@@ -335,12 +487,13 @@
   }
 
   /* ================= interpreter ================= */
-  const BUILTIN_TYPES = new Set(['string', 'integer', 'long', 'double', 'decimal', 'boolean', 'id', 'object', 'date', 'datetime', 'time', 'blob', 'list', 'map', 'set', 'math', 'json', 'system', 'database', 'limits', 'userinfo', 'test', 'schema', 'sobject', 'exception', 'type', 'url', 'void', 'string.format', 'logginglevel', 'apexpages']);
+  const BUILTIN_TYPES = new Set(['string', 'integer', 'long', 'double', 'decimal', 'boolean', 'id', 'object', 'date', 'datetime', 'time', 'blob', 'list', 'map', 'set', 'math', 'json', 'system', 'database', 'limits', 'userinfo', 'test', 'schema', 'sobject', 'exception', 'type', 'url', 'void', 'string.format', 'logginglevel', 'apexpages', 'dom']);
   const BUILTIN_ENUMS = {
     'logginglevel': ['NONE', 'INTERNAL', 'FINEST', 'FINER', 'FINE', 'DEBUG', 'INFO', 'WARN', 'ERROR'],
     'apexpages.severity': ['CONFIRM', 'ERROR', 'FATAL', 'INFO', 'WARNING'],
     'triggeroperation': ['BEFORE_INSERT', 'BEFORE_UPDATE', 'BEFORE_DELETE', 'AFTER_INSERT', 'AFTER_UPDATE', 'AFTER_DELETE', 'AFTER_UNDELETE'],
     'quiddity': ['ANONYMOUS', 'AURA', 'BATCH_APEX', 'FUTURE', 'INVOCABLE_ACTION', 'QUEUEABLE', 'REST', 'RUNTEST_SYNC', 'SCHEDULED', 'SOAP', 'SYNCHRONOUS', 'VF'],
+    'dom.xmlnodetype': ['ELEMENT', 'COMMENT', 'TEXT', 'CDATA', 'PROCESSING_INSTRUCTION'],
   };
   // Sentinel returned by org-eval helpers when a value could not be resolved from the org.
   const ENGINE_UNRESOLVED = Symbol('engine-unresolved');
@@ -551,8 +704,80 @@
     }
 
     pickOverload(methods, args) {
-      const exact = methods.find(m => (m.params || []).length === args.length);
-      return exact || methods[0];
+      if (!methods || !methods.length) return null;
+      args = args || [];
+      // Candidates whose arity matches the supplied argument count.
+      const arityMatch = methods.filter(m => (m.params || []).length === args.length);
+      const pool = arityMatch.length ? arityMatch : methods;
+      if (pool.length === 1) return pool[0];
+      // Type-aware disambiguation: Apex resolves overloads by parameter types,
+      // not merely by argument count. Score each candidate and keep the best.
+      let best = pool[0], bestScore = -Infinity;
+      for (const m of pool) {
+        const params = m.params || [];
+        let score = 0;
+        for (let i = 0; i < args.length; i++) {
+          const pt = params[i] && params[i].type ? params[i].type.name : null;
+          score += this.scoreArgToParam(args[i], pt);
+        }
+        if (score > bestScore) { bestScore = score; best = m; }
+      }
+      return best;
+    }
+
+    // How well a runtime argument value fits a declared parameter type.
+    // 3 = exact match, 2 = compatible, 1 = weak/unknown, 0 = neutral, negative = mismatch.
+    scoreArgToParam(arg, paramType) {
+      if (!paramType) return 0;                       // unknown param type -> neutral
+      const base = String(paramType).replace(/<[\s\S]*>/, '').replace(/\[\]$/, '').trim();
+      const bl = base.toLowerCase();
+      const isCollectionType = /<.*>/.test(String(paramType)) || /\[\]$/.test(String(paramType));
+      if (bl === 'object' || bl === 'sobject' && isSObject(arg)) return bl === 'object' ? 1 : 2;
+      if (arg === null || arg === undefined) return 1; // null binds to any reference type
+      if (typeof arg === 'boolean') return bl === 'boolean' ? 3 : -3;
+      if (typeof arg === 'number') {
+        return ['integer', 'long', 'double', 'decimal'].includes(bl) ? 3 : -3;
+      }
+      if (typeof arg === 'string') {
+        // Apex freely assigns between String and Id; also date-ish parse targets.
+        if (['string', 'id'].includes(bl)) return 3;
+        if (['date', 'datetime', 'time', 'blob'].includes(bl)) return 1;
+        return -3;
+      }
+      if (Array.isArray(arg)) return (bl === 'list' || bl === 'set' || isCollectionType) ? 3 : -3;
+      if (arg instanceof ApexMap) return bl === 'map' ? 3 : -3;
+      if (arg instanceof ApexSet) return bl === 'set' ? 3 : -3;
+      if (arg instanceof ApexDate) return bl === 'date' ? 3 : (bl === 'datetime' ? 1 : -2);
+      if (arg instanceof ApexDatetime) return bl === 'datetime' ? 3 : (bl === 'date' ? 1 : -2);
+      if (arg instanceof ApexObject) {
+        if (this.apexObjIsA(arg.classInfo, bl)) return 3;
+        return -2;
+      }
+      if (isSObject(arg)) {
+        if (bl === 'sobject') return 2;
+        const t = String(sobjType(arg)).toLowerCase();
+        if (t === bl || stripNs(t) === stripNs(bl)) return 3;
+        // unknown/stub SObject vs a concrete object type -> weak compatible
+        if (/__(c|mdt|e|x|share|history)$/.test(bl) || t === 'sobject') return 1;
+        return -1;
+      }
+      return 0;
+    }
+
+    // Does an ApexObject's class satisfy a type name (self / super chain / interfaces)?
+    apexObjIsA(ci, typeNameLower) {
+      let c = ci;
+      const seen = new Set();
+      while (c && !seen.has(c)) {
+        seen.add(c);
+        if (c.name && c.name.toLowerCase() === typeNameLower) return true;
+        if (c.qualifiedName && c.qualifiedName.toLowerCase() === typeNameLower) return true;
+        for (const it of (c.ast.interfaces || [])) {
+          if (it && it.name && it.name.toLowerCase() === typeNameLower) return true;
+        }
+        c = this.superOf(c);
+      }
+      return false;
     }
 
     superOf(ci) {
@@ -1357,6 +1582,8 @@
       if (target instanceof ApexDate) return this.callDateMethod(target, name, args, line);
       if (target instanceof ApexDatetime) return this.callDatetimeMethod(target, name, args, line);
       if (target instanceof ApexError) return this.callErrorMethod(target, name, args, line);
+      if (target instanceof ApexDomDocument) return this.callDomDocumentMethod(target, name, args, line);
+      if (target instanceof ApexXmlnode) return this.callXmlnodeMethod(target, name, args, line);
       if (isSObject(target)) return this.callSObjectMethod(target, name, args, line);
       throw new ApexError('System.NoSuchMethodException', `Method ${name} not found on ${typeNameOf(target)}`, line);
     }
@@ -1417,6 +1644,8 @@
       }
       if (tn === 'datetime') { const args = await this.evalArgs(e.args, frame); return args.length ? new ApexDatetime(new Date(args[0], (args[1] || 1) - 1, args[2] || 1, args[3] || 0, args[4] || 0, args[5] || 0)) : ApexDatetime.now(); }
       if (tn === 'date') { const args = await this.evalArgs(e.args, frame); return args.length >= 3 ? new ApexDate(args[0], args[1], args[2]) : ApexDate.today(); }
+      // DOM.Document — real XML document
+      if (tn === 'dom.document') { await this.evalArgs(e.args, frame); return new ApexDomDocument(); }
       // ApexPages.Message — simulate locally
       if (tn === 'apexpages.message') {
         const args = await this.evalArgs(e.args, frame);
@@ -1633,6 +1862,49 @@
       }
     }
 
+    /* ---------- DOM.Document / DOM.XmlNode ---------- */
+    callDomDocumentMethod(doc, name, a, line) {
+      switch (name.toLowerCase()) {
+        case 'load': doc.root = parseXml(a[0]); return null;
+        case 'getrootelement': return doc.root;
+        case 'toxmlstring': return doc.root ? serializeXml(doc.root) : '';
+        case 'createrootelement': {
+          const node = new ApexXmlnode({ name: a[0], namespace: a[1] || null, prefix: a[2] || null });
+          doc.root = node; return node;
+        }
+        default:
+          if (this.host.log) this.host.log(`⚠ DOM.Document.${name}() is not simulated — returning null and continuing.`, 'system');
+          return null;
+      }
+    }
+    callXmlnodeMethod(node, name, a, line) {
+      switch (name.toLowerCase()) {
+        case 'getname': return node.name || null;
+        case 'gettext': return node.text != null ? node.text : '';
+        case 'getnodetype': return node.nodeType;
+        case 'getnamespace': return node.namespace || null;
+        case 'getprefixfornamespace': return node.prefix || null;
+        case 'getparent': return node.parent || null;
+        case 'getchildelements': return node.elementChildren();
+        case 'getchildren': return node.children.slice();
+        case 'haschildren': return node.children.length > 0;
+        case 'getchildelement': {
+          const nm = String(a[0] || '').toLowerCase();
+          return node.elementChildren().find(c => c.name.toLowerCase() === nm) || null;
+        }
+        case 'getattributecount': return node.attributes.length;
+        case 'getattributekeyat': return node.attributes[a[0]] ? node.attributes[a[0]].name : null;
+        case 'getattributekeynsat': return null;
+        case 'getattributevalueat': return node.attributes[a[0]] ? node.attributes[a[0]].value : null;
+        case 'getattribute':
+        case 'getattributevalue': { const at = node.findAttr(a[0], a[1]); return at ? at.value : null; }
+        case 'tostring': return serializeXml(node);
+        default:
+          if (this.host.log) this.host.log(`⚠ DOM.XmlNode.${name}() is not simulated — returning null and continuing.`, 'system');
+          return null;
+      }
+    }
+
     /* ---------- static builtins ---------- */
     staticProp(typeName, propName, line) {
       const t = typeName.toLowerCase();
@@ -1646,6 +1918,8 @@
       }
       // ApexPages.Severity sub-namespace
       if (t === 'apexpages' && p === 'severity') return { __builtinRef: 'ApexPages.Severity' };
+      // DOM sub-namespace (DOM.Xmlnodetype.ELEMENT, etc.)
+      if (t === 'dom' && p === 'xmlnodetype') return { __builtinRef: 'DOM.Xmlnodetype' };
       // Unknown static prop — degrade gracefully (never kill a session)
       if (this.host.log) this.host.log(`⚠ ${typeName}.${propName} is not simulated — returning null and continuing.`, 'system');
       return null;
