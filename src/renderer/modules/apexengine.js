@@ -417,8 +417,31 @@
       if (pauseReason === 'breakpoint') this._lastBpKey = gateKey;
       this.pauseRequested = false;
       this.paused = true;
+      this._hasSteppedOnce = true;
       try {
         if (this.host.onPause) this.host.onPause({ line: node.line, file: frame.file, reason: pauseReason, stack: this.getCallStack() });
+      } catch (e) { /* UI errors must not kill execution */ }
+      const action = await new Promise(res => { this._resume = res; });
+      this.paused = false;
+      if (action === 'stop') { this.stopped = true; throw new StopSignal(); }
+      this.mode = action;
+      this.stepDepth = this.callStack.length;
+    }
+
+    /* ---------- pause when an exception is caught (Chrome "pause on caught exceptions") ---------- */
+    async pauseForException(err, frame, caught) {
+      if (this.pauseOnCaught === false) return;
+      // Only pause when this is an interactive stepping session (breakpoints set or
+      // currently stepping) — never gate a plain "Continue" run into an interruption.
+      if (this.mode === 'continue' && !this._hasSteppedOnce) return;
+      const line = (err.apexStack && err.apexStack.length && err.apexStack[0].line) || err.apexLine || frame.line;
+      this.paused = true;
+      try {
+        if (this.host.onPause) this.host.onPause({
+          line, file: frame.file, reason: caught ? 'caught-exception' : 'exception',
+          error: { type: err.apexType, message: err.apexMessage || err.message || '', stack: err.apexStack || [] },
+          stack: this.getCallStack(),
+        });
       } catch (e) { /* UI errors must not kill execution */ }
       const action = await new Promise(res => { this._resume = res; });
       this.paused = false;
@@ -805,6 +828,10 @@
             let handled = false;
             for (const c of stmt.catches) {
               if (this.catchMatches(c.type, err)) {
+                // Surface the caught exception so the user can SEE why the try block
+                // exited early into catch (otherwise it looks like the try was skipped).
+                this.reportCaught(err, c);
+                await this.pauseForException(err, frame, true);
                 const env = new Environment(frame.env, 'catch');
                 if (c.name) env.define(c.name, err, c.type.name);
                 try { await this.execBlock(c.block, frame, env); handled = true; }
@@ -862,6 +889,23 @@
         ci = this.superOf(ci);
       }
       return false;
+    }
+
+    /**
+     * Surface a caught exception to the host console so the user can SEE why the
+     * try block exited early into catch. Without this a thrown-and-caught error is
+     * invisible and looks like "the try block was skipped".
+     */
+    reportCaught(err, catchClause) {
+      if (!this.host.log) return;
+      const where = (err.apexStack && err.apexStack.length)
+        ? ` at ${err.apexStack[0].className}.${err.apexStack[0].methodName} (line ${err.apexStack[0].line})`
+        : (err.apexLine ? ` (line ${err.apexLine})` : '');
+      const caughtAs = catchClause && catchClause.type ? catchClause.type.name : 'Exception';
+      this.host.log(`⚠ Caught ${err.apexType || 'Exception'}: ${err.apexMessage || err.message || ''}${where} → handled by catch (${caughtAs}${catchClause && catchClause.name ? ' ' + catchClause.name : ''}). Execution continues in the catch block.`, 'system');
+      if (err.apexStack && err.apexStack.length > 1) {
+        this.host.log(err.apexStack.map(f => `      at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'), 'system');
+      }
     }
 
     typeLabel(t) {

@@ -1472,6 +1472,17 @@ async function onEnginePause(info) {
   debugState.engineRunning = false;
   mirrorEngineStack(info.stack || []);
   debugState.currentLine = info.line;
+  // Announce an exception pause so it's obvious WHY we stopped (and why the try
+  // block handed control to catch), then let the user inspect state before continuing.
+  if ((info.reason === 'caught-exception' || info.reason === 'exception') && info.error) {
+    const e = info.error;
+    addConsoleEntry('error', `⏸ Paused on ${info.reason === 'caught-exception' ? 'caught ' : ''}exception: ${e.type || 'Exception'}: ${e.message || ''}`);
+    if (e.stack && e.stack.length) {
+      addConsoleEntry('error', e.stack.map(f => `      at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'));
+    }
+    addConsoleEntry('info', 'Inspect variables/stack now. ▶ Continue resumes into the catch block.');
+    renderConsolePanel();
+  }
   // Cross-file step-into: open the paused file if it isn't the current one
   if (info.file && info.file !== debugState.currentFile && /\.(cls|trigger)$/.test(info.file)) {
     try {
