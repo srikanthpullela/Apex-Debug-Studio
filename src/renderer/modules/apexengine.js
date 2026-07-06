@@ -336,6 +336,8 @@
 
   /* ================= interpreter ================= */
   const BUILTIN_TYPES = new Set(['string', 'integer', 'long', 'double', 'decimal', 'boolean', 'id', 'object', 'date', 'datetime', 'time', 'blob', 'list', 'map', 'set', 'math', 'json', 'system', 'database', 'limits', 'userinfo', 'test', 'schema', 'sobject', 'exception', 'type', 'url', 'void', 'string.format']);
+  // Sentinel returned by org-eval helpers when a value could not be resolved from the org.
+  const ENGINE_UNRESOLVED = Symbol('engine-unresolved');
 
   class ApexEngine {
     constructor(host) {
@@ -1549,7 +1551,9 @@
         case 'clone': { const c = Object.assign({}, rec); if (!a[0]) delete c.Id; return c; }
         case 'getpopulatedfieldsasmap': { const m = new ApexMap(); for (const k of Object.keys(rec)) if (k !== 'attributes') m.put(k, rec[k]); return m; }
         case 'tostring': return toApexString(rec);
-        default: throw new ApexError('System.NoSuchMethodException', `SObject.${name} not supported`, line);
+        default:
+          if (this.host.log) this.host.log(`⚠ SObject.${name}() is not simulated — returning null and continuing.`, 'system');
+          return null;
       }
     }
 
@@ -1717,13 +1721,102 @@
         if (n === 'forname') return { __typeToken: toApexString(a[0]) };
         return null;
       }
+      // ---- Custom Settings (__c) / Custom Metadata (__mdt) built-in static methods ----
+      // getInstance / getInstance(id|name) / getOrgDefaults / getValues(name) / getAll.
+      // Resolve REAL values from the connected org; fall back to a typed empty stub so
+      // execution keeps stepping instead of dying on a NoSuchMethodException.
+      if (/__(c|mdt)$/i.test(typeName) &&
+          (n === 'getinstance' || n === 'getorgdefaults' || n === 'getvalues' || n === 'getall')) {
+        return await this.resolveCustomSettingCall(typeName, name, n, a, line);
+      }
       // Unknown namespace/class — try lazy class load once
       const ci = await this.lazyLoadClass(typeName);
       if (ci) {
         const { ci: fci, m } = this.findMethodInHierarchy(ci, name, a, true);
         if (m && m.static) return this.invokeMethod(fci, m, null, a, frame);
       }
-      throw new ApexError('System.NoSuchMethodException', `${typeName}.${name} not supported`, line);
+      // Graceful degradation (V8-style "keep going"): a genuinely unsupported static
+      // method must NOT halt the whole debug session. Try to resolve the entire call
+      // in the org when every argument is a serializable scalar; otherwise log a
+      // warning and return null so line-by-line stepping continues.
+      const orgVal = await this.tryOrgStaticCall(typeName, name, a);
+      if (orgVal !== ENGINE_UNRESOLVED) return orgVal;
+      if (this.host.log) this.host.log(`⚠ ${typeName}.${name}() is not simulated and could not be resolved in the org — returning null and continuing.`, 'system');
+      return null;
+    }
+
+    /* ---------- custom setting / metadata resolution via the org ---------- */
+    apexLiteral(v) {
+      if (v === null || v === undefined) return 'null';
+      if (typeof v === 'number') return String(v);
+      if (typeof v === 'boolean') return String(v);
+      if (v instanceof ApexDate) return `Date.newInstance(${v.y}, ${v.mo}, ${v.day})`;
+      return `'${String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+    }
+
+    /** Convert plain JSON from an org eval into engine SObject/scalar values. */
+    orgJsonToSObject(v, typeName) {
+      if (v === null || v === undefined) return null;
+      if (typeof v !== 'object') return v;
+      if (Array.isArray(v)) return v.map(x => this.orgJsonToSObject(x, typeName));
+      const rec = {};
+      for (const k of Object.keys(v)) {
+        const child = v[k];
+        rec[k] = (child && typeof child === 'object')
+          ? this.orgJsonToSObject(child, (child && child.attributes && child.attributes.type) || 'SObject')
+          : child;
+      }
+      if (!rec.attributes) rec.attributes = { type: typeName };
+      return rec;
+    }
+
+    async resolveCustomSettingCall(typeName, methodName, n, a, line) {
+      const argLit = a.length ? this.apexLiteral(a[0]) : null;
+      let expr;
+      if (n === 'getall') expr = `${typeName}.getAll()`;
+      else if (n === 'getorgdefaults') expr = `${typeName}.getOrgDefaults()`;
+      else if (n === 'getvalues') expr = `${typeName}.getValues(${argLit != null ? argLit : "''"})`;
+      else expr = argLit != null ? `${typeName}.getInstance(${argLit})` : `${typeName}.getInstance()`;
+
+      let val = ENGINE_UNRESOLVED;
+      if (this.host.evalOrg) {
+        this.pendingBackend = `${typeName}.${methodName}() from org…`;
+        try {
+          const r = await this.host.evalOrg(expr, { sobjectType: typeName });
+          if (r && r.ok) val = r.value;
+        } catch (_) { /* fall through to stub */ }
+        finally { this.pendingBackend = null; }
+      }
+      if (val === ENGINE_UNRESOLVED) {
+        if (this.host.log) this.host.log(`↳ ${typeName}.${methodName}(): org value unavailable — using an empty ${n === 'getall' ? 'map' : 'record'} stub so stepping continues.`, 'system');
+        return n === 'getall' ? new ApexMap() : { attributes: { type: typeName } };
+      }
+      if (n === 'getall') {
+        const m = new ApexMap();
+        if (val && typeof val === 'object' && !Array.isArray(val)) {
+          for (const k of Object.keys(val)) m.put(k, this.orgJsonToSObject(val[k], typeName));
+        }
+        return m;
+      }
+      const rec = this.orgJsonToSObject(val, typeName);
+      return (rec && typeof rec === 'object') ? rec : { attributes: { type: typeName } };
+    }
+
+    /** Try to resolve an arbitrary static call in the org (scalar args only). */
+    async tryOrgStaticCall(typeName, methodName, a) {
+      if (!this.host.evalOrg) return ENGINE_UNRESOLVED;
+      for (const x of a) { if (x !== null && x !== undefined && typeof x === 'object') return ENGINE_UNRESOLVED; }
+      const expr = `${typeName}.${methodName}(${a.map(x => this.apexLiteral(x)).join(', ')})`;
+      this.pendingBackend = `${typeName}.${methodName}() from org…`;
+      try {
+        const r = await this.host.evalOrg(expr, {});
+        if (r && r.ok) {
+          const v = r.value;
+          return (v !== null && typeof v === 'object') ? this.orgJsonToSObject(v, 'SObject') : v;
+        }
+      } catch (_) { /* ignore */ }
+      finally { this.pendingBackend = null; }
+      return ENGINE_UNRESOLVED;
     }
   }
 

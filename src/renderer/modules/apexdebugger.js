@@ -1530,6 +1530,46 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
       addConsoleEntry('warn', `DML ${op.toUpperCase()} simulated locally (${records.length} record(s)) — the org is never modified by the debugger.`);
       renderConsolePanel();
     },
+    // Resolve a read-only Apex expression (custom settings, unsupported statics, etc.)
+    // against the connected org so the engine gets REAL values instead of halting.
+    // Never throws; returns { ok, value } or { ok:false, error }.
+    evalOrg: async (apexExpr) => {
+      if (!liveOrgAvailable()) return { ok: false, error: 'no org' };
+      try {
+        if (!debugState.engineOrgEvalCache) debugState.engineOrgEvalCache = new Map();
+        if (debugState.engineOrgEvalCache.has(apexExpr)) return debugState.engineOrgEvalCache.get(apexExpr);
+        debugState.orgFetching = true;
+        updateLiveOrgIndicator();
+        addConsoleEntry('info', `⚙ Resolving in org: ${apexExpr}`);
+        renderConsolePanel();
+        let r = await _runEvalApex(apexExpr);
+        if (r.compileFailed) {
+          const ns = await getPackageNamespace();
+          if (ns) {
+            const nsExpr = nsPrefixApexExpr(apexExpr, ns);
+            if (nsExpr !== apexExpr) {
+              const r2 = await _runEvalApex(nsExpr);
+              if (!r2.error) r = r2;
+            }
+          }
+        }
+        const out = r.error ? { ok: false, error: r.error } : { ok: true, value: r.value };
+        if (out.ok) {
+          debugState.engineOrgEvalCache.set(apexExpr, out);
+          const preview = typeof out.value === 'object' && out.value !== null ? '{…}' : formatValue(out.value);
+          addConsoleEntry('info', `↳ ${apexExpr} → ${preview} (real org value)`);
+        } else {
+          addConsoleEntry('warn', `Org resolve failed for ${apexExpr}: ${out.error}`);
+        }
+        return out;
+      } catch (e) {
+        return { ok: false, error: e?.message || String(e) };
+      } finally {
+        debugState.orgFetching = false;
+        updateLiveOrgIndicator();
+        renderConsolePanel();
+      }
+    },
     loadClassSource: async (className) => {
       const file = await resolveClassFile(className);
       if (!file) return null;
@@ -5058,6 +5098,22 @@ function applyNamespaceToApex(expr, ns) {
   const head = m[1];
   if (isApexTypeName(head) || head === ns) return expr;
   return ns + '.' + expr;
+}
+
+/**
+ * Namespace-prefix a leading token in an Apex expression for a managed package.
+ * SObject / custom-setting / custom-metadata tokens (Foo__c, Foo__mdt) use the
+ * `ns__Foo__c` form; a plain leading class token uses the `ns.Class` form.
+ */
+function nsPrefixApexExpr(expr, ns) {
+  if (!ns) return expr;
+  const mObj = expr.match(/^([A-Za-z]\w*?)(__c|__mdt)\b/i);
+  if (mObj) {
+    const base = mObj[1];
+    if (base.includes('__') || base.toLowerCase() === ns.toLowerCase()) return expr;
+    return ns + '__' + expr;
+  }
+  return applyNamespaceToApex(expr, ns);
 }
 
 /** Run one anonymous-Apex evaluation of a resolved expression. Returns { value?, error?, compileFailed?, resolvedExpr }. */
