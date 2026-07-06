@@ -344,6 +344,64 @@
         </div>
       </div>
 
+      <!-- Debug Bottom Panel (Variables, Call Stack, Console, Breakpoints) -->
+      <div id="debug-panel" class="debug-panel hidden">
+        <div id="debug-panel-resizer" class="debug-panel-resizer"></div>
+        <div class="dbg-panel-header">
+          <div class="dbg-panel-tabs">
+            <button class="dbg-panel-tab active" data-tab="dbg-variables">Variables</button>
+            <button class="dbg-panel-tab" data-tab="dbg-watch">Watch</button>
+            <button class="dbg-panel-tab" data-tab="dbg-callstack">Call Stack</button>
+            <button class="dbg-panel-tab" data-tab="dbg-console">Console</button>
+            <button class="dbg-panel-tab" data-tab="dbg-breakpoints">Breakpoints</button>
+            <button class="dbg-panel-tab" data-tab="dbg-orgactivity">⚡ Org</button>
+          </div>
+          <div class="dbg-panel-actions">
+            <button id="dbg-console-clear" class="tool-hdr-btn" title="Clear Console">⌫</button>
+          </div>
+        </div>
+        <div class="dbg-panel-body">
+          <div id="dbg-variables" class="dbg-tab-content active">
+            <div id="dbg-variables-body" class="dbg-scroll-body">
+              <div class="dbg-empty">No debug session active</div>
+            </div>
+          </div>
+          <div id="dbg-watch" class="dbg-tab-content">
+            <div id="dbg-watch-body" class="dbg-scroll-body">
+              <div class="dbg-empty">No watch expressions</div>
+            </div>
+            <div class="dbg-watch-input-row">
+              <span class="dbg-watch-icon">👁</span>
+              <input type="text" id="dbg-watch-input" class="dbg-watch-input" placeholder="Add watch expression…" spellcheck="false" autocomplete="off" />
+            </div>
+          </div>
+          <div id="dbg-callstack" class="dbg-tab-content">
+            <div id="dbg-callstack-body" class="dbg-scroll-body">
+              <div class="dbg-empty">No active call stack</div>
+            </div>
+          </div>
+          <div id="dbg-console" class="dbg-tab-content">
+            <div id="dbg-console-body" class="dbg-scroll-body">
+              <div class="dbg-empty">Debug console</div>
+            </div>
+            <div class="dbg-console-input-row">
+              <span class="dbg-console-prompt">&gt;</span>
+              <input type="text" id="dbg-console-input" class="dbg-console-input" placeholder="Evaluate expression, method, or SOQL…  e.g. flow  ·  CustomSettingUtil.isTurboPricing(flow)  ·  [SELECT Id FROM Account LIMIT 5]" spellcheck="false" autocomplete="off" />
+            </div>
+          </div>
+          <div id="dbg-breakpoints" class="dbg-tab-content">
+            <div id="dbg-breakpoints-body" class="dbg-scroll-body">
+              <div class="dbg-empty">No breakpoints set</div>
+            </div>
+          </div>
+          <div id="dbg-orgactivity" class="dbg-tab-content">
+            <div id="dbg-orgactivity-body" class="dbg-scroll-body">
+              <div class="dbg-empty">Enable ⚡ Live Org and click "Run in Org" to execute the entry method against the connected org (read-only — changes are rolled back).</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Status bar -->
       <div id="status-bar">
         <span id="status-git" class="status-clickable status-git hidden" title="Git Branch">⎇ main</span>
@@ -1270,64 +1328,6 @@
       </label>
       <span id="dbg-liveorg-status" class="dbg-liveorg-status disconnected">no org connected</span>
       <button id="dbg-btn-run-org" class="dbg-runorg-btn" title="Execute the entry method against the connected org (read-only — any DML is rolled back) and capture real data + org activity">▶ Run in Org</button>
-    </div>
-  </div>
-
-  <!-- Debug Bottom Panel (Variables, Call Stack, Console, Breakpoints) -->
-  <div id="debug-panel" class="debug-panel hidden">
-    <div id="debug-panel-resizer" class="debug-panel-resizer"></div>
-    <div class="dbg-panel-header">
-      <div class="dbg-panel-tabs">
-        <button class="dbg-panel-tab active" data-tab="dbg-variables">Variables</button>
-        <button class="dbg-panel-tab" data-tab="dbg-watch">Watch</button>
-        <button class="dbg-panel-tab" data-tab="dbg-callstack">Call Stack</button>
-        <button class="dbg-panel-tab" data-tab="dbg-console">Console</button>
-        <button class="dbg-panel-tab" data-tab="dbg-breakpoints">Breakpoints</button>
-        <button class="dbg-panel-tab" data-tab="dbg-orgactivity">⚡ Org</button>
-      </div>
-      <div class="dbg-panel-actions">
-        <button id="dbg-console-clear" class="tool-hdr-btn" title="Clear Console">⌫</button>
-      </div>
-    </div>
-    <div class="dbg-panel-body">
-      <div id="dbg-variables" class="dbg-tab-content active">
-        <div id="dbg-variables-body" class="dbg-scroll-body">
-          <div class="dbg-empty">No debug session active</div>
-        </div>
-      </div>
-      <div id="dbg-watch" class="dbg-tab-content">
-        <div id="dbg-watch-body" class="dbg-scroll-body">
-          <div class="dbg-empty">No watch expressions</div>
-        </div>
-        <div class="dbg-watch-input-row">
-          <span class="dbg-watch-icon">👁</span>
-          <input type="text" id="dbg-watch-input" class="dbg-watch-input" placeholder="Add watch expression…" spellcheck="false" autocomplete="off" />
-        </div>
-      </div>
-      <div id="dbg-callstack" class="dbg-tab-content">
-        <div id="dbg-callstack-body" class="dbg-scroll-body">
-          <div class="dbg-empty">No active call stack</div>
-        </div>
-      </div>
-      <div id="dbg-console" class="dbg-tab-content">
-        <div id="dbg-console-body" class="dbg-scroll-body">
-          <div class="dbg-empty">Debug console</div>
-        </div>
-        <div class="dbg-console-input-row">
-          <span class="dbg-console-prompt">&gt;</span>
-          <input type="text" id="dbg-console-input" class="dbg-console-input" placeholder="Evaluate expression, method, or SOQL…  e.g. flow  ·  CustomSettingUtil.isTurboPricing(flow)  ·  [SELECT Id FROM Account LIMIT 5]" spellcheck="false" autocomplete="off" />
-        </div>
-      </div>
-      <div id="dbg-breakpoints" class="dbg-tab-content">
-        <div id="dbg-breakpoints-body" class="dbg-scroll-body">
-          <div class="dbg-empty">No breakpoints set</div>
-        </div>
-      </div>
-      <div id="dbg-orgactivity" class="dbg-tab-content">
-        <div id="dbg-orgactivity-body" class="dbg-scroll-body">
-          <div class="dbg-empty">Enable ⚡ Live Org and click "Run in Org" to execute the entry method against the connected org (read-only — changes are rolled back).</div>
-        </div>
-      </div>
     </div>
   </div>
 

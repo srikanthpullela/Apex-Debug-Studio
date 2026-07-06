@@ -4173,17 +4173,18 @@ body.zen-mode #editor-container { border-radius: 0; }
 
 /* -- Debug Panel (bottom panel) -- */
 .debug-panel {
-  position: absolute;
-  bottom: 22px; /* above status bar */
-  left: 0; right: 0;
+  position: relative;
   height: 220px;
+  min-height: 80px;
+  max-height: 70vh;
+  flex-shrink: 0;
   background: var(--bg-secondary, #252526);
   border-top: 1px solid var(--accent, #007acc);
   display: flex;
   flex-direction: column;
-  z-index: 60;
   font-size: 12px;
 }
+.debug-panel.hidden { display: none; }
 .debug-panel-resizer {
   position: absolute;
   top: -3px;
