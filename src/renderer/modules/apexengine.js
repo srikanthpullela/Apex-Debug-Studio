@@ -1492,8 +1492,7 @@
           const ast = Lang.parseExpression(b.expr);
           binds[b.expr] = await this.evalExpr(ast, frame);
         } catch (err) { binds[b.expr] = null; }
-      }
-      this.pendingBackend = 'SOQL query against org…';
+      }      this.pendingBackend = 'SOQL query against org…';
       if (this.host.log) this.host.log(`SOQL → org: ${e.raw.replace(/\s+/g, ' ').slice(0, 200)}`, 'soql');
       try {
         if (this.host.query) {
@@ -1504,6 +1503,25 @@
       } finally {
         this.pendingBackend = null;
       }
+    }
+
+    // Resolve `:name` / `:obj.field` bind tokens in a dynamic SOQL string against
+    // the current frame's scope (mirrors inline [SELECT ...] bind resolution).
+    async resolveScopeBinds(raw, frame) {
+      const binds = {};
+      const re = /:\s*([A-Za-z_]\w*(?:\.\w+)*)/g;
+      let m;
+      const seen = new Set();
+      while ((m = re.exec(String(raw || '')))) {
+        const expr = m[1];
+        if (seen.has(expr)) continue;
+        seen.add(expr);
+        try {
+          const ast = Lang.parseExpression(expr);
+          binds[expr] = await this.evalExpr(ast, frame);
+        } catch (_) { binds[expr] = null; }
+      }
+      return binds;
     }
 
     /* ---------- calls ---------- */
@@ -2028,10 +2046,22 @@
       if (t === 'database') {
         switch (n) {
           case 'query': case 'querywithbinds': {
+            const raw = String(a[0]);
+            // Resolve bind variables the same way inline [SELECT ...] does. For
+            // Database.queryWithBinds the caller supplies an explicit Map; for a
+            // plain Database.query(dynamicString) we resolve `:name` tokens from
+            // the current scope so dynamic SOQL isn't sent with unbound vars.
+            let binds;
+            if (n === 'querywithbinds' && a[1] instanceof ApexMap) {
+              binds = {};
+              for (const en of a[1].m.values()) binds[toApexString(en.k)] = en.v;
+            } else {
+              binds = await this.resolveScopeBinds(raw, frame);
+            }
             this.pendingBackend = 'Database.query against org…';
-            if (this.host.log) this.host.log(`Database.query → org: ${String(a[0]).slice(0, 200)}`, 'soql');
+            if (this.host.log) this.host.log(`Database.query → org: ${raw.replace(/\s+/g, ' ').slice(0, 200)}`, 'soql');
             try {
-              if (this.host.query) { const rows = await this.host.query(a[0], {}); return Array.isArray(rows) ? rows : []; }
+              if (this.host.query) { const rows = await this.host.query(raw, binds); return Array.isArray(rows) ? rows : []; }
               return [];
             } finally { this.pendingBackend = null; }
           }
@@ -2041,7 +2071,9 @@
             return records.map(r => ({ attributes: { type: 'Database.SaveResult' }, success: true, id: sobjGet(r, 'Id') || null, errors: [] }));
           }
           case 'countquery': {
-            if (this.host.query) { const rows = await this.host.query(a[0], {}); return Array.isArray(rows) && rows.length && rows[0].expr0 !== undefined ? rows[0].expr0 : (rows || []).length; }
+            const raw = String(a[0]);
+            const binds = await this.resolveScopeBinds(raw, frame);
+            if (this.host.query) { const rows = await this.host.query(raw, binds); return Array.isArray(rows) && rows.length && rows[0].expr0 !== undefined ? rows[0].expr0 : (rows || []).length; }
             return 0;
           }
           case 'setsavepoint': return { __savepoint: Date.now() };
