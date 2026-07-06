@@ -503,16 +503,28 @@
     }
 
     async lazyLoadClass(className) {
+      if (!className) return null;
+      // Already registered (e.g. an inner class loaded with its outer file)?
+      const already = this.registry.get(className);
+      if (already) return already;
       if (!this.host.loadClassSource) return null;
-      try {
-        const res = await this.host.loadClassSource(className);
-        if (!res) return null;
-        const src = typeof res === 'string' ? res : res.source;
-        const file = typeof res === 'string' ? className + '.cls' : (res.path || className + '.cls');
-        if (!src) return null;
-        this.loadSource(file, src);
-        return this.registry.get(className);
-      } catch (e) { return null; }
+      // For a qualified inner-class name (Outer.Inner[.Inner2]) the source lives in
+      // the OUTER class file, so ask the host for the outer name too.
+      const head = String(className).split('.')[0];
+      const tries = head !== className ? [className, head] : [className];
+      for (const nm of tries) {
+        try {
+          const res = await this.host.loadClassSource(nm);
+          if (!res) continue;
+          const src = typeof res === 'string' ? res : res.source;
+          const file = typeof res === 'string' ? nm + '.cls' : (res.path || nm + '.cls');
+          if (!src) continue;
+          this.loadSource(file, src);
+          const found = this.registry.get(className);
+          if (found) return found;
+        } catch (e) { /* try next candidate */ }
+      }
+      return this.registry.get(className) || null;
     }
 
     pickOverload(methods, args) {
