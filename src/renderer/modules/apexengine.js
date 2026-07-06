@@ -496,9 +496,12 @@
     async lazyLoadClass(className) {
       if (!this.host.loadClassSource) return null;
       try {
-        const src = await this.host.loadClassSource(className);
+        const res = await this.host.loadClassSource(className);
+        if (!res) return null;
+        const src = typeof res === 'string' ? res : res.source;
+        const file = typeof res === 'string' ? className + '.cls' : (res.path || className + '.cls');
         if (!src) return null;
-        this.loadSource(className + '.cls', src);
+        this.loadSource(file, src);
         return this.registry.get(className);
       } catch (e) { return null; }
     }
@@ -641,7 +644,15 @@
 
     async execStmt(stmt, frame) {
       if (!stmt) return;
-      await this.gate(stmt, frame);
+      // Blocks/empties aren't pause points (Chrome doesn't pause on '{');
+      // their inner statements gate themselves.
+      if (stmt.kind !== 'block' && stmt.kind !== 'empty') await this.gate(stmt, frame);
+      return this.execStmtInner(stmt, frame);
+    }
+
+    // Statement body without the pause gate — used when the gate for this
+    // line has already fired (e.g. for-loop init on the same line).
+    async execStmtInner(stmt, frame) {
       switch (stmt.kind) {
         case 'block': return this.execBlock(stmt, frame, new Environment(frame.env, 'block'));
         case 'empty': return;
@@ -661,8 +672,10 @@
           return;
         }
         case 'while': {
+          let firstIter = true;
           while (true) {
-            await this.gate(stmt, frame);
+            if (!firstIter) await this.gate(stmt, frame);
+            firstIter = false;
             const c = await this.evalExpr(stmt.cond, frame);
             if (c !== true) break;
             try { await this.execStmt(stmt.body, frame); }
@@ -685,13 +698,15 @@
           const prevEnv = frame.env;
           frame.env = loopEnv;
           try {
-            if (stmt.init) await this.execStmt(stmt.init, frame);
+            if (stmt.init) await this.execStmtInner(stmt.init, frame);
+            let firstIter = true;
             while (true) {
               if (stmt.cond) {
-                await this.gate(stmt, frame);
+                if (!firstIter) await this.gate(stmt, frame);
                 const c = await this.evalExpr(stmt.cond, frame);
                 if (c !== true) break;
               }
+              firstIter = false;
               try { await this.execStmt(stmt.body, frame); }
               catch (e) {
                 if (e instanceof BreakSignal) break;
@@ -710,13 +725,15 @@
           else if (iterable instanceof ApexSet) items = iterable.items();
           else if (iterable instanceof ApexMap) items = iterable.keys();
           else throw new ApexError('System.TypeException', `Cannot iterate over ${typeNameOf(iterable)}`, stmt.line);
+          let firstItem = true;
           for (const item of items) {
             const loopEnv = new Environment(frame.env, 'foreach');
             loopEnv.define(stmt.varName, item, stmt.type ? this.typeLabel(stmt.type) : null);
             const prevEnv = frame.env;
             frame.env = loopEnv;
             try {
-              await this.gate(stmt, frame);
+              if (!firstItem) await this.gate(stmt, frame);
+              firstItem = false;
               await this.execStmt(stmt.body, frame);
             }
             catch (e) {
