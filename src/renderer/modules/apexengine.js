@@ -1350,6 +1350,14 @@
       if (t.kind === 'ident') {
         try { return this.resolveIdent(t, frame); }
         catch (err) {
+          // Unknown ident used as a member target. It may be a user class whose
+          // source hasn't been loaded yet (e.g. RequestParams.PARAM_X static
+          // constants). Try to lazy-load it before assuming a builtin namespace,
+          // otherwise its static fields resolve to null and break the code.
+          if (!BUILTIN_TYPES.has(t.name.toLowerCase())) {
+            const ci = await this.lazyLoadClass(t.name);
+            if (ci) return { __classRef: ci };
+          }
           // Dotted type like Schema.Account — treat unknown ident as builtin/namespace marker
           return { __builtinRef: t.name };
         }
