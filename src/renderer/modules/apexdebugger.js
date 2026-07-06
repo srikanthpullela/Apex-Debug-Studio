@@ -2513,6 +2513,12 @@ async function executeCurrentStatement() {
     case 'assignment':
       if (stmt._directValue !== undefined) {
         assignProperty(frame.variables, stmt.varName, JSON.parse(JSON.stringify(stmt._directValue)));
+        // Loop-variable binding → advance the iteration counter so hover/panels
+        // show which element (i of n) is currently bound.
+        if (stmt._loopVar) {
+          frame._iter = frame._iter || {};
+          frame._iter[stmt._loopVar] = { index: stmt._loopIndex, total: stmt._loopTotal, collection: stmt._loopCollection, elemType: stmt._loopElemType };
+        }
       } else {
         const assignVal = evaluateExpression(stmt.expression, scope);
         // Handle this.field assignment → goes to classFields
@@ -2605,15 +2611,25 @@ async function executeCurrentStatement() {
           const collectionExpr = forEachMatch[3].trim();
           // Track the loop variable's declared element type (e.g. RemoteCPQ.LineItemDO)
           // so hover can resolve instance-method calls on it.
-          if (forEachMatch[1]) (frame.varTypes || (frame.varTypes = {}))[iterVar] = forEachMatch[1].trim();
+          const elemType = forEachMatch[1] ? forEachMatch[1].trim() : null;
+          if (elemType) (frame.varTypes || (frame.varTypes = {}))[iterVar] = elemType;
           const items = await resolveLoopCollection(collectionExpr, scope, frame, stmt.line);
-          addConsoleEntry('loop', `for (${iterVar} : ${collectionExpr}) — ${items.length} iterations`, stmt.line);
+          addConsoleEntry('loop', `for (${iterVar} : ${collectionExpr}) — ${items.length} iteration(s)`, stmt.line);
+          // Record iteration metadata so hover/panels can show "iteration i of n"
+          // and clearly distinguish the single ELEMENT (lineItemDO) from the
+          // COLLECTION (lineItemDOs) — important when the list has only 1 item.
+          frame._iter = frame._iter || {};
+          frame._iter[iterVar] = { index: items.length ? 0 : -1, total: items.length, collection: collectionExpr, elemType };
+          // Preview-bind the loop variable to the first element the instant we
+          // reach the `for` line (V8/DevTools-style), so hovering the header shows
+          // one element — never the whole collection.
+          if (items.length) frame.variables[iterVar] = JSON.parse(JSON.stringify(items[0]));
           // Unroll loop: insert body for each item
           const expanded = [];
-          for (const item of items) {
-            expanded.push({ line: stmt.line, type: 'assignment', raw: `${iterVar} = [loop item]`, varName: iterVar, _directValue: item });
+          items.forEach((item, idx) => {
+            expanded.push({ line: stmt.line, type: 'assignment', raw: `${iterVar} = [loop item ${idx + 1}/${items.length}]`, varName: iterVar, _directValue: item, _loopVar: iterVar, _loopIndex: idx, _loopTotal: items.length, _loopCollection: collectionExpr, _loopElemType: elemType });
             expanded.push(...JSON.parse(JSON.stringify(stmt.body)));
-          }
+          });
           frame.statements.splice(frame.pc + 1, 0, ...expanded);
         } else {
           // C-style for loop: for (init; condition; increment)
@@ -3445,7 +3461,7 @@ function renderVariablesPanel() {
     html += '<div class="dbg-empty" style="padding-left:16px">No local variables</div>';
   } else {
     for (const key of localKeys) {
-      html += renderVarEntry(key, vars[key], 'local');
+      html += renderVarEntry(key, vars[key], 'local', frame._iter && frame._iter[key]);
     }
   }
   html += '</div>';
@@ -3540,7 +3556,7 @@ window._dbgRemoveWatch = function(watchId) {
   renderWatchPanel();
 };
 
-function renderVarEntry(key, val, scopeType = 'local') {
+function renderVarEntry(key, val, scopeType = 'local', iterInfo = null) {
   const isExpandable = val !== null && typeof val === 'object';
   const isNullish = val === null || val === undefined;
   const rawAttr = _esc(rawValueString(val));
@@ -3548,6 +3564,14 @@ function renderVarEntry(key, val, scopeType = 'local') {
   html += `<div class="dbg-var-header" onclick="window._dbgToggleVar(this)">`;
   if (isExpandable) html += `<span class="dbg-var-arrow">▶</span>`;
   html += `<span class="dbg-var-name">${_esc(key)}</span>`;
+  // For-each loop variable → show which element of the collection is bound now,
+  // so a single element is never confused with the whole collection.
+  if (iterInfo) {
+    const badge = iterInfo.index >= 0
+      ? `↻ ${iterInfo.index + 1}/${iterInfo.total} of ${_esc(iterInfo.collection)}`
+      : `↻ empty ${_esc(iterInfo.collection)}`;
+    html += `<span class="dbg-var-iter" title="for-each element">${badge}</span>`;
+  }
   if (isNullish) {
     // Nothing resolved yet — invite the user to supply a value inline,
     // and (when connected) to fetch the real value from the org on demand.
@@ -3639,7 +3663,7 @@ function renderVariablesForFrame(frameIdx) {
   html += '<div class="dbg-scope-section">';
   html += '<div class="dbg-scope-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">▼ Local</div>';
   for (const key of Object.keys(frame.variables)) {
-    html += renderVarEntry(key, frame.variables[key]);
+    html += renderVarEntry(key, frame.variables[key], 'local', frame._iter && frame._iter[key]);
   }
   html += '</div>';
 
@@ -4225,13 +4249,31 @@ function registerDebugHoverProvider() {
         return null;
       };
 
+      // Look up for-each iteration state (index/total/collection) for a variable.
+      const lookupLoopIter = (name) => {
+        if (!name || /[.[\]()]/.test(name)) return null;
+        for (let fi = debugState.callStack.length - 1; fi >= 0; fi--) {
+          const it = debugState.callStack[fi]._iter;
+          if (it && name in it) return it[name];
+        }
+        return null;
+      };
+
       // Build a Monaco hover payload for a resolved value.
       const makeHover = (displayPath, val, opts = {}) => {
         const contents = [];
         const declaredType = opts.declaredType || lookupVarType(displayPath);
         const typeName = getValueTypeName(val, declaredType);
         const tag = opts.realOrg ? ' · _real org value_' : '';
-        contents.push({ value: `**\`${displayPath}\`** : *${typeName}*${tag}` });
+        // Distinguish a for-each ELEMENT from its COLLECTION so a 1-item list
+        // (where element ≈ collection) is never ambiguous.
+        const iter = lookupLoopIter(displayPath);
+        const iterTag = iter
+          ? (iter.index >= 0
+              ? ` · _element ${iter.index + 1} of ${iter.total} from \`${iter.collection}\`_`
+              : ` · _no elements in \`${iter.collection}\`_`)
+          : '';
+        contents.push({ value: `**\`${displayPath}\`** : *${typeName}*${tag}${iterTag}` });
         if (val === null) {
           contents.push({ value: '```\nnull\n```' });
         } else if (typeof val === 'object') {

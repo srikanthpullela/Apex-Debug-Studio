@@ -4296,6 +4296,16 @@ body.zen-mode #editor-container { border-radius: 0; }
   font-family: var(--font-mono, monospace);
   font-size: 12px;
 }
+.dbg-var-iter {
+  margin-left: 6px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: #c586c0;
+  background: rgba(197, 134, 192, 0.14);
+  border-radius: 3px;
+  padding: 0 5px;
+  white-space: nowrap;
+}
 .dbg-var-value {
   color: var(--text-secondary, #ccc);
   font-family: var(--font-mono, monospace);
