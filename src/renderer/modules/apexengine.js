@@ -1301,7 +1301,7 @@
         if (inner) return { __classRef: inner };
         throw new ApexError('System.VariableDoesNotExistException', `Static ${ci.name}.${e.name} does not exist`, e.line);
       }
-      if (target.__builtinRef) return this.staticProp(target.__builtinRef, e.name, e.line);
+      if (target.__builtinRef) return await this.staticProp(target.__builtinRef, e.name, e.line);
       return this.memberGet(target, e.name, e.line, frame);
     }
 
@@ -1327,7 +1327,16 @@
       }
       if (isSObject(target)) {
         const v = sobjGet(target, name);
-        return v === undefined ? null : v;
+        if (v !== undefined) return v;
+        // Field is ABSENT from this record (not merely null). In real Apex this
+        // either returns the queried value or throws SObjectException. Rather than
+        // silently return a misleading null, ask the org for the REAL value — but
+        // only when Live data is on and the record carries a real Id. This is the
+        // general "any step that needs backend data fetches it" rule; it is gated
+        // (falls back to null when Live is off/unavailable) and never fabricates.
+        const hydrated = await this.hydrateSObjectField(target, name);
+        if (hydrated !== ENGINE_UNRESOLVED) return hydrated;
+        return null;
       }
       if (target instanceof ApexError) {
         return this.callErrorMethod(target, 'get' + name, [], line);
@@ -1932,7 +1941,7 @@
     }
 
     /* ---------- static builtins ---------- */
-    staticProp(typeName, propName, line) {
+    async staticProp(typeName, propName, line) {
       const t = typeName.toLowerCase();
       const p = propName.toLowerCase();
       if (t === 'trigger') return null; // trigger context not simulated
@@ -1946,7 +1955,14 @@
       if (t === 'apexpages' && p === 'severity') return { __builtinRef: 'ApexPages.Severity' };
       // DOM sub-namespace (DOM.Xmlnodetype.ELEMENT, etc.)
       if (t === 'dom' && p === 'xmlnodetype') return { __builtinRef: 'DOM.Xmlnodetype' };
-      // Unknown static prop — degrade gracefully (never kill a session)
+      // Unknown static prop/constant. Before degrading to null, try to resolve the
+      // real value from the org (a class constant we couldn't load locally, a
+      // global static, etc.). Gated by Live data — a no-op when Live is off.
+      if (!BUILTIN_TYPES.has(t)) {
+        const orgVal = await this.resolveViaOrg(`${typeName}.${propName}`, {});
+        if (orgVal !== ENGINE_UNRESOLVED) return orgVal;
+      }
+      // Degrade gracefully (never kill a session)
       if (this.host.log) this.host.log(`⚠ ${typeName}.${propName} is not simulated — returning null and continuing.`, 'system');
       return null;
     }
@@ -2249,6 +2265,54 @@
           return (v !== null && typeof v === 'object') ? this.orgJsonToSObject(v, 'SObject') : v;
         }
       } catch (_) { /* ignore */ }
+      finally { this.pendingBackend = null; }
+      return ENGINE_UNRESOLVED;
+    }
+
+    /* ---------- general Live-data seam ----------
+     * Single entry point every "I don't have this value locally" branch routes
+     * through. host.evalOrg is gated by the debugger's Live Org toggle, so when
+     * Live is OFF (or no org) this is a cheap no-op returning ENGINE_UNRESOLVED
+     * and the caller falls back to normal local behavior. When Live is ON we get
+     * the REAL value from the connected org. We NEVER fabricate — an unresolved
+     * value stays unresolved so faithful behavior (null / NPE) still surfaces. */
+    async resolveViaOrg(expr, ctx) {
+      if (!this.host.evalOrg) return ENGINE_UNRESOLVED;
+      this.pendingBackend = `resolving ${expr} from org…`;
+      try {
+        const r = await this.host.evalOrg(expr, ctx || {});
+        if (r && r.ok) {
+          const v = r.value;
+          return (v !== null && typeof v === 'object')
+            ? this.orgJsonToSObject(v, (ctx && ctx.sobjectType) || 'SObject')
+            : v;
+        }
+      } catch (_) { /* fall through to unresolved */ }
+      finally { this.pendingBackend = null; }
+      return ENGINE_UNRESOLVED;
+    }
+
+    /* Lazily fetch a single field that wasn't part of the record's original query.
+     * Only fires when Live data is on, the record has a real 15/18-char Id and a
+     * concrete SObject type. The fetched value is cached back onto the record so
+     * subsequent reads (and re-reads of a genuinely-null field) don't re-query. */
+    async hydrateSObjectField(rec, field) {
+      if (!this.host.query) return ENGINE_UNRESOLVED;
+      const id = sobjGet(rec, 'Id');
+      const type = sobjType(rec);
+      if (id === undefined || id === null || !/^[a-zA-Z0-9]{15,18}$/.test(String(id))) return ENGINE_UNRESOLVED;
+      if (!type || type === 'SObject') return ENGINE_UNRESOLVED;
+      const soql = `SELECT ${field} FROM ${type} WHERE Id = '${String(id).replace(/'/g, "\\'")}' LIMIT 1`;
+      this.pendingBackend = `hydrating ${type}.${field} from org…`;
+      try {
+        const rows = await this.host.query(soql, {});
+        if (Array.isArray(rows) && rows.length) {
+          const val = sobjGet(rows[0], field);
+          const resolved = val === undefined ? null : val;
+          sobjSet(rec, field, resolved); // cache onto the live record
+          return resolved;
+        }
+      } catch (_) { /* fall through to unresolved */ }
       finally { this.pendingBackend = null; }
       return ENGINE_UNRESOLVED;
     }
