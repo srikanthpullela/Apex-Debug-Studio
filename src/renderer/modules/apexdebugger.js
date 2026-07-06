@@ -1861,14 +1861,27 @@ async function execSoql(soql) {
 
   let result = await _runSoqlOnce(soql);
   // Managed-package objects/fields need their namespace prefix when queried via the
-  // CLI (which runs outside the package namespace). Retry with the prefix on failure.
-  if (result.error && /not supported|INVALID_TYPE|INVALID_FIELD|No such column|did.?n.?t understand/i.test(result.error)) {
+  // CLI (which runs outside the package namespace). Retry with the prefix when the
+  // query FAILS, and also when a by-Id / filtered lookup succeeds with 0 rows — in a
+  // namespaced org an unqualified object name can resolve to a different (empty)
+  // object, so 0 rows by Id is a strong signal we queried the wrong namespace. We
+  // only switch to the namespaced result when it actually returns rows, so a record
+  // that is genuinely absent still reports 0 rows truthfully.
+  const compileErr = result.error && /not supported|INVALID_TYPE|INVALID_FIELD|No such column|did.?n.?t understand/i.test(result.error);
+  const emptyResult = !result.error && (result.records || []).length === 0;
+  if (compileErr || emptyResult) {
     const ns = await getPackageNamespace();
     const nsSoql = applyNamespaceToSoql(soql, ns);
     if (ns && nsSoql !== soql) {
       const r2 = await _runSoqlOnce(nsSoql);
-      if (!r2.error) result = { ...r2, soql: nsSoql };
-      else result = { ...result, error: `${result.error} (also tried ${ns} namespace: ${r2.error})` };
+      if (!r2.error && (r2.records || []).length > 0) {
+        result = { ...r2, soql: nsSoql };           // namespaced object had the real data
+      } else if (compileErr && !r2.error) {
+        result = { ...r2, soql: nsSoql };           // bare name didn't compile; namespaced did (0 rows, truthful)
+      } else if (compileErr && r2.error) {
+        result = { ...result, error: `${result.error} (also tried ${ns} namespace: ${r2.error})` };
+      }
+      // (emptyResult && r2 also empty) → keep the original 0-row result: truly not found.
     }
   }
   debugState.orgQueryCache.set(soql, result);
@@ -4216,6 +4229,88 @@ function showRequestModal(filePath, methodName, signatureLine) {
 
   // Focus the mini editor
   setTimeout(() => debugState.miniEditorInstance?.focus(), 100);
+
+  // Render the request history so the user can re-pick a previous payload
+  // instead of re-pasting it each time.
+  renderRequestHistory(filePath, methodName);
+}
+
+const DBG_REQ_HISTORY_KEY = 'congacode.debugRequestHistory';
+
+function loadRequestHistory() {
+  try {
+    const raw = localStorage.getItem(DBG_REQ_HISTORY_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch (_) { return []; }
+}
+
+function saveRequestHistoryEntry(filePath, methodName, jsonText) {
+  const text = (jsonText || '').trim();
+  if (!text || /^\/\/|^\{\s*\}$/.test(text) && text.length < 6) return;
+  const className = (filePath || '').split('/').pop().replace(/\.(cls|trigger)$/, '');
+  const hist = loadRequestHistory().filter(e => !(e.json === text && e.method === methodName && e.className === className));
+  hist.unshift({ json: text, method: methodName, className, filePath, ts: Date.now() });
+  try { localStorage.setItem(DBG_REQ_HISTORY_KEY, JSON.stringify(hist.slice(0, 25))); } catch (_) {}
+}
+
+function renderRequestHistory(filePath, methodName) {
+  const wrap = _$('#dbg-request-history-wrap');
+  const list = _$('#dbg-request-history');
+  if (!wrap || !list) return;
+  const all = loadRequestHistory();
+  // Prefer entries for THIS method first, then everything else.
+  const forMethod = all.filter(e => e.method === methodName);
+  const others = all.filter(e => e.method !== methodName);
+  const ordered = [...forMethod, ...others];
+  if (!ordered.length) { wrap.classList.add('hidden'); return; }
+  wrap.classList.remove('hidden');
+  list.innerHTML = '';
+  ordered.forEach((entry, idx) => {
+    const flat = entry.json.replace(/\s+/g, ' ').trim();
+    const preview = flat.length > 90 ? flat.slice(0, 87) + '…' : flat;
+    const when = timeAgo(entry.ts);
+    const row = document.createElement('div');
+    row.className = 'dbg-history-item';
+    row.innerHTML =
+      `<div class="dbg-history-main">` +
+      `<span class="dbg-history-method">${_esc(entry.className)}.${_esc(entry.method)}</span>` +
+      `<span class="dbg-history-when">${_esc(when)}</span>` +
+      `</div>` +
+      `<div class="dbg-history-preview">${_esc(preview)}</div>` +
+      `<div class="dbg-history-actions">` +
+      `<button class="dbg-history-load" title="Load into editor">Use</button>` +
+      `<button class="dbg-history-copy" title="Copy JSON">Copy</button>` +
+      `</div>`;
+    row.querySelector('.dbg-history-load')?.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (debugState.miniEditorInstance) debugState.miniEditorInstance.setValue(entry.json);
+    });
+    row.querySelector('.dbg-history-copy')?.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      try { navigator.clipboard.writeText(entry.json); window.showToast?.('Request copied', 'success'); } catch (_) {}
+    });
+    // Clicking the row body also loads it.
+    row.querySelector('.dbg-history-preview')?.addEventListener('click', () => {
+      if (debugState.miniEditorInstance) debugState.miniEditorInstance.setValue(entry.json);
+    });
+    list.appendChild(row);
+  });
+}
+
+function timeAgo(ts) {
+  if (!ts) return '';
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24); return `${d}d ago`;
+}
+
+function clearRequestHistory() {
+  try { localStorage.removeItem(DBG_REQ_HISTORY_KEY); } catch (_) {}
+  const wrap = _$('#dbg-request-history-wrap');
+  if (wrap) wrap.classList.add('hidden');
 }
 
 function hideRequestModal() {
@@ -4240,6 +4335,7 @@ function startDebugFromModal() {
 
   debugState.parsedRequest = parsed;
   debugState.requestJson = jsonText;
+  saveRequestHistoryEntry(filePath, methodName, jsonText);
   hideRequestModal();
 
   // Start debug session
@@ -4941,6 +5037,7 @@ function initApexDebugger() {
   _$('#dbg-modal-start')?.addEventListener('click', startDebugFromModal);
   _$('#dbg-modal-close')?.addEventListener('click', hideRequestModal);
   _$('#dbg-modal-cancel')?.addEventListener('click', hideRequestModal);
+  _$('#dbg-history-clear')?.addEventListener('click', clearRequestHistory);
 
   // Debug panel tabs
   initDebugPanelTabs();

@@ -1341,6 +1341,13 @@
       <div class="dbg-modal-body">
         <div class="dbg-modal-info">Paste the raw API request JSON (VF Remoting, REST, or raw parameter object):</div>
         <div id="dbg-request-editor" class="dbg-request-editor"></div>
+        <div id="dbg-request-history-wrap" class="dbg-request-history-wrap hidden">
+          <div class="dbg-request-history-hdr">
+            <span>Recent requests</span>
+            <button id="dbg-history-clear" class="dbg-history-clear" title="Clear history">Clear</button>
+          </div>
+          <div id="dbg-request-history" class="dbg-request-history"></div>
+        </div>
       </div>
       <div class="dbg-modal-footer">
         <button id="dbg-modal-cancel" class="sf-btn">Cancel</button>

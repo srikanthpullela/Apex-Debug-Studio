@@ -641,6 +641,15 @@
     /* ---------- entry points ---------- */
     async run(className, methodName, argValues) {
       this.stopped = false; this._steps = 0;
+      // Reset per-session pause state so a RESTART re-honors breakpoints. Without
+      // this, _lastBpKey retains the previous run's gate key and the breakpoint at
+      // the same line+depth (e.g. the method's first line) is suppressed on re-run.
+      this._lastBpKey = null;
+      this._hasSteppedOnce = false;
+      this.pauseRequested = false;
+      this.callStack = [];
+      this.pageMessages = [];
+      this.dmlLog = [];
       const cls = this.registry.get(className) || await this.lazyLoadClass(className);
       if (!cls) throw new ApexError('System.TypeException', `Class not found: ${className}`, 0);
       const methods = cls.findMethods(methodName);

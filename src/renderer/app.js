@@ -1756,9 +1756,9 @@ function showQuickOpen() {
   dom.quickOpenInput.focus();
   dom.quickOpenResults.innerHTML = '';
   quickOpenSelectedIndex = -1;
-  loadQuickOpenFiles().then(() => {
+  loadQuickOpenFiles().then(async () => {
     // Show recent files by default when opening
-    const recentPaths = getRecentFilePaths();
+    const recentPaths = await getRecentFilePaths();
     if (recentPaths.length > 0) {
       renderQuickOpenResults(recentPaths);
     } else {
@@ -1767,18 +1767,29 @@ function showQuickOpen() {
   });
 }
 
-function getRecentFilePaths() {
-  // Gather recently opened tabs + recent files list
+async function getRecentFilePaths() {
+  // Gather recently opened files: currently-open tabs first (most relevant), then
+  // the PERSISTENT recent-files store (files opened earlier, across sessions) so the
+  // finder always surfaces recents even when the sidebar list is collapsed/empty.
   const seen = new Set();
   const result = [];
-  // Open tabs first (most relevant)
   for (const t of state.tabs) {
     if (t.filePath && !seen.has(t.filePath)) {
       seen.add(t.filePath);
       result.push(t.filePath);
     }
   }
-  // Then add files from the recent list in sidebar
+  try {
+    const recents = await window.congacode.getRecent();
+    for (const entry of (recents || [])) {
+      const fp = (entry && entry.type !== 'directory' && entry.type !== 'folder-group') ? entry.path : null;
+      if (fp && !seen.has(fp)) {
+        seen.add(fp);
+        result.push(fp);
+      }
+    }
+  } catch (_) { /* store unavailable — fall back to tabs only */ }
+  // Also fold in any sidebar recent-list entries not already covered.
   const recentItems = document.querySelectorAll('#recent-list .recent-item');
   recentItems.forEach(el => {
     const fp = el.dataset?.path;
