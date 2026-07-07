@@ -1748,9 +1748,17 @@
       if (lk === 'getlabel') return info.label;
       if (lk === 'getlabelplural') return info.plural;
       if (lk === 'getkeyprefix') return info.prefix || null;
-      if (lk === 'getsobjecttype') return { __sobjectType: nm };
+      if (lk === 'getsobjecttype') return nm;
       if (lk === 'fields' || lk === 'getfields') return { __fieldsHandle: nm };
       if (lk === 'tostring') return nm;
+      if (lk === 'iscustom') return /__c$/i.test(nm);
+      if (lk === 'iscustomsetting' || lk === 'isfeedenabled' || lk === 'ismergeenabled' ||
+          lk === 'isdeprecatedandhidden') return false;
+      // Permission/FLS flags: stepping runs in system context, so default these
+      // to true (returning null would wrongly skip guarded code paths). No warning.
+      if (lk === 'isaccessible' || lk === 'iscreateable' || lk === 'isupdateable' ||
+          lk === 'isdeletable' || lk === 'isundeletable' || lk === 'isqueryable' ||
+          lk === 'issearchable') return true;
       if (this.host.log) this.host.log(`⚠ DescribeSObjectResult.${name}() not simulated — returning null`, 'system');
       return null;
     }
@@ -1779,7 +1787,10 @@
       if (lk === 'getname' || lk === 'tostring') return f.field;
       if (lk === 'getlocalname') return stripNs(f.field);
       if (lk === 'getlabel') return f.field;
-      if (lk === 'getsobjecttype') return { __sobjectType: f.sobject };
+      if (lk === 'getsobjecttype') return f.sobject;
+      if (lk === 'isaccessible' || lk === 'iscreateable' || lk === 'isupdateable' ||
+          lk === 'isnillable' || lk === 'issortable' || lk === 'isfilterable') return true;
+      if (lk === 'iscustom') return /__c$/i.test(f.field);
       if (this.host.log) this.host.log(`⚠ DescribeFieldResult.${name}() not simulated — returning null`, 'system');
       return null;
     }
@@ -1862,6 +1873,11 @@
     /* ---------- builtin instance methods ---------- */
     callStringMethod(s, name, a, line) {
       switch (name.toLowerCase()) {
+        // A Schema.SObjectType stringifies to its API name, so getSObjectType()
+        // returns a plain string. Support the describe chain from that string:
+        // <apiName>.getDescribe() → DescribeSObjectResult handle. ensureDescribe
+        // (org metadata fetch) is triggered lazily by the describe-result methods.
+        case 'getdescribe': return { __describeResult: s };
         case 'length': return s.length;
         case 'substring': return a.length > 1 ? s.substring(a[0], a[1]) : s.substring(a[0]);
         case 'indexof': return a.length > 1 ? s.indexOf(a[0], a[1]) : s.indexOf(a[0]);
@@ -2045,7 +2061,7 @@
       switch (name.toLowerCase()) {
         case 'get': { const v = sobjGet(rec, a[0]); return v === undefined ? null : v; }
         case 'put': { const prev = sobjGet(rec, a[0]); sobjSet(rec, a[0], a[1]); return prev === undefined ? null : prev; }
-        case 'getsobjecttype': return { __sobjectType: sobjType(rec) };
+        case 'getsobjecttype': return sobjType(rec);
         case 'clone': { const c = Object.assign({}, rec); if (!a[0]) delete c.Id; return c; }
         case 'getpopulatedfieldsasmap': { const m = new ApexMap(); for (const k of Object.keys(rec)) if (k !== 'attributes') m.put(k, rec[k]); return m; }
         case 'tostring': return toApexString(rec);
@@ -2351,10 +2367,12 @@
         return await this.resolveCustomSettingCall(typeName, name, n, a, line);
       }
       // <SObjectTypeName>.getSObjectType() — a static Schema call on a type name
-      // (e.g. ProductConfiguration__c.getSObjectType()). Return a real
-      // Schema.SObjectType handle so downstream describe/field-name resolution
-      // works against org metadata instead of returning null.
-      if (n === 'getsobjecttype') return { __sobjectType: typeName };
+      // (e.g. ProductConfiguration__c.getSObjectType()). Return the API-name
+      // STRING (Apex Schema.SObjectType stringifies to the API name and is used
+      // as a Map/cache key throughout CPQ code). The describe chain is reachable
+      // via <string>.getDescribe() (see callStringMethod), so field-name
+      // resolution still works against real org metadata.
+      if (n === 'getsobjecttype') return typeName;
       // Unknown namespace/class — try lazy class load once
       const ci = await this.lazyLoadClass(typeName);
       if (ci) {
