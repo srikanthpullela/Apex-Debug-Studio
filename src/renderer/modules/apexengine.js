@@ -552,6 +552,9 @@
       if (this.stopped) throw new StopSignal();
       if (!node || !node.line) return;
       frame.line = node.line;
+      // Sandbox evals (hover tooltips, console) must never hit pause gates —
+      // they run synchronously to completion and never interact with the step UI.
+      if (this._sandboxEval) return;
       // Track the line currently executing and surface it to the UI so a running
       // (Continue) session shows WHERE it is — most valuable on a slow line that
       // then awaits the org (SOQL/describe/eval), which yields to let the UI paint
@@ -601,6 +604,7 @@
 
     /* ---------- pause when an exception is caught (Chrome "pause on caught exceptions") ---------- */
     async pauseForException(err, frame, caught) {
+      if (this._sandboxEval) return; // sandbox evals never pause on exception
       if (this.pauseOnCaught === false) return;
       // Only pause when this is an interactive stepping session (breakpoints set or
       // currently stepping) — never gate a plain "Continue" run into an interruption.
@@ -655,6 +659,36 @@
       return await this.evalExpr(ast, frame || this.topFrame());
     }
     topFrame() { return this.callStack[this.callStack.length - 1] || null; }
+
+    /**
+     * Sandboxed eval: runs an expression in a contained sub-execution that can
+     * never corrupt the main debug session. Three guarantees:
+     *  1. Call stack is always restored to its pre-eval depth (even on throw).
+     *  2. Depth cap: aborts after 40 frames above the baseline → no 500-frame grind.
+     *  3. When quiet=true (default): engine log calls are silenced.
+     * Pass quiet=false for the debug console path where log output is desired.
+     */
+    async evalExpressionSandboxed(expr, frame, quiet) {
+      const baseline = this.callStack.length;
+      const prevSandbox = this._sandboxEval;
+      const prevQuiet = this._quiet;
+      const prevBaseline = this._sandboxBaseline;
+      this._sandboxEval = true;
+      this._quiet = quiet !== false; // default true; false = keep logs (console eval)
+      this._sandboxBaseline = baseline;
+      try {
+        return await this.evalExpressionInFrame(expr, frame);
+      } finally {
+        this._sandboxEval = prevSandbox;
+        this._quiet = prevQuiet;
+        this._sandboxBaseline = prevBaseline;
+        if (this.callStack.length > baseline) this.callStack.length = baseline;
+      }
+    }
+
+    /** Route informational log messages through here so they can be suppressed
+     *  during sandbox evals (hover tooltips etc.) by setting this._quiet = true. */
+    log(msg, level) { if (!this._quiet && this.host.log) this.host.log(msg, level); }
 
     /* ---------- entry points ---------- */
     async run(className, methodName, argValues) {
@@ -949,17 +983,38 @@
         className: cls.name, methodName: method.name, file: cls.fileName,
         line: method.line, env, thisRef: method.static ? null : thisRef, classInfo: cls,
       };
+      // Fix 3: fast early-exit for direct self-recursion (25 consecutive identical frames
+      // at the top of the stack). This turns a 500-frame grind into an immediate abort
+      // for e.g. `Integer go() { return go(); }` — checked O(25) instead of O(500).
+      if (this.callStack.length > 25) {
+        const thisSig = cls.name.toLowerCase() + '.' + method.name.toLowerCase();
+        let selfRun = 0;
+        for (let i = this.callStack.length - 1; i >= Math.max(0, this.callStack.length - 25); i--) {
+          const f = this.callStack[i];
+          if ((f.className + '.' + f.methodName).toLowerCase() === thisSig) selfRun++;
+          else break;
+        }
+        if (selfRun >= 25) {
+          const cycle = this._describeRecursionCycle();
+          throw new ApexError('System.LimitException', `Maximum stack depth reached (recursion too deep). Repeating cycle: ${cycle.short}`, method.line);
+        }
+      }
+      // Fix 1: sandbox eval depth cap — hover/console evals abort at 40 frames above
+      // their baseline so a buggy expression never causes a 500-frame hang.
+      if (this._sandboxEval && this._sandboxBaseline !== undefined && this.callStack.length - this._sandboxBaseline >= 40) {
+        throw new ApexError('System.LimitException', 'Hover evaluation aborted (too deep)', method.line);
+      }
       if (this.callStack.length > 500) {
         // Interpreter recursion guard. Surface the repeating cycle so the user
         // (and we) can see WHICH methods loop, instead of a bare limit error
         // that a CPQ `catch (Exception)` swallows far from the real cause.
         const cycle = this._describeRecursionCycle();
-        if (this.host.log && !this._recursionReported) {
+        if (!this._recursionReported) {
           this._recursionReported = true;
           const cycleDesc = cycle.reps > 0
             ? `kept re-entering the same call cycle ${cycle.reps}× and stopped at depth ${this.callStack.length}. Repeating cycle:\n${cycle.text}`
             : `stopped at depth ${this.callStack.length} (no clear repeating cycle). Last frames:\n${cycle.text}`;
-          this.host.log(`♻ Runaway recursion detected — the interpreter ${cycleDesc}`, 'system');
+          this.log(`♻ Runaway recursion detected — the interpreter ${cycleDesc}`, 'system');
         }
         throw new ApexError('System.LimitException', `Maximum stack depth reached (recursion too deep). Repeating cycle: ${cycle.short}`, method.line);
       }
@@ -1255,9 +1310,9 @@
         ? ` at ${err.apexStack[0].className}.${err.apexStack[0].methodName} (line ${err.apexStack[0].line})`
         : (err.apexLine ? ` (line ${err.apexLine})` : '');
       const caughtAs = catchClause && catchClause.type ? catchClause.type.name : 'Exception';
-      this.host.log(`⚠ Caught ${err.apexType || 'Exception'}: ${err.apexMessage || err.message || ''}${where} → handled by catch (${caughtAs}${catchClause && catchClause.name ? ' ' + catchClause.name : ''}). Execution continues in the catch block.`, 'system');
+      this.log(`⚠ Caught ${err.apexType || 'Exception'}: ${err.apexMessage || err.message || ''}${where} → handled by catch (${caughtAs}${catchClause && catchClause.name ? ' ' + catchClause.name : ''}). Execution continues in the catch block.`, 'system');
       if (err.apexStack && err.apexStack.length > 1) {
-        this.host.log(err.apexStack.map(f => `      at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'), 'system');
+        this.log(err.apexStack.map(f => `      at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'), 'system');
       }
     }
 
@@ -1282,7 +1337,7 @@
           }
         }
         this.dmlLog.push({ op, count: records.length, line: stmt.line, type: records.length && records[0] ? sobjType(records[0]) : 'SObject' });
-        if (this.host.log) this.host.log(`DML ${op.toUpperCase()}: ${records.length} ${records.length && records[0] ? sobjType(records[0]) : 'SObject'} record(s)`, 'dml');
+        this.log(`DML ${op.toUpperCase()}: ${records.length} ${records.length && records[0] ? sobjType(records[0]) : 'SObject'} record(s)`, 'dml');
       } finally {
         this.pendingBackend = null;
       }
@@ -1646,7 +1701,7 @@
           binds[b.expr] = await this.evalExpr(ast, frame);
         } catch (err) { binds[b.expr] = null; }
       }      this.pendingBackend = 'SOQL query against org…';
-      if (this.host.log) this.host.log(`SOQL → org: ${e.raw.replace(/\s+/g, ' ').slice(0, 200)}`, 'soql');
+      this.log(`SOQL → org: ${e.raw.replace(/\s+/g, ' ').slice(0, 200)}`, 'soql');
       try {
         if (this.host.query) {
           const rows = await this.host.query(e.raw, binds);
@@ -1833,7 +1888,7 @@
       if (lk === 'getname' || lk === 'tostring') return nm;
       if (lk === 'equals') { const o = args[0]; return !!(o && o.__sobjectType && String(o.__sobjectType).toLowerCase() === String(nm).toLowerCase()); }
       if (lk === 'hashcode') return String(nm).length;
-      if (this.host.log) this.host.log(`⚠ Schema.SObjectType.${name}() not simulated — returning null`, 'system');
+      this.log(`⚠ Schema.SObjectType.${name}() not simulated — returning null`, 'system');
       return null;
     }
     async callDescribeResultMethod(tok, name, args, line, frame) {
@@ -1854,7 +1909,7 @@
       if (lk === 'isaccessible' || lk === 'iscreateable' || lk === 'isupdateable' ||
           lk === 'isdeletable' || lk === 'isundeletable' || lk === 'isqueryable' ||
           lk === 'issearchable') return true;
-      if (this.host.log) this.host.log(`⚠ DescribeSObjectResult.${name}() not simulated — returning null`, 'system');
+      this.log(`⚠ DescribeSObjectResult.${name}() not simulated — returning null`, 'system');
       return null;
     }
     async callFieldsHandleMethod(tok, name, args, line, frame) {
@@ -1866,7 +1921,7 @@
         for (const fn of info.names) m.put(String(fn).toLowerCase(), { __sobjectField: { sobject: nm, field: fn } });
         return m;
       }
-      if (this.host.log) this.host.log(`⚠ Schema fields.${name}() not simulated — returning null`, 'system');
+      this.log(`⚠ Schema fields.${name}() not simulated — returning null`, 'system');
       return null;
     }
     callSObjectFieldMethod(tok, name, args, line) {
@@ -1874,7 +1929,7 @@
       if (lk === 'getdescribe') return { __describeFieldResult: f };
       if (lk === 'getsobjectfield') return tok;
       if (lk === 'getname' || lk === 'tostring') return f.field;
-      if (this.host.log) this.host.log(`⚠ Schema.SObjectField.${name}() not simulated — returning null`, 'system');
+      this.log(`⚠ Schema.SObjectField.${name}() not simulated — returning null`, 'system');
       return null;
     }
     callDescribeFieldResultMethod(tok, name, args, line) {
@@ -1886,7 +1941,7 @@
       if (lk === 'isaccessible' || lk === 'iscreateable' || lk === 'isupdateable' ||
           lk === 'isnillable' || lk === 'issortable' || lk === 'isfilterable') return true;
       if (lk === 'iscustom') return /__c$/i.test(f.field);
-      if (this.host.log) this.host.log(`⚠ DescribeFieldResult.${name}() not simulated — returning null`, 'system');
+      this.log(`⚠ DescribeFieldResult.${name}() not simulated — returning null`, 'system');
       return null;
     }
 
@@ -2164,7 +2219,7 @@
         case 'getdetail': return rec.detail ?? null;
         case 'getseverity': return rec.severity ?? null;
         default:
-          if (this.host.log) this.host.log(`⚠ SObject.${name}() is not simulated — returning null and continuing.`, 'system');
+          this.log(`⚠ SObject.${name}() is not simulated — returning null and continuing.`, 'system');
           return null;
       }
     }
@@ -2180,7 +2235,7 @@
           doc.root = node; return node;
         }
         default:
-          if (this.host.log) this.host.log(`⚠ DOM.Document.${name}() is not simulated — returning null and continuing.`, 'system');
+          this.log(`⚠ DOM.Document.${name}() is not simulated — returning null and continuing.`, 'system');
           return null;
       }
     }
@@ -2207,7 +2262,7 @@
         case 'getattributevalue': { const at = node.findAttr(a[0], a[1]); return at ? at.value : null; }
         case 'tostring': return serializeXml(node);
         default:
-          if (this.host.log) this.host.log(`⚠ DOM.XmlNode.${name}() is not simulated — returning null and continuing.`, 'system');
+          this.log(`⚠ DOM.XmlNode.${name}() is not simulated — returning null and continuing.`, 'system');
           return null;
       }
     }
@@ -2235,7 +2290,7 @@
         if (orgVal !== ENGINE_UNRESOLVED) return orgVal;
       }
       // Degrade gracefully (never kill a session)
-      if (this.host.log) this.host.log(`⚠ ${typeName}.${propName} is not simulated — returning null and continuing.`, 'system');
+      this.log(`⚠ ${typeName}.${propName} is not simulated — returning null and continuing.`, 'system');
       return null;
     }
 
@@ -2246,7 +2301,7 @@
         switch (n) {
           case 'debug': {
             const msg = a.length > 1 ? `[${toApexString(a[0])}] ${toApexString(a[1])}` : toApexString(a[0]);
-            if (this.host.log) this.host.log(msg, 'debug');
+            this.log(msg, 'debug');
             return null;
           }
           case 'now': return ApexDatetime.now();
@@ -2257,8 +2312,8 @@
           case 'assertnotequals': if (apexEquals(a[0], a[1])) throw new ApexError('System.AssertException', `Assertion Failed: Same value: ${toApexString(a[0])}` + (a[2] != null ? ' — ' + toApexString(a[2]) : ''), line); return null;
           case 'runas': return null;   // handled by callblock
           case 'isbatch': case 'isfuture': case 'isqueueable': case 'isscheduled': return false;
-          case 'enqueuejob': { if (this.host.log) this.host.log('System.enqueueJob: queued (simulated, not executed)', 'system'); return fakeId('707'); }
-          case 'schedule': { if (this.host.log) this.host.log('System.schedule: scheduled (simulated)', 'system'); return fakeId('708'); }
+          case 'enqueuejob': { this.log('System.enqueueJob: queued (simulated, not executed)', 'system'); return fakeId('707'); }
+          case 'schedule': { this.log('System.schedule: scheduled (simulated)', 'system'); return fakeId('708'); }
           case 'abortjob': return null;
         }
         throw new ApexError('System.NoSuchMethodException', `System.${name} not supported`, line);
@@ -2355,7 +2410,7 @@
               binds = await this.resolveScopeBinds(raw, frame);
             }
             this.pendingBackend = 'Database.query against org…';
-            if (this.host.log) this.host.log(`Database.query → org: ${raw.replace(/\s+/g, ' ').slice(0, 200)}`, 'soql');
+            this.log(`Database.query → org: ${raw.replace(/\s+/g, ' ').slice(0, 200)}`, 'soql');
             try {
               if (this.host.query) { const rows = await this.host.query(raw, binds); return Array.isArray(rows) ? rows : []; }
               return [];
@@ -2373,7 +2428,7 @@
             return 0;
           }
           case 'setsavepoint': return { __savepoint: Date.now() };
-          case 'rollback': { if (this.host.log) this.host.log('Database.rollback (simulated)', 'system'); return null; }
+          case 'rollback': { this.log('Database.rollback (simulated)', 'system'); return null; }
         }
         throw new ApexError('System.NoSuchMethodException', `Database.${name} not supported`, line);
       }
@@ -2408,7 +2463,7 @@
             this.pageMessages.push(msg);
             const sev = (msg && msg.severity) ? toApexString(msg.severity) : 'UNKNOWN';
             const sum = (msg && msg.summary != null) ? toApexString(msg.summary) : '';
-            if (this.host.log) this.host.log(`ApexPages message [${sev}]: ${sum}`, 'system');
+            this.log(`ApexPages message [${sev}]: ${sum}`, 'system');
             return null;
           }
           case 'addmessages': {
@@ -2416,7 +2471,7 @@
             if (arg instanceof ApexError) {
               const synth = { attributes: { type: 'ApexPages.Message' }, severity: 'ERROR', summary: arg.apexMessage, detail: null };
               this.pageMessages.push(synth);
-              if (this.host.log) this.host.log(`ApexPages message [ERROR]: ${arg.apexMessage}`, 'system');
+              this.log(`ApexPages message [ERROR]: ${arg.apexMessage}`, 'system');
             } else if (Array.isArray(arg)) {
               for (const m of arg) { this.pageMessages.push(m); }
             }
@@ -2425,15 +2480,15 @@
           case 'getmessages': return this.pageMessages.slice();
           case 'hasmessages': return this.pageMessages.length > 0;
           case 'currentpage':
-            if (this.host.log) this.host.log('⚠ ApexPages.currentPage(): VF page context is not simulated — returning null.', 'system');
+            this.log('⚠ ApexPages.currentPage(): VF page context is not simulated — returning null.', 'system');
             return null;
           default:
-            if (this.host.log) this.host.log(`⚠ ApexPages.${name}() is not simulated — returning null`, 'system');
+            this.log(`⚠ ApexPages.${name}() is not simulated — returning null`, 'system');
             return null;
         }
       }
       if (t === 'schema') {
-        if (this.host.log) this.host.log(`Schema.${name}: describe calls are not simulated locally`, 'system');
+        this.log(`Schema.${name}: describe calls are not simulated locally`, 'system');
         return null;
       }
       if (t === 'type') {
@@ -2482,7 +2537,7 @@
       if (/^[a-z]/.test(typeName) && !BUILTIN_TYPES.has(t) && !BUILTIN_ENUMS[t] && !this.registry.get(typeName)) {
         if (!this._unresolvedVarWarned.has(typeName)) {
           this._unresolvedVarWarned.add(typeName);
-          if (this.host.log) this.host.log(`⚠ '${typeName}' isn't in scope here (its declaration may have failed) — treating as null.`, 'system');
+          this.log(`⚠ '${typeName}' isn't in scope here (its declaration may have failed) — treating as null.`, 'system');
         }
         return null;
       }
@@ -2492,7 +2547,7 @@
       // warning and return null so line-by-line stepping continues.
       const orgVal = await this.tryOrgStaticCall(typeName, name, a);
       if (orgVal !== ENGINE_UNRESOLVED) return orgVal;
-      if (this.host.log) this.host.log(`⚠ ${typeName}.${name}() is not simulated and could not be resolved in the org — returning null and continuing.`, 'system');
+      this.log(`⚠ ${typeName}.${name}() is not simulated and could not be resolved in the org — returning null and continuing.`, 'system');
       return null;
     }
 
@@ -2539,7 +2594,7 @@
         finally { this.pendingBackend = null; }
       }
       if (val === ENGINE_UNRESOLVED) {
-        if (this.host.log) this.host.log(`↳ ${typeName}.${methodName}(): org value unavailable — using an empty ${n === 'getall' ? 'map' : 'record'} stub so stepping continues.`, 'system');
+        this.log(`↳ ${typeName}.${methodName}(): org value unavailable — using an empty ${n === 'getall' ? 'map' : 'record'} stub so stepping continues.`, 'system');
         return n === 'getall' ? new ApexMap() : { attributes: { type: typeName } };
       }
       if (n === 'getall') {

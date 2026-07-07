@@ -4114,6 +4114,18 @@ body.zen-mode #editor-container { border-radius: 0; }
 .dbg-liveorg-status.fetching { color: #d29922; }
 .dbg-liveorg-status.idle { color: #8b949e; }
 
+/* Exec-status: shown when execution is in a file that isn't the active editor */
+.dbg-exec-status {
+  font-size: 11px;
+  color: #8b949e;
+  margin-left: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+  opacity: 0.9;
+}
+
 /* Run in Org button */
 .dbg-runorg-btn {
   margin-left: 6px;
@@ -4777,6 +4789,15 @@ body.zen-mode #editor-container { border-radius: 0; }
 @keyframes dbg-exec-pulse {
   0%, 100% { background: rgba(0, 200, 255, 0.06) !important; }
   50%      { background: rgba(0, 200, 255, 0.16) !important; }
+}
+/* Loading variant: shown when execution is at this line AND an org call is in flight */
+.debug-executing-line-loading {
+  border-left: 2px solid #d29922 !important;
+  animation: dbg-exec-loading-pulse 0.75s ease-in-out infinite !important;
+}
+@keyframes dbg-exec-loading-pulse {
+  0%, 100% { background: rgba(210, 153, 34, 0.07) !important; }
+  50%      { background: rgba(210, 153, 34, 0.20) !important; }
 }
 .debug-executing-arrow {
   background: none !important;

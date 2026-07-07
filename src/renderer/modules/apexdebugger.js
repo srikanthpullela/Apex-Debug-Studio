@@ -1760,12 +1760,15 @@ function engineStep(action) {
   eng.resume(action);
 }
 
-/** Console / watch evaluation inside the live interpreter's top frame. */
+/** Console / watch evaluation inside the live interpreter's top frame.
+ *  Uses a sandboxed eval (stack saved/restored, depth-capped) so a bad expression
+ *  in the console can't corrupt the paused call stack. quiet=false so engine logs
+ *  (System.debug, DML notifications) still appear in the console. */
 async function evaluateEngineConsole(expr) {
   const eng = debugState.engineSession;
   if (!eng || !eng.topFrame()) { addConsoleEntry('error', 'No active engine frame'); return; }
   try {
-    const val = await eng.evalExpressionInFrame(expr, eng.topFrame());
+    const val = await eng.evalExpressionSandboxed(expr, eng.topFrame(), false);
     const plain = engineValToPlain(val);
     if (plain !== null && typeof plain === 'object') addConsoleEntry('result-json', JSON.stringify(plain, null, 2));
     else addConsoleEntry('result', formatValue(plain));
@@ -1851,11 +1854,24 @@ function normCompileErr(s) {
  */
 function sfErrorText(cli, stderr, stdout, fallback) {
   if (cli) {
-    if (cli.status && cli.status !== 0 && cli.message) return String(cli.message).split('\n')[0];
     const r = cli.result || cli.data || {};
-    if (r.compileProblem) return `Compile error: ${r.compileProblem}`;
+    // compileProblem is the canonical error for compile failures — check before message.
+    if (r.compileProblem) {
+      const loc = r.line ? ` at line ${r.line}${r.column ? ' col ' + r.column : ''}` : '';
+      return `Compile failed${loc}: ${r.compileProblem}`;
+    }
     if (r.exceptionMessage) return r.exceptionMessage;
-    if (cli.message && !r.success) return String(cli.message).split('\n')[0];
+    if (cli.status && cli.status !== 0 && cli.message) {
+      // Preserve full compile error — the CLI may embed it after a newline.
+      const afterErr = cli.message.match(/with the error:\s*([\s\S]+)/i);
+      if (afterErr) return `Compile failed: ${afterErr[1].trim()}`;
+      return String(cli.message).replace(/\r?\n/g, ' ').trim();
+    }
+    if (cli.message && !r.success) {
+      const afterErr = cli.message.match(/with the error:\s*([\s\S]+)/i);
+      if (afterErr) return `Compile failed: ${afterErr[1].trim()}`;
+      return String(cli.message).replace(/\r?\n/g, ' ').trim();
+    }
   }
   const cleaned = cleanSfNoise(stderr) || cleanSfNoise(stdout);
   if (cleaned) return cleaned.split('\n')[0];
@@ -2245,6 +2261,9 @@ function updateLiveOrgIndicator() {
       status.className = 'dbg-liveorg-status idle';
     }
   }
+  // When orgFetching changes, update the executing-line decoration class so the
+  // user can see "something is happening at this line" via the loading animation.
+  _refreshExecDecoration();
 }
 
 /** Toggle Live Org mode from the toolbar checkbox. */
@@ -2561,7 +2580,14 @@ async function runEntryMethodInOrg() {
       const parsed = parseApexLog(rawLog);
       parsed.compiled = res.compiled;
       parsed.success = res.success;
-      parsed.compileProblem = normCompileErr(res.compileProblem || (cli.name === 'executeCompileFailure' ? (cli.message || 'Compilation failed') : null));
+      // Prefer compileProblem field; extract from cli.message when missing.
+      let cpText = res.compileProblem || (cli && cli.data && cli.data.compileProblem);
+      if (!cpText && res.compiled === false) {
+        const rawMsg = (cli.name === 'executeCompileFailure' ? cli.message : null) || cli.message || 'Compilation failed';
+        const afterErr = rawMsg.match(/with the error:\s*([\s\S]+)/i);
+        cpText = afterErr ? afterErr[1].trim() : rawMsg;
+      }
+      parsed.compileProblem = cpText ? String(cpText) : null;
       parsed.exceptionMessage = res.exceptionMessage || null;
       parsed.rawLog = rawLog;
       if (!parsed.error && res.exceptionMessage) parsed.error = res.exceptionMessage;
@@ -3855,46 +3881,84 @@ async function flushExecFollow() {
 }
 
 /**
- * Open (if needed) and reveal the file+line the interpreter is executing.
- * Guarded so overlapping async file opens can't stack up.
+ * Reveal the file+line the interpreter is currently executing.
+ * KEY BEHAVIOR CHANGE: never auto-opens a file during free-running execution.
+ * If execution has moved to a file that's not the active editor, show a status
+ * indicator instead. Only a PAUSE (breakpoint, step, exception) may open files
+ * (that's handled by onEnginePause, not here).
  */
 async function revealExecutingLocation(line, file) {
   const editor = window.state?.editor;
   if (!editor || !debugState.active || debugState.paused || !line) return;
-  if (debugState.orgFetching) return;   // backend fetch in progress — don't churn files
   if (file && file !== debugState.currentFile && /\.(cls|trigger)$/.test(file)) {
-    if (debugState._execOpening) return;   // an open is already in flight
-    const now = Date.now();
-    if (debugState._lastExecOpenTs && now - debugState._lastExecOpenTs < 400) return; // throttle
-    debugState._lastExecOpenTs = now;
-    debugState._execOpening = true;
-    try {
-      const content = await window.congacode.readFile(file);
-      if (content != null) { await window.openFile(file, content); debugState.currentFile = file; }
-    } catch (_) { /* keep current file */ }
-    finally { debugState._execOpening = false; }
+    // Execution has moved to a different file — do NOT open it automatically.
+    // Show a non-intrusive status indicator so the user knows where execution is.
+    const shortName = file.split('/').pop() || file;
+    const msg = debugState.orgFetching
+      ? `⏳ waiting for org… ${shortName}:${line}`
+      : `Running… ${shortName}:${line}`;
+    _updateExecStatus(msg);
+    return;
   }
-  if (!debugState.active || debugState.paused) return;  // user may have paused during the open
+  _updateExecStatus(null); // on the visible file — clear any "running elsewhere" text
+  if (!debugState.active || debugState.paused) return;
   highlightExecutingLine(line, file);
   try { editor.revealLineInCenterIfOutsideViewport(line); } catch (_) { /* ignore */ }
 }
 
+/** Update the exec-status span in the debug toolbar. Pass null to hide it. */
+function _updateExecStatus(text) {
+  const el = _$('#dbg-exec-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.display = text ? '' : 'none';
+}
+
+/**
+ * Re-apply the executing-line decoration with the correct loading class when
+ * orgFetching state changes (called from updateLiveOrgIndicator).
+ */
+function _refreshExecDecoration() {
+  const editor = window.state?.editor;
+  if (!editor || !debugState.active || debugState.paused) return;
+  if (!debugState.execLineDecoration || !debugState.execLineDecoration.length) return;
+  const line = debugState._execShownLine || debugState.currentLine;
+  const file = debugState._execShownFile || debugState.currentFile;
+  if (!line) return;
+  if (file && debugState.currentFile && file !== debugState.currentFile) return;
+  const cls = debugState.orgFetching
+    ? 'debug-executing-line debug-executing-line-loading'
+    : 'debug-executing-line';
+  debugState.execLineDecoration = editor.deltaDecorations(debugState.execLineDecoration, [{
+    range: new monaco.Range(line, 1, line, 1),
+    options: {
+      isWholeLine: true,
+      className: cls,
+      glyphMarginClassName: 'debug-executing-arrow',
+      stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+    }
+  }]);
+}
+
 /**
  * Paint the animated "currently executing" decoration on a line — distinct from
- * the amber paused-line highlight. Only decorates the file that's on screen (the
- * caller opens the right file first via revealExecutingLocation).
+ * the amber paused-line highlight. Only decorates the file that's on screen.
+ * Uses the loading variant when an org fetch is in progress at this line.
  */
 function highlightExecutingLine(line, file) {
   const editor = window.state?.editor;
   if (!editor || !debugState.active || debugState.paused || !line) return;
   if (file && debugState.currentFile && file !== debugState.currentFile) return;
   clearExecutingLineHighlight();
+  const cls = debugState.orgFetching
+    ? 'debug-executing-line debug-executing-line-loading'
+    : 'debug-executing-line';
   debugState.execLineDecoration = editor.deltaDecorations([], [
     {
       range: new monaco.Range(line, 1, line, 1),
       options: {
         isWholeLine: true,
-        className: 'debug-executing-line',
+        className: cls,
         glyphMarginClassName: 'debug-executing-arrow',
         stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
       }
@@ -3909,6 +3973,7 @@ function clearExecutingLineHighlight() {
   debugState._execPending = null;
   debugState._execShownLine = null;
   debugState._execShownFile = null;
+  _updateExecStatus(null); // also clear the "running elsewhere" status text
   if (!editor) return;
   if (debugState.execLineDecoration && debugState.execLineDecoration.length > 0) {
     editor.deltaDecorations(debugState.execLineDecoration, []);
@@ -5166,8 +5231,33 @@ function registerDebugHoverProvider() {
         const eng = debugState.engineSession;
         const fr = eng.topFrame && eng.topFrame();
         if (fr) {
+          // Pre-flight scope check: extract root identifiers (the first token of each
+          // member chain) and verify they're in scope in the paused frame. This prevents
+          // evaluating expressions like `request.cartId` when `request` is not defined
+          // in the current frame, which would degrade out-of-scope vars to null and
+          // potentially corrupt the session via pause-on-exception side effects.
+          const BUILTIN_ID_RE = /^(System|Math|String|JSON|Database|Schema|Type|Date|Datetime|Integer|Long|Double|Decimal|Boolean|Id|List|Map|Set|SObject|Limits|UserInfo|Test|Trigger|URL|Blob|Exception|true|false|null|this|super)$/i;
+          const roots = [];
+          const rootRe = /(?<![.\w])([A-Za-z_]\w*)/g;
+          let rm;
+          while ((rm = rootRe.exec(engExpr)) !== null) roots.push(rm[1]);
+          const scopeOk = roots.every(root => {
+            if (BUILTIN_ID_RE.test(root)) return true;
+            if (eng.registry && eng.registry.get(root)) return true;          // known class
+            if (fr.env && fr.env.lookupEntry(root)) return true;              // local variable
+            if (fr.thisRef && fr.thisRef.hasField && fr.thisRef.hasField(root)) return true; // instance field
+            if (fr.classInfo) {
+              if (fr.classInfo.staticEnv && fr.classInfo.staticEnv.has(root)) return true;  // static field
+              if (fr.classInfo.findMethods && fr.classInfo.findMethods(root).length > 0) return true; // method
+            }
+            return false;
+          });
+          if (!scopeOk) {
+            debugState._hoverCache.set(cacheKey, undefined);
+            return orgEvalHover();
+          }
           return Promise.resolve()
-            .then(() => eng.evalExpressionInFrame(engExpr, fr))
+            .then(() => eng.evalExpressionSandboxed(engExpr, fr))
             .then((val) => {
               const plain = engineValToPlain(val);
               if (plain === undefined) {
@@ -5652,9 +5742,21 @@ async function _runEvalApex(resolvedExpr) {
     if (cli && cli.status && cli.status !== 0 && !res.logs) {
       return { error: sfErrorText(cli, stderr, stdout, 'Org command failed'), resolvedExpr };
     }
-    const compileProblem = normCompileErr(res.compileProblem || (res.compiled === false ? (cli && cli.message) : null));
+    // Prefer compileProblem field — it's the actual error text ("Invalid type: Foo").
+    // Fall back to extracting from cli.message which the CLI embeds after a newline
+    // ("Compilation failed at Line 5 column 85 with the error:\nActual error here").
+    let compileProblem = res.compileProblem || (cli && cli.data && cli.data.compileProblem);
+    if (!compileProblem && res.compiled === false) {
+      const rawMsg = (cli && cli.message) || '';
+      const afterErr = rawMsg.match(/with the error:\s*([\s\S]+)/i);
+      compileProblem = afterErr ? afterErr[1].trim() : (rawMsg || null);
+    }
     if (res.compiled === false || compileProblem) {
-      return { error: `Compile failed: ${compileProblem || 'unknown'}`, compileFailed: true, resolvedExpr };
+      if (compileProblem) {
+        const loc = res.line ? ` at line ${res.line}${res.column ? ' col ' + res.column : ''}` : '';
+        return { error: `Compile failed${loc}: ${compileProblem}`, compileFailed: true, resolvedExpr };
+      }
+      return { error: 'Compile failed: unknown', compileFailed: true, resolvedExpr };
     }
     let raw = null, evalErr = '';
     for (const line of log.split('\n')) {
