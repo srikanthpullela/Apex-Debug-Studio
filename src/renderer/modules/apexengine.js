@@ -522,6 +522,7 @@
       this._steps = 0;
       this.dmlLog = [];
       this.pageMessages = [];
+      this._unresolvedVarWarned = new Set();
     }
 
     loadSource(fileName, source) {
@@ -666,6 +667,7 @@
       this.pauseRequested = false;
       this.callStack = [];
       this._recursionReported = false;
+      this._unresolvedVarWarned = new Set();
       this.pageMessages = [];
       this.dmlLog = [];
       const cls = this.registry.get(className) || await this.lazyLoadClass(className);
@@ -730,7 +732,7 @@
       return this.registry.get(className) || null;
     }
 
-    pickOverload(methods, args) {
+    pickOverload(methods, args, argHints) {
       if (!methods || !methods.length) return null;
       args = args || [];
       // Candidates whose arity matches the supplied argument count.
@@ -745,11 +747,51 @@
         let score = 0;
         for (let i = 0; i < args.length; i++) {
           const pt = params[i] && params[i].type ? params[i].type.name : null;
-          score += this.scoreArgToParam(args[i], pt);
+          const hint = argHints && argHints[i];
+          if ((args[i] === null || args[i] === undefined) && hint) {
+            // Use static type hint to break null-ambiguity between overloads.
+            const hintL = String(hint).replace(/<[\s\S]*>/, '').replace(/\[\]$/, '').trim().toLowerCase();
+            const baseL = pt ? String(pt).replace(/<[\s\S]*>/, '').replace(/\[\]$/, '').trim().toLowerCase() : null;
+            if (!baseL) { score += 0; }
+            else if (hintL === baseL || stripNs(hintL) === stripNs(baseL)) { score += 3; }
+            else { score += -2; }
+          } else {
+            score += this.scoreArgToParam(args[i], pt);
+          }
         }
         if (score > bestScore) { bestScore = score; best = m; }
       }
       return best;
+    }
+
+    // Compute static type hints from arg AST nodes (synchronous, before evalArgs).
+    // Returns an array parallel to argNodes; each element is a type-name string or null.
+    _argHints(argNodes, frame) {
+      if (!argNodes || !argNodes.length) return [];
+      return argNodes.map(node => {
+        if (!node) return null;
+        if (node.kind === 'lit') {
+          return node.litType === 'null' ? null : (node.litType || null);
+        }
+        if (node.kind === 'ident' && frame && frame.env) {
+          const entry = frame.env.lookupEntry(node.name);
+          return entry ? entry.type : null;
+        }
+        if (node.kind === 'call' && !node.target && frame && frame.classInfo) {
+          // Unqualified call: look up declared return type from classInfo hierarchy.
+          let c = frame.classInfo;
+          while (c) {
+            const ms = c.findMethods ? c.findMethods(node.name) : [];
+            if (ms.length) { const rt = ms[0].returnType; return rt ? rt.name : null; }
+            c = c.superClass ? this.registry.get(c.superClass) : null;
+          }
+          return null;
+        }
+        if (node.kind === 'new') {
+          return node.type ? (node.type.name || null) : null;
+        }
+        return null;
+      });
     }
 
     // How well a runtime argument value fits a declared parameter type.
@@ -914,7 +956,10 @@
         const cycle = this._describeRecursionCycle();
         if (this.host.log && !this._recursionReported) {
           this._recursionReported = true;
-          this.host.log(`♻ Runaway recursion detected — the interpreter kept re-entering the same call cycle ${cycle.reps}× and stopped at depth ${this.callStack.length}. Repeating cycle:\n${cycle.text}`, 'system');
+          const cycleDesc = cycle.reps > 0
+            ? `kept re-entering the same call cycle ${cycle.reps}× and stopped at depth ${this.callStack.length}. Repeating cycle:\n${cycle.text}`
+            : `stopped at depth ${this.callStack.length} (no clear repeating cycle). Last frames:\n${cycle.text}`;
+          this.host.log(`♻ Runaway recursion detected — the interpreter ${cycleDesc}`, 'system');
         }
         throw new ApexError('System.LimitException', `Maximum stack depth reached (recursion too deep). Repeating cycle: ${cycle.short}`, method.line);
       }
@@ -974,6 +1019,7 @@
         for (let j = 0; j < period; j++) { if (top[i + j] !== unit[j]) { match = false; break; } }
         if (match) reps++; else break;
       }
+      reps = Math.max(1, reps);
       return {
         text: unit.map(s => '   ↻ ' + s).join('\n'),
         short: unit.join(' → '),
@@ -1635,9 +1681,10 @@
     async evalCall(e, frame) {
       // Unqualified call: method on this / current class statics
       if (!e.target) {
+        const argHints = this._argHints(e.args, frame);
         const args = await this.evalArgs(e.args, frame);
         if (frame.classInfo) {
-          const { ci, m } = this.findMethodInHierarchy(frame.classInfo, e.name, args);
+          const { ci, m } = this.findMethodInHierarchy(frame.classInfo, e.name, args, false, argHints);
           if (m) return this.invokeMethod(ci, m, m.static ? null : frame.thisRef, args, frame);
         }
         throw new ApexError('System.NoSuchMethodException', `Method ${e.name}(${args.length} args) not found`, e.line);
@@ -1647,10 +1694,11 @@
         if (e.safe) return null;
         throw npe(e.line, `Attempt to de-reference a null object (calling '${e.name}')`);
       }
+      const argHints = this._argHints(e.args, frame);
       const args = await this.evalArgs(e.args, frame);
       if (target.__classRef) {
         const ci = target.__classRef;
-        const { ci: foundCi, m } = this.findMethodInHierarchy(ci, e.name, args, true);
+        const { ci: foundCi, m } = this.findMethodInHierarchy(ci, e.name, args, true, argHints);
         if (m) {
           if (m.static) return this.invokeMethod(foundCi, m, null, args, frame);
           throw new ApexError('System.TypeException', `Non-static method ${e.name} called statically on ${ci.name}`, e.line);
@@ -1663,19 +1711,19 @@
       if (e.target.kind === 'super' && frame.classInfo) {
         const superCi = this.superOf(frame.classInfo);
         if (superCi) {
-          const { ci: fci, m } = this.findMethodInHierarchy(superCi, e.name, args);
+          const { ci: fci, m } = this.findMethodInHierarchy(superCi, e.name, args, false, argHints);
           if (m) return this.invokeMethod(fci, m, frame.thisRef, args, frame);
         }
       }
-      return this.callInstanceMethod(target, e.name, args, e.line, frame);
+      return this.callInstanceMethod(target, e.name, args, e.line, frame, argHints);
     }
 
-    findMethodInHierarchy(ci, name, args, staticsOnly) {
+    findMethodInHierarchy(ci, name, args, staticsOnly, argHints) {
       let c = ci;
       while (c) {
         const ms = c.findMethods(name);
         if (ms.length) {
-          const m = this.pickOverload(ms, args);
+          const m = this.pickOverload(ms, args, argHints);
           return { ci: c, m };
         }
         c = this.superOf(c);
@@ -1683,7 +1731,7 @@
       return { ci: null, m: null };
     }
 
-    async callInstanceMethod(target, name, args, line, frame) {
+    async callInstanceMethod(target, name, args, line, frame, argHints) {
       // System.Type handle (from Type.forName(...) / SomeType.class): support the
       // reflection primitives natively so patterns like
       //   Type t = Type.forName(name); SObject so = (SObject) t.newInstance();
@@ -1705,7 +1753,7 @@
         if (target.__describeFieldResult) return this.callDescribeFieldResultMethod(target, name, args, line, frame);
       }
       if (target instanceof ApexObject) {
-        const { ci, m } = this.findMethodInHierarchy(target.classInfo, name, args);
+        const { ci, m } = this.findMethodInHierarchy(target.classInfo, name, args, false, argHints);
         if (m) return this.invokeMethod(ci, m, target, args, frame);
         // fallthrough: maybe common Object methods
         const lk = name.toLowerCase();
@@ -2425,6 +2473,18 @@
       if (ci) {
         const { ci: fci, m } = this.findMethodInHierarchy(ci, name, a, true);
         if (m && m.static) return this.invokeMethod(fci, m, null, a, frame);
+      }
+      // Lowercase-first name that isn't a known class or builtin is almost certainly
+      // an unresolved local variable whose declaration failed earlier.  Evaluating it
+      // against the org as if it were a class reference produces nonsense results
+      // (e.g. "configs.isEmpty()" being org-evaled as a class call).  Catch it here,
+      // warn once, and return null so stepping continues.
+      if (/^[a-z]/.test(typeName) && !BUILTIN_TYPES.has(t) && !BUILTIN_ENUMS[t] && !this.registry.get(typeName)) {
+        if (!this._unresolvedVarWarned.has(typeName)) {
+          this._unresolvedVarWarned.add(typeName);
+          if (this.host.log) this.host.log(`⚠ '${typeName}' isn't in scope here (its declaration may have failed) — treating as null.`, 'system');
+        }
+        return null;
       }
       // Graceful degradation (V8-style "keep going"): a genuinely unsupported static
       // method must NOT halt the whole debug session. Try to resolve the entire call

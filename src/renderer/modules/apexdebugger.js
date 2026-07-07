@@ -1505,6 +1505,7 @@ function engineBuildSoql(raw, binds) {
 async function onEnginePause(info) {
   debugState.paused = true;
   debugState.engineRunning = false;
+  debugState._hoverCache = new Map();   // clear per-pause hover cache
   clearExecutingLineHighlight();
   mirrorEngineStack(info.stack || []);
   debugState.currentLine = info.line;
@@ -1833,6 +1834,14 @@ function cleanSfNoise(text) {
     })
     .join('\n')
     .trim();
+}
+
+/**
+ * Normalize a compile-error string from the CLI: flatten newlines to spaces,
+ * collapse whitespace, and cap at 300 chars so the real error text is visible.
+ */
+function normCompileErr(s) {
+  return String(s || '').replace(/\r?\n/g, ' ').replace(/\s{2,}/g, ' ').trim().slice(0, 300);
 }
 
 /**
@@ -2552,7 +2561,7 @@ async function runEntryMethodInOrg() {
       const parsed = parseApexLog(rawLog);
       parsed.compiled = res.compiled;
       parsed.success = res.success;
-      parsed.compileProblem = res.compileProblem || (cli.name === 'executeCompileFailure' ? (cli.message || 'Compilation failed') : null);
+      parsed.compileProblem = normCompileErr(res.compileProblem || (cli.name === 'executeCompileFailure' ? (cli.message || 'Compilation failed') : null));
       parsed.exceptionMessage = res.exceptionMessage || null;
       parsed.rawLog = rawLog;
       if (!parsed.error && res.exceptionMessage) parsed.error = res.exceptionMessage;
@@ -3852,8 +3861,12 @@ async function flushExecFollow() {
 async function revealExecutingLocation(line, file) {
   const editor = window.state?.editor;
   if (!editor || !debugState.active || debugState.paused || !line) return;
+  if (debugState.orgFetching) return;   // backend fetch in progress — don't churn files
   if (file && file !== debugState.currentFile && /\.(cls|trigger)$/.test(file)) {
     if (debugState._execOpening) return;   // an open is already in flight
+    const now = Date.now();
+    if (debugState._lastExecOpenTs && now - debugState._lastExecOpenTs < 400) return; // throttle
+    debugState._lastExecOpenTs = now;
     debugState._execOpening = true;
     try {
       const content = await window.congacode.readFile(file);
@@ -5035,7 +5048,7 @@ function registerDebugHoverProvider() {
         const contents = [];
         const declaredType = opts.declaredType || lookupVarType(displayPath);
         const typeName = getValueTypeName(val, declaredType);
-        const tag = opts.realOrg ? ' · _real org value_' : '';
+        const tag = opts.realOrg ? ' · _real org value_' : (opts.engine ? ' · _live engine_' : '');
         // Distinguish a for-each ELEMENT from its COLLECTION so a 1-item list
         // (where element ≈ collection) is never ambiguous.
         const iter = lookupLoopIter(displayPath);
@@ -5143,6 +5156,13 @@ function registerDebugHoverProvider() {
       //    eval only when the engine can't resolve the expression.
       if (debugState.engineMode && debugState.engineSession && (callExpr || fullPath.includes('.'))) {
         const engExpr = callExpr || fullPath;
+        const cacheKey = engExpr + '\x00' + (debugState.currentLine || '');
+        if (!debugState._hoverCache) debugState._hoverCache = new Map();
+        if (debugState._hoverCache.has(cacheKey)) {
+          const cached = debugState._hoverCache.get(cacheKey);
+          if (cached !== undefined) return makeHover(engExpr, cached, { range: wordRange, engine: true });
+          return orgEvalHover();
+        }
         const eng = debugState.engineSession;
         const fr = eng.topFrame && eng.topFrame();
         if (fr) {
@@ -5150,10 +5170,14 @@ function registerDebugHoverProvider() {
             .then(() => eng.evalExpressionInFrame(engExpr, fr))
             .then((val) => {
               const plain = engineValToPlain(val);
-              if (plain === undefined) return orgEvalHover();
-              return makeHover(engExpr, plain, { range: wordRange });
+              if (plain === undefined) {
+                debugState._hoverCache.set(cacheKey, undefined);
+                return orgEvalHover();
+              }
+              debugState._hoverCache.set(cacheKey, plain);
+              return makeHover(engExpr, plain, { range: wordRange, engine: true });
             })
-            .catch(() => orgEvalHover());
+            .catch(() => { debugState._hoverCache.set(cacheKey, undefined); return orgEvalHover(); });
         }
       }
 
@@ -5568,7 +5592,6 @@ function buildEvalApex(resolvedExpr) {
     `    try { Database.rollback(ccEvSp); } catch (Exception ccEvRe) {}`,
     `}`,
     `String ccEvOut;`,
-    `String ccEvOut;`,
     `if (ccEvVal == null) { ccEvOut = 'null'; }`,
     `else {`,
     `    try { ccEvOut = JSON.serialize(ccEvVal); }`,
@@ -5629,7 +5652,7 @@ async function _runEvalApex(resolvedExpr) {
     if (cli && cli.status && cli.status !== 0 && !res.logs) {
       return { error: sfErrorText(cli, stderr, stdout, 'Org command failed'), resolvedExpr };
     }
-    const compileProblem = res.compileProblem || (res.compiled === false ? (cli && cli.message) : null);
+    const compileProblem = normCompileErr(res.compileProblem || (res.compiled === false ? (cli && cli.message) : null));
     if (res.compiled === false || compileProblem) {
       return { error: `Compile failed: ${compileProblem || 'unknown'}`, compileFailed: true, resolvedExpr };
     }
