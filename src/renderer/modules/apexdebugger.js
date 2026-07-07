@@ -1405,6 +1405,7 @@ function engineValToPlain(v, depth = 0) {
   if (depth > 6) return '…';
   const t = typeof v;
   if (t === 'string' || t === 'number' || t === 'boolean') return v;
+  if (t === 'object' && v.__typeToken) return v.__typeToken;   // System.Type / Schema.SObjectType handle → its API name
   const E = window.ApexEngine;
   if (Array.isArray(v)) return v.map(x => engineValToPlain(x, depth + 1));
   if (E && v instanceof E.ApexMap) {
@@ -1453,7 +1454,32 @@ function mirrorEngineStack(engineStack) {
   debugState.callStack = frames;
 }
 
-/** Inline resolved bind values into a SOQL string so it can run via the CLI. */
+/** Mirror an exception's throw-site stack (captured at throw time, top-first,
+    each frame carrying a snapshotVars() array) into debugState.callStack so the
+    Call Stack panel shows the FULL chain that led to the throw — not the single
+    catching frame the live stack has already unwound to. */
+function mirrorExceptionStack(excStack) {
+  const frames = [];
+  // exception stack is top-first (innermost throw site first); panel wants bottom-first
+  for (let i = excStack.length - 1; i >= 0; i--) {
+    const f = excStack[i];
+    const variables = {};
+    const classFields = {};
+    for (const v of f.variables || []) {
+      if (v.name === 'this') continue;
+      if (v.scope && String(v.scope).startsWith('static')) classFields[v.name] = engineValToPlain(v.value);
+      else variables[v.name] = engineValToPlain(v.value);
+    }
+    if (f.thisRef && f.thisRef.fields) {
+      for (const e of f.thisRef.fields.values()) classFields[e.name] = engineValToPlain(e.value);
+    }
+    frames.push({
+      file: f.file, className: f.className, methodName: f.methodName,
+      line: f.line, variables, classFields, statements: [], pc: 0,
+    });
+  }
+  debugState.callStack = frames;
+}
 function engineBuildSoql(raw, binds) {
   let q = String(raw || '').trim().replace(/^\[/, '').replace(/\]\s*;?$/, '').trim();
   const entries = Object.entries(binds || {}).sort((a, b) => b[0].length - a[0].length);
@@ -1476,6 +1502,18 @@ async function onEnginePause(info) {
   // block handed control to catch), then let the user inspect state before continuing.
   if ((info.reason === 'caught-exception' || info.reason === 'exception') && info.error) {
     const e = info.error;
+    // The live stack has already unwound to the catching frame by the time the
+    // catch handler runs, so it would show only ONE method. The exception's
+    // throw-site stack (captured with real variables at throw time) is the true
+    // chain the user needs to see — mirror THAT into the Call Stack panel.
+    if (e.stack && e.stack.length) {
+      mirrorExceptionStack(e.stack);
+      debugState.currentFrame = debugState.callStack.length - 1;
+      // Navigate the editor to the actual THROW SITE (top of the exception stack),
+      // which may live in a different file than the catching frame.
+      if (e.stack[0].file) info.file = e.stack[0].file;
+      if (e.stack[0].line) { info.line = e.stack[0].line; debugState.currentLine = e.stack[0].line; }
+    }
     addConsoleEntry('error', `⏸ Paused on ${info.reason === 'caught-exception' ? 'caught ' : ''}exception: ${e.type || 'Exception'}: ${e.message || ''}`);
     if (e.stack && e.stack.length) {
       addConsoleEntry('error', e.stack.map(f => `      at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'));
@@ -4906,6 +4944,27 @@ function registerDebugHoverProvider() {
         return null;
       };
 
+      // 3) Live-interpreter mode: resolve method calls / dotted expressions in the
+      //    ENGINE first. It holds the real runtime object graph and now supports
+      //    Type.newInstance(), getSObjectType(), etc., so values come from actual
+      //    execution state rather than a separate org round-trip. Fall back to org
+      //    eval only when the engine can't resolve the expression.
+      if (debugState.engineMode && debugState.engineSession && (callExpr || fullPath.includes('.'))) {
+        const engExpr = callExpr || fullPath;
+        const eng = debugState.engineSession;
+        const fr = eng.topFrame && eng.topFrame();
+        if (fr) {
+          return Promise.resolve()
+            .then(() => eng.evalExpressionInFrame(engExpr, fr))
+            .then((val) => {
+              const plain = engineValToPlain(val);
+              if (plain === undefined) return orgEvalHover();
+              return makeHover(engExpr, plain, { range: wordRange });
+            })
+            .catch(() => orgEvalHover());
+        }
+      }
+
       // 3.5) Instance method call on an already-resolved object → interpret the
       // method locally against that object (honors its if/else + loops, V8-style).
       // e.g. lineItemDO.primaryLineItemSO() returns chargeLines[0].lineItemSO.
@@ -5317,7 +5376,18 @@ function buildEvalApex(resolvedExpr) {
     `    try { Database.rollback(ccEvSp); } catch (Exception ccEvRe) {}`,
     `}`,
     `String ccEvOut;`,
-    `try { ccEvOut = JSON.serialize(ccEvVal); } catch (Exception ccEvSe) { ccEvOut = '"<unserializable: ' + String.valueOf(ccEvVal) + '>"'; }`,
+    `String ccEvOut;`,
+    `if (ccEvVal == null) { ccEvOut = 'null'; }`,
+    `else {`,
+    `    try { ccEvOut = JSON.serialize(ccEvVal); }`,
+    `    catch (Exception ccEvSe) {`,
+    `        // Non-serializable Apex types (Schema.SObjectType, System.Type,`,
+    `        // Schema.DescribeSObjectResult, …) throw on JSON.serialize. Show their`,
+    `        // real String.valueOf form (e.g. the API name) instead of a placeholder.`,
+    `        try { ccEvOut = JSON.serialize(String.valueOf(ccEvVal)); }`,
+    `        catch (Exception ccEvSe2) { ccEvOut = '"<unserializable>"'; }`,
+    `    }`,
+    `}`,
     `System.debug(LoggingLevel.ERROR, '__CC_EVAL__' + ccEvOut);`,
     `System.debug(LoggingLevel.ERROR, '__CC_EVALERR__' + ccEvErr);`,
   ].join('\n');

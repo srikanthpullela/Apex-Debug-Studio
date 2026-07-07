@@ -897,9 +897,18 @@
       } catch (e) {
         if (e instanceof ReturnSignal) return e.value;
         if (e instanceof ApexError && !e.apexStack.length) {
+          // Capture the FULL throw-site stack here, while every frame is still
+          // live on this.callStack (the finally below, and the callers' finallys,
+          // will pop them as the exception unwinds). We snapshot each frame's real
+          // variables/thisRef/file too, so a "pause on exception" can show the
+          // complete chain WITH real values — the unwound live stack at catch-time
+          // only contains the catching frame.
           for (let i = this.callStack.length - 1; i >= 0; i--) {
             const f = this.callStack[i];
-            e.apexStack.push({ className: f.className, methodName: f.methodName, line: f.line });
+            e.apexStack.push({
+              className: f.className, methodName: f.methodName, line: f.line,
+              file: f.file, variables: this.snapshotVars(f), thisRef: f.thisRef || null,
+            });
           }
         }
         throw e;
