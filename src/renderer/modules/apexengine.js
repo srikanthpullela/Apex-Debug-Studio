@@ -1603,6 +1603,15 @@
     }
 
     async callInstanceMethod(target, name, args, line, frame) {
+      // System.Type handle (from Type.forName(...) / SomeType.class): support the
+      // reflection primitives natively so patterns like
+      //   Type t = Type.forName(name); SObject so = (SObject) t.newInstance();
+      // execute in the engine instead of falling through to org eval (which can't
+      // rebuild a runtime object). Handled BEFORE isSObject, since {__typeToken}
+      // is a plain object that would otherwise be mistaken for an SObject.
+      if (target && target.__typeToken) {
+        return await this.callTypeTokenMethod(target, name, args, line, frame);
+      }
       if (target instanceof ApexObject) {
         const { ci, m } = this.findMethodInHierarchy(target.classInfo, name, args);
         if (m) return this.invokeMethod(ci, m, target, args, frame);
@@ -1630,6 +1639,31 @@
       if (target instanceof ApexXmlnode) return this.callXmlnodeMethod(target, name, args, line);
       if (isSObject(target)) return this.callSObjectMethod(target, name, args, line);
       throw new ApexError('System.NoSuchMethodException', `Method ${name} not found on ${typeNameOf(target)}`, line);
+    }
+
+    /**
+     * Methods on a System.Type handle (produced by Type.forName / X.class).
+     * newInstance() builds a real instance: a user class is instantiated via its
+     * no-arg constructor; any other name is treated as an SObject type and yields
+     * an empty SObject (`{attributes:{type:name}}`) — matching how CPQ code uses
+     * `(SObject) Type.forName(name).newInstance()`. No fabricated field data.
+     */
+    async callTypeTokenMethod(tok, name, args, line, frame) {
+      const typeName = tok.__typeToken;
+      const lk = name.toLowerCase();
+      if (lk === 'newinstance') {
+        let ci = this.registry.get(typeName)
+          || (frame && frame.classInfo ? this.registry.getInner(frame.classInfo, typeName) : null)
+          || await this.lazyLoadClass(typeName);
+        if (ci && !ci.ast.isEnum) return this.instantiate(ci, [], null, line);
+        // Not a user class → an SObject type. Return an empty SObject of that type.
+        return { attributes: { type: typeName } };
+      }
+      if (lk === 'getname') return typeName;
+      if (lk === 'tostring') return typeName;
+      if (lk === 'equals') { const o = args[0]; return !!(o && o.__typeToken && String(o.__typeToken).toLowerCase() === String(typeName).toLowerCase()); }
+      if (lk === 'hashcode') return String(typeName).length;
+      throw new ApexError('System.NoSuchMethodException', `Method Type.${name} not supported`, line);
     }
 
     /* ---------- new ---------- */
@@ -2174,7 +2208,20 @@
         return null;
       }
       if (t === 'type') {
-        if (n === 'forname') return { __typeToken: toApexString(a[0]) };
+        if (n === 'forname') {
+          // forName(name) or forName(namespace, name). Return a type handle, or
+          // null for an empty/unknown name so `if (oType != null)` guards behave
+          // exactly as in real Apex.
+          let nm;
+          if (a.length >= 2) {
+            const ns = a[0] != null ? toApexString(a[0]) : '';
+            const base = a[1] != null ? toApexString(a[1]) : '';
+            nm = ns ? `${ns}__${base}` : base;
+          } else {
+            nm = a.length && a[0] != null ? toApexString(a[0]) : '';
+          }
+          return (nm && nm !== 'null') ? { __typeToken: nm } : null;
+        }
         return null;
       }
       // ---- Custom Settings (__c) / Custom Metadata (__mdt) built-in static methods ----
