@@ -1535,11 +1535,14 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
           const info = describeEmptyQuery(soql);
           addConsoleEntry('warn', `🔎 0 rows from org — ${info.subject} not found in org${info.org ? ' ' + info.org : ''}.`);
           if (info.byId) {
-            addConsoleEntry('warn', `↳ This record does not exist in the connected org (it may be a transient record that was already cleaned up). Any code that dereferences this empty result will get null — and will throw a NullPointerException, exactly as it would in real Apex. No data is being generated to hide this.`);
+            const sysNote = res.mode === 'system'
+              ? ' This ran in system mode (FLS/CRUD/sharing bypassed), so a missing permission is NOT the cause — the record genuinely is not in the org.'
+              : '';
+            addConsoleEntry('warn', `↳ This record does not exist in the connected org (it may be a transient record that was already cleaned up).${sysNote} Any code that dereferences this empty result will get null — and will throw a NullPointerException, exactly as it would in real Apex. No data is being generated to hide this.`);
           }
           renderConsolePanel();
         } else {
-          addConsoleEntry('info', `✓ ${res.records.length} row(s) from org`);
+          addConsoleEntry('info', `✓ ${res.records.length} row(s) from org${res.mode === 'system' ? ' (system mode — full permissions)' : res.mode === 'user' ? ' (user mode)' : ''}`);
         }
         return res.records;
       } finally {
@@ -1888,13 +1891,31 @@ async function execSoql(soql) {
   return result;
 }
 
-/** Single `sf data query` invocation (no caching, no retry). */
+/**
+ * Single SOQL invocation (no caching, no namespace retry).
+ *
+ * Prefers a SYSTEM-MODE fetch via anonymous Apex (`Database.query` runs without
+ * FLS/CRUD and `without sharing` by default) so the debugger sees the same data
+ * the managed-package classes see in production, even when the connected user
+ * lacks explicit object/field read permission. Falls back to the USER-MODE REST
+ * Query API only when the Apex path can't run (auth/CLI failure or no FINEST log).
+ * Returns { records, error, soql }.
+ */
 async function _runSoqlOnce(soql) {
+  if (liveOrgAvailable()) {
+    const viaApex = await _runSoqlViaApex(soql);
+    if (viaApex && !viaApex._apexUnavailable) return viaApex;
+  }
+  return _runSoqlViaRest(soql);
+}
+
+/** USER-MODE fetch: a single `sf data query` invocation (REST Query API). */
+async function _runSoqlViaRest(soql) {
   const org = getActiveOrg();
   const folder = window.state?.folderPath;
   const escaped = soql.replace(/"/g, '\\"');
   const cmd = `sf data query --query "${escaped}" --json --target-org ${org.org}`;
-  let result = { records: [], error: null, soql };
+  let result = { records: [], error: null, soql, mode: 'user' };
   try {
     const { stdout, stderr } = await window.congacode.sfExec(cmd, folder, 60000);
     const parsed = parseSfJson(stdout);
@@ -1907,6 +1928,67 @@ async function _runSoqlOnce(soql) {
     result.error = e?.message || String(e);
   }
   return result;
+}
+
+/**
+ * SYSTEM-MODE fetch: run the query inside anonymous Apex via `sf apex run` and
+ * pull the serialized rows back out of the FINEST debug log. `Database.query`
+ * in an anonymous block runs in system context (no FLS/CRUD, without sharing),
+ * so records blocked from the connected user by permissions are still returned.
+ *
+ * Returns { records, error, soql } like the REST path. A genuine query error
+ * (e.g. "sObject type 'X' is not supported") is surfaced as `error` so the
+ * caller's namespace-retry still fires. Returns { _apexUnavailable: true } only
+ * when the Apex mechanism itself can't run (auth/CLI failure, no debug log),
+ * signalling the caller to fall back to the REST Query API. No data is fabricated.
+ */
+async function _runSoqlViaApex(soql) {
+  const org = getActiveOrg();
+  if (!org) return { _apexUnavailable: true };
+  // Escape for embedding inside an Apex single-quoted string literal.
+  const escaped = soql.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const apex = [
+    `List<SObject> ccRows = new List<SObject>();`,
+    `String ccErr = '';`,
+    `try {`,
+    `    ccRows = Database.query('${escaped}');`,
+    `} catch (Exception ccE) {`,
+    `    ccErr = ccE.getTypeName() + ': ' + ccE.getMessage();`,
+    `}`,
+    `String ccOut;`,
+    `try { ccOut = JSON.serialize(ccRows); } catch (Exception ccSe) { ccOut = '[]'; }`,
+    `System.debug(LoggingLevel.ERROR, '__CC_SOQL__' + ccOut);`,
+    `System.debug(LoggingLevel.ERROR, '__CC_SOQLERR__' + ccErr);`,
+  ].join('\n');
+  try {
+    const paths = await window.congacode.getPaths?.();
+    const dir = paths?.congacodeDir || paths?.home || '.';
+    const tmpFile = `${dir}/.cc_debug_soql.apex`;
+    await window.congacode.writeFile(tmpFile, apex);
+    const cmd = `sf apex run --file "${tmpFile}" --json --target-org ${org.org}`;
+    const { stdout, stderr } = await window.congacode.sfExec(cmd, window.state?.folderPath, 60000);
+    const cli = parseSfJson(stdout);
+    if (!cli) return { _apexUnavailable: true };
+    const res = (cli.result || cli.data) || {};
+    const log = res.logs || '';
+    if (cli.status && cli.status !== 0 && !log) return { _apexUnavailable: true }; // auth/IP/CLI failure
+    if (res.compiled === false) return { _apexUnavailable: true };                  // wrapper didn't compile
+    let raw = null, qErr = '';
+    for (const line of log.split('\n')) {
+      const pipe = line.split('|');
+      const msg = pipe.length >= 5 ? pipe.slice(4).join('|') : '';
+      if (msg.startsWith('__CC_SOQL__')) raw = msg.slice('__CC_SOQL__'.length);
+      else if (msg.startsWith('__CC_SOQLERR__')) qErr = msg.slice('__CC_SOQLERR__'.length);
+    }
+    if (raw == null && !qErr) return { _apexUnavailable: true }; // no markers (FINEST off) → fall back to REST
+    if (qErr) return { records: [], error: qErr, soql };         // real query exception → let caller retry/report
+    let recs = [];
+    try { recs = JSON.parse(raw) || []; } catch { recs = []; }
+    if (!Array.isArray(recs)) recs = recs ? [recs] : [];
+    return { records: recs.map(cleanSObject), error: null, soql, mode: 'system' };
+  } catch (e) {
+    return { _apexUnavailable: true };
+  }
 }
 
 /** Read the package namespace from the open folder's sfdx-project.json (cached). */
