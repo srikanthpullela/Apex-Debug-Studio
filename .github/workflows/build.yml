@@ -58,7 +58,10 @@ jobs:
 
       - name: Build macOS app
         if: matrix.platform == 'mac'
-        run: npm run build
+        # --publish never: just build the artifacts, don't try to publish a
+        # GitHub release (electron-builder auto-publishes when it detects CI,
+        # which would require a GH_TOKEN we intentionally don't provide).
+        run: npm run build -- --publish never
         env:
           # No Apple Developer certificate on CI — build unsigned instead of
           # failing on a missing identity.
@@ -66,11 +69,10 @@ jobs:
 
       - name: Build Windows app
         if: matrix.platform == 'win'
-        run: npx --no-install electron-builder --win
+        run: npx --no-install electron-builder --win --publish never
         env:
           # No Windows code-signing certificate on CI — build unsigned.
-          CSC_LINK: ''
-          CSC_KEY_PASSWORD: ''
+          CSC_IDENTITY_AUTO_DISCOVERY: false
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
