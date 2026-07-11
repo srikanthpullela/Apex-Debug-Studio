@@ -21,6 +21,7 @@ const debugState = {
   entryFile: null,             // Path of the file containing the target method
   entryMethod: null,           // Name of the target method
   entryLine: 0,                // Line number where method starts
+  entryDeclLine: 0,            // Line of the entry method's signature (for replay trimming)
   // Execution
   callStack: [],               // [{ file, className, methodName, line, variables: {}, statements: [], pc: 0, classFields: {} }]
   currentFile: null,           // Currently highlighted file
@@ -32,6 +33,8 @@ const debugState = {
   breakpointDecorations: new Map(),  // filePath → decoration IDs array
   currentLineDecoration: [],         // decoration IDs for current execution line
   execLineDecoration: [],            // decoration IDs for the line executing during a running (Continue) session
+  exceptionDecoration: [],           // decoration IDs for the "thrown here" / failing-call-chain markers
+  exceptionInfo: null,               // { type, message, stack:[{file,line,className,methodName}] } — stack[0] = throw site
   // Variable scopes
   variables: {},               // Current frame's variable map
   // Class-level fields: className → { publicFields: {}, privateFields: {}, staticFields: {} }
@@ -42,6 +45,12 @@ const debugState = {
   methodCache: new Map(),
   // Console log entries
   consoleLog: [],
+  // Org/engine activity log (SOQL, DML, branch/loop traces, status) — shown in
+  // the ⚡ Org tab, kept OUT of the Console so the Console only holds user output.
+  orgLog: [],
+  // Replay: high-water mark of the furthest step whose System.debug output has
+  // been streamed to the Console, so stepping back/forward never double-prints.
+  replayDebugHigh: -1,
   // Watch expressions
   watchExpressions: [],  // [{ expr: string, id: number }]
   watchNextId: 1,
@@ -55,6 +64,13 @@ const debugState = {
   liveOrgMode: false,          // When true, SOQL runs against the connected org
   orgFetching: false,          // True while an org call is in flight
   orgQueryCache: new Map(),    // normalized SOQL string → { records, error, soql }
+  sysHelper: new Map(),        // org username → 'ready'|'declined'|'unavailable'|Promise (system-mode helper class status)
+  // FINEST-logging warm-up cache (per org alias). Avoids re-doing the ~7 serial `sf`
+  // CLI calls that set up the temporary debug TraceFlag on every run: once a valid
+  // CongaCodeFinest flag exists it is reused until it nears expiry. Value shape:
+  // { promise:Promise<bool>, expiresAt:number|null, userId:string|null, debugLevelId:string|null }.
+  // Populated in the background the moment a debug session starts (overlaps the wait).
+  _finestWarm: new Map(),
   orgRunning: false,           // True while the entry method is executing in the org
   orgActivity: null,           // Parsed result of the last "Run in Org" execution
   // Replay mode — step through a recorded org execution (from the debug log)
@@ -71,6 +87,18 @@ const debugState = {
   engineMode: false,           // When true, step controls drive the live interpreter
   engineSession: null,         // Active ApexEngine instance
   engineRunning: false,        // True while the engine is executing (not paused)
+  engineAction: null,          // Last resume action ('continue'|'into'|'over'|'out') — decides cross-file navigation
+  currentQueryText: null,      // Short text of the in-flight SOQL, shown in the exec-status while querying
+  pausedElsewhere: null,       // { file, line, reason } when paused in a file that isn't on screen (click to open)
+  // Engine-mode reverse stepping: a bounded, in-memory timeline of the REAL state
+  // captured at each engine pause this run (view-only — the engine is never rewound;
+  // we redisplay states it genuinely reached). Mirrors the ⚡ Live-Org replay model so
+  // Step Back works in "Debug with Request" runs too. All values are real captures.
+  engineHistory: [],           // [{ file, line, frames, exceptionInfo, reason }] oldest→newest
+  engineHistoryIndex: -1,      // index currently DISPLAYED; the live edge is length-1
+  engineViewingHistory: false, // true while displaying an earlier snapshot (not the live edge)
+  _engineHistoryCap: 400,      // retain the most recent N pauses (bounds memory on deep runs)
+  _engineStepBackNoted: false,
 };
 
 /* ================================================================
@@ -1250,6 +1278,12 @@ async function startDebugSession(filePath, methodName, requestParams) {
   const methodInfo = findMethodInSource(source, methodName);
   if (!methodInfo) { window.showToast?.(`Method "${methodName}" not found`, 'error'); return; }
 
+  // Start FINEST-logging setup in the BACKGROUND now (if an org is connected), so the
+  // one-time ~20-35s trace-flag dance overlaps session setup / the user reading code
+  // instead of stalling the first org run. Cached + deduped: the later org run reuses
+  // this result. Debug metadata only — never touches business data.
+  warmUpLiveOrg();
+
   // Reset state
   debugState.active = true;
   debugState.paused = true;
@@ -1257,7 +1291,8 @@ async function startDebugSession(filePath, methodName, requestParams) {
   debugState.entryMethod = methodName;
   debugState.entryLine = methodInfo.signatureLine + 1;
   debugState.consoleLog = [];
-  debugState.methodCache.clear();
+  debugState.orgLog = [];
+  debugState.replayDebugHigh = -1;
   debugState.classIndex = null; // refresh on next use
   debugState.classFieldsCache.clear();
   debugState.orgQueryCache.clear();
@@ -1374,21 +1409,45 @@ function stopDebugSession() {
   }
   debugState.engineMode = false;
   debugState.engineRunning = false;
+  debugState.engineAction = null;
+  debugState.currentQueryText = null;
+  debugState.pausedElsewhere = null;
+  debugState.exceptionInfo = null;
   debugState.active = false;
   debugState.paused = false;
   debugState.callStack = [];
   debugState.stepMode = null;
+  debugState.currentFrame = null;
+  debugState._frameSelSig = null;
+  if (typeof _hideHoverTree === 'function') _hideHoverTree();
   debugState.replayMode = false;
   debugState.replayTimeline = [];
   debugState.replayIndex = 0;
   debugState.replayFatalError = null;
+  debugState._steppedBackNoted = false;
+  debugState.engineHistory = [];
+  debugState.engineHistoryIndex = -1;
+  debugState.engineViewingHistory = false;
+  debugState._engineStepBackNoted = false;
   debugState.userOverrides = {};
   if (debugState.orgEvalCache) debugState.orgEvalCache.clear();
   if (debugState.orgQueryCache) debugState.orgQueryCache.clear();
   debugState._soqlHoverLogged = null;
+  debugState.orgFetching = false;
+  debugState.orgRunning = false;
+  debugState._execCurrentFile = null;
+  debugState._execCurrentLine = 0;
+  _updateExecStatus(null);
+  updateQueryBanner();
+  clearExceptionMarkers();
   clearCurrentLineHighlight();
-  hideDebugUI();
-  addConsoleEntry('info', '⏹ Debug session ended');
+  // Keep the debug panel (Console / Org & Log) VISIBLE after the session ends so
+  // the user can still read and copy the output; only the floating step-toolbar is
+  // dismissed. The user closes the panel themselves with its ✕, and starting a new
+  // run refreshes everything.
+  _$('#debug-toolbar')?.classList.add('hidden');
+  setTimeout(() => window.state?.editor?.layout(), 50);
+  addConsoleEntry('info', '⏹ Debug session ended — output kept below. Close this panel with ✕, or start a new run to refresh.');
 }
 
 /* ================================================================
@@ -1401,9 +1460,8 @@ function stopDebugSession() {
    ================================================================ */
 
 /** Convert an engine runtime value into a plain JS value for the UI panels. */
-function engineValToPlain(v, depth = 0) {
+function engineValToPlain(v, depth = 0, seen) {
   if (v === null || v === undefined) return null;
-  if (depth > 6) return '…';
   const t = typeof v;
   if (t === 'string' || t === 'number' || t === 'boolean') return v;
   if (t === 'object' && v.__typeToken) return v.__typeToken;   // System.Type / Schema.SObjectType handle → its API name
@@ -1415,24 +1473,35 @@ function engineValToPlain(v, depth = 0) {
     if (v.__sobjectField) return `SObjectField(${v.__sobjectField.field})`;
     if (v.__describeFieldResult) return `DescribeFieldResult(${v.__describeFieldResult.field})`;
   }
+  // Recursion guards. A WeakSet breaks true cycles (self-referencing ApexObject
+  // graphs); the depth cap bounds pathological breadth. Real org query data is an
+  // acyclic tree only a few relationship levels deep, so with these guards its REAL
+  // values are shown in full — no longer collapsed to a bare "…" that looks like
+  // missing/fabricated data. If a marker ever appears, it names the actual reason.
+  if (t === 'object' || Array.isArray(v)) {
+    if (!seen) seen = new WeakSet();
+    if (seen.has(v)) return '…(circular reference — same object already shown above)';
+    seen.add(v);
+  }
+  if (depth > 20) return '…(nested beyond display depth 20 — the real value was fetched, not missing)';
   const E = window.ApexEngine;
-  if (Array.isArray(v)) return v.map(x => engineValToPlain(x, depth + 1));
+  if (Array.isArray(v)) return v.map(x => engineValToPlain(x, depth + 1, seen));
   if (E && v instanceof E.ApexMap) {
     const o = {};
-    for (const e of v.m.values()) o[typeof e.k === 'string' ? e.k : E.toApexString(e.k)] = engineValToPlain(e.v, depth + 1);
+    for (const e of v.m.values()) o[typeof e.k === 'string' ? e.k : E.toApexString(e.k)] = engineValToPlain(e.v, depth + 1, seen);
     return o;
   }
-  if (E && v instanceof E.ApexSet) return v.items().map(x => engineValToPlain(x, depth + 1));
+  if (E && v instanceof E.ApexSet) return v.items().map(x => engineValToPlain(x, depth + 1, seen));
   if (E && (v instanceof E.ApexDate || v instanceof E.ApexDatetime)) return v.toString();
   if (E && v instanceof E.ApexError) return `${v.apexType}: ${v.apexMessage}`;
   if (E && v instanceof E.ApexObject) {
     const o = {};
-    for (const e of v.fields.values()) o[e.name] = engineValToPlain(e.value, depth + 1);
+    for (const e of v.fields.values()) o[e.name] = engineValToPlain(e.value, depth + 1, seen);
     return o;
   }
   if (t === 'object') {
     const o = {};
-    for (const k of Object.keys(v)) { if (k === 'attributes') continue; o[k] = engineValToPlain(v[k], depth + 1); }
+    for (const k of Object.keys(v)) { if (k === 'attributes') continue; o[k] = engineValToPlain(v[k], depth + 1, seen); }
     return o;
   }
   return String(v);
@@ -1496,9 +1565,112 @@ function engineBuildSoql(raw, binds) {
     const plain = engineValToPlain(val);
     const lit = toSoqlLiteral(plain);
     if (lit == null) continue;
-    q = q.replace(new RegExp(':\\s*' + escapeRegex(expr) + '(?![\\w.])', 'g'), lit);
+    const ex = escapeRegex(expr);
+    // Apex binds a collection to `=` as IN and to `!=`/`<>` as NOT IN.
+    if (Array.isArray(plain)) {
+      q = q.replace(new RegExp('([=!<>]{1,2})\\s*:\\s*' + ex + '(?![\\w.])', 'g'), (mm, op) => {
+        if (op === '=') return 'IN ' + lit;
+        if (op === '!=' || op === '<>') return 'NOT IN ' + lit;
+        return op + ' ' + lit;
+      });
+    }
+    q = q.replace(new RegExp(':\\s*' + ex + '(?![\\w.])', 'g'), lit);
   }
   return q;
+}
+
+/* ---- Engine-mode reverse stepping (view-only recorded history) --------------
+ * "Debug with Request" runs the live interpreter forward, and real side effects can't
+ * be un-run. But every pause already materialises a full, INDEPENDENT plain snapshot
+ * of the visible state (mirrorEngineStack deep-copies via engineValToPlain), so we
+ * retain the most recent N of them and let the user walk BACKWARD through the states
+ * execution genuinely reached, then forward again toward the live edge. This is
+ * honest — every value is a real capture from THIS run, nothing fabricated — and it
+ * mirrors the ⚡ Live-Org replay model so Step Back behaves the same in both modes. */
+function captureEngineHistory(reason) {
+  if (!debugState.engineMode) return;
+  const h = debugState.engineHistory;
+  h.push({
+    file: debugState.currentFile,
+    line: debugState.currentLine,
+    // mirrorEngineStack builds a fresh array of fresh frames each pause, so retaining
+    // this reference is safe: later pauses REASSIGN debugState.callStack, they never
+    // mutate the array captured here.
+    frames: debugState.callStack,
+    exceptionInfo: debugState.exceptionInfo,
+    reason: reason || null,
+  });
+  if (h.length > debugState._engineHistoryCap) h.shift();
+  debugState.engineHistoryIndex = h.length - 1;
+  debugState.engineViewingHistory = false;
+}
+
+/** Redisplay a recorded engine snapshot (view-only). Does NOT touch the engine — it
+ *  only repaints the editor + panels with the real state captured at that step. */
+async function engineHistoryGoto(index) {
+  const h = debugState.engineHistory;
+  if (!h.length) return;
+  index = Math.max(0, Math.min(index, h.length - 1));
+  const snap = h[index];
+  debugState.engineHistoryIndex = index;
+  debugState.engineViewingHistory = index < h.length - 1;
+  debugState.callStack = snap.frames || [];
+  debugState.currentFrame = null;               // show the top (executing) frame of that step
+  debugState.currentFile = snap.file;
+  debugState.currentLine = snap.line;
+  debugState.exceptionInfo = snap.exceptionInfo || null;
+  _hideHoverTree();                              // the code under any open hover just moved
+  if (snap.file) {
+    await navigateToFile(snap.file, snap.line);
+    highlightCurrentLine();
+  }
+  paintExceptionMarkers();
+  setDebugBusyUI();
+  updateDebugPanels();
+}
+
+/** Step Back in engine mode: return to the previous recorded pause of this run. */
+async function engineStepBack() {
+  if (debugState.engineRunning || debugState.orgFetching) return;
+  if (debugState.engineHistoryIndex <= 0) {
+    window.showToast?.(debugState.engineHistory.length > 1
+      ? 'Already at the first captured step of this run.'
+      : 'No earlier step yet — step or hit a breakpoint first, then Step Back walks back through the run.', 'info');
+    return;
+  }
+  if (!debugState._engineStepBackNoted) {
+    debugState._engineStepBackNoted = true;
+    addConsoleEntry('info', '⏪ Stepping back through this run’s captured pauses — the real values recorded at each earlier step. Step forward (F10/F11) to walk toward where you were; at the newest step, stepping resumes live execution. (Backward view only — the engine is not rewound, so no side effects are undone.)');
+  }
+  await engineHistoryGoto(debugState.engineHistoryIndex - 1);
+}
+
+/** Pure decision for a forward step while positioned in recorded history. Returns
+ *  { mode:'resume'|'history', index }: 'history' redisplays `index` (view-only),
+ *  'resume' runs the real engine. Continue (and being at the live edge) always
+ *  resumes. Exported for unit tests. */
+function planEngineForward(action, index, lastIdx, viewing) {
+  if (!viewing) return { mode: 'resume', index: lastIdx };
+  if (action === 'continue') return { mode: 'resume', index: lastIdx };
+  return { mode: 'history', index: Math.min(index + 1, lastIdx) };
+}
+
+/** When the user has stepped back into recorded history, forward commands re-walk that
+ *  history toward the live edge instead of resuming real execution — exactly like the
+ *  replay timeline. Returns true when the command was fully handled here (caller must
+ *  NOT resume the engine). Continue snaps to the live edge and lets execution resume. */
+function engineForwardViaHistory(action) {
+  if (!debugState.engineMode || !debugState.engineViewingHistory) return false;
+  const lastIdx = debugState.engineHistory.length - 1;
+  const plan = planEngineForward(action, debugState.engineHistoryIndex, lastIdx, true);
+  if (plan.mode === 'resume') {
+    // Abandon the backward view and let the engine run on from where it actually is.
+    debugState.engineHistoryIndex = lastIdx;
+    debugState.engineViewingHistory = false;
+    return false;
+  }
+  engineHistoryGoto(plan.index);
+  return true;
 }
 
 /** Called when the engine pauses (step / breakpoint). Sync the whole UI. */
@@ -1511,7 +1683,9 @@ async function onEnginePause(info) {
   debugState.currentLine = info.line;
   // Announce an exception pause so it's obvious WHY we stopped (and why the try
   // block handed control to catch), then let the user inspect state before continuing.
-  if ((info.reason === 'caught-exception' || info.reason === 'exception') && info.error) {
+  const isException = (info.reason === 'caught-exception' || info.reason === 'exception') && info.error;
+  debugState.exceptionInfo = null;
+  if (isException) {
     const e = info.error;
     // The live stack has already unwound to the catching frame by the time the
     // catch handler runs, so it would show only ONE method. The exception's
@@ -1525,26 +1699,62 @@ async function onEnginePause(info) {
       if (e.stack[0].file) info.file = e.stack[0].file;
       if (e.stack[0].line) { info.line = e.stack[0].line; debugState.currentLine = e.stack[0].line; }
     }
+    // Remember the exception so we can mark the EXACT throw line (and the failing
+    // call chain) inline on the code, on whichever file the user opens.
+    debugState.exceptionInfo = {
+      type: e.type || 'Exception',
+      message: e.message || '',
+      reason: info.reason,
+      stack: (e.stack || []).map(f => ({ file: f.file, line: f.line, className: f.className, methodName: f.methodName })),
+    };
+    const site = debugState.exceptionInfo.stack[0];
+    if (site && site.file) {
+      const siteName = site.file.split('/').pop() || site.file;
+      // The single most important line: exactly WHERE and WHY it was thrown.
+      addConsoleEntry('error', `💥 ${e.type || 'Exception'} thrown at ${siteName}:${site.line} (${site.className}.${site.methodName}) — ${e.message || ''}`);
+    }
     addConsoleEntry('error', `⏸ Paused on ${info.reason === 'caught-exception' ? 'caught ' : ''}exception: ${e.type || 'Exception'}: ${e.message || ''}`);
     if (e.stack && e.stack.length) {
-      addConsoleEntry('error', e.stack.map(f => `      at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'));
+      addConsoleEntry('error', e.stack.map((f, i) => `      ${i === 0 ? '➤ throw ' : '  called '}at ${f.className}.${f.methodName} (${(f.file || '').split('/').pop()}:${f.line})`).join('\n'));
     }
-    addConsoleEntry('info', 'Inspect variables/stack now. ▶ Continue resumes into the catch block.');
+    addConsoleEntry('info', 'The exact throw line is marked 💥 in the code. ▶ Continue resumes into the catch block.');
     renderConsolePanel();
   }
-  // Cross-file step-into: open the paused file if it isn't the current one
-  if (info.file && info.file !== debugState.currentFile && /\.(cls|trigger)$/.test(info.file)) {
+  // Navigation on pause: every pause is now user-intentional — a breakpoint the
+  // user set, an explicit Step Into/Over/Out, or a manual pause. (Caught exceptions
+  // no longer pause at all.) So we ALWAYS go to the pause location: if it's in a
+  // different file — even one the user forgot they'd set a breakpoint in — we open
+  // that file and navigate to the exact line. We never auto-open/scroll during a
+  // free RUN (see revealExecutingLocation); only on an actual stop like this.
+  debugState.pausedElsewhere = null;
+  const differentFile = info.file && info.file !== debugState.currentFile && /\.(cls|trigger)$/.test(info.file);
+  if (differentFile) {
     try {
       const content = await window.congacode.readFile(info.file);
       if (content != null) { await window.openFile(info.file, content); }
-      debugState.currentFile = info.file;
-    } catch (_) { /* keep current file */ }
-  } else if (info.file) {
-    debugState.currentFile = info.file;
+    } catch (_) { /* fall through — keep whatever is open */ }
   }
-  highlightCurrentLine();
-  navigateToLine(info.line);
+  if (info.file) debugState.currentFile = info.file;
+  // Reveal the paused line. On a file switch the new model needs a layout pass
+  // before it will scroll, so revealPauseLocation defers + force-centers there;
+  // same-file stepping stays synchronous and jump-free.
+  revealPauseLocation(info.line, differentFile);
+  captureEngineHistory(info.reason);
+  setDebugBusyUI();
   updateDebugPanels();
+}
+
+/** Open the file the engine paused in when we chose not to auto-navigate. */
+async function openPausedElsewhere() {
+  const p = debugState.pausedElsewhere;
+  if (!p) return;
+  await navigateToFile(p.file, p.line);
+  debugState.currentFile = p.file;
+  debugState.currentLine = p.line;
+  debugState.pausedElsewhere = null;
+  _updateExecStatus(null);
+  highlightCurrentLine();
+  paintExceptionMarkers();
 }
 
 /**
@@ -1557,32 +1767,55 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
 
   const host = {
     log: (msg, level) => {
-      const map = { debug: 'log', soql: 'info', dml: 'info', system: 'info' };
-      addConsoleEntry(map[level] || 'log', level === 'debug' ? `USER_DEBUG: ${msg}` : msg);
-      renderConsolePanel();
+      // Route by level: user output ('debug') → Console; everything else
+      // (soql/dml/system/info/warn/…) → the ⚡ Org activity log.
+      const map = { debug: 'debug', soql: 'soql', dml: 'dml', system: 'info' };
+      addConsoleEntry(map[level] || level || 'info', level === 'debug' ? `USER_DEBUG: ${msg}` : msg);
     },
-    query: async (rawSoql, binds) => {
+    debug: (payload) => {
+      // Chrome-style user print from System.debug: display text + an optional
+      // expandable value tree. Always lands in the Console (user output).
+      const p = payload || {};
+      addConsoleEntry('debug', p.text != null ? p.text : String(payload), p.line, p.tree);
+    },
+    query: async (rawSoql, binds, opts) => {
+      // Internal field-existence probes (hydrateSObjectField) pass { probe:true } so a
+      // handled, expected miss doesn't spam the console with a red "SOQL error" or a
+      // scary "record not found → will throw NPE" warning. The fetch still runs and
+      // still throws on error so the engine can classify absence; it just stays quiet.
+      const probe = !!(opts && opts.probe);
       if (!liveOrgAvailable()) {
-        addConsoleEntry('warn', 'SOQL needs a connected org — returning 0 rows. Connect an org for real data.');
+        if (!probe) addConsoleEntry('warn', 'SOQL needs a connected org — returning 0 rows. Connect an org for real data.');
         return [];
       }
       const soql = engineBuildSoql(rawSoql, binds);
       debugState.orgFetching = true;
+      debugState.currentQueryText = soql.replace(/\s+/g, ' ').trim().slice(0, 90);
       updateLiveOrgIndicator();
-      addConsoleEntry('info', `⏳ Fetching from org: ${soql.replace(/\s+/g, ' ').slice(0, 180)}`);
-      renderConsolePanel();
+      if (!probe) {
+        maybeOpenOrgTabForLiveQuery();
+        addConsoleEntry('info', `⏳ Fetching from org: ${soql.replace(/\s+/g, ' ').slice(0, 180)}`);
+        renderConsolePanel();
+      }
       try {
         const res = await execSoql(soql);
         if (res.error) {
-          addConsoleEntry('error', `SOQL error: ${res.error}`);
-          throw Object.assign(new E.ApexError('System.QueryException', res.error, 0), {});
+          if (!probe) addConsoleEntry('error', `SOQL error: ${res.error}`);
+          // Tag as org-origin so the engine attributes it correctly: a semantic
+          // rejection (bad query/data) reads as "real Apex error reported by the org",
+          // while an infra failure (CLI crash/auth/timeout) reads as an org/CLI issue —
+          // never as an engine bug.
+          throw Object.assign(new E.ApexError('System.QueryException', res.error, 0), { __origin: 'org' });
         }
-        if (res.records.length === 0) {
+        if (!probe && res.records.length === 0) {
           // Truthful diagnostics: report an empty result like a 404 so the user
           // knows the record isn't in the org (rather than silently returning []
           // and surfacing a confusing downstream NPE). We do NOT fabricate data.
           const info = describeEmptyQuery(soql);
           addConsoleEntry('warn', `🔎 0 rows from org — ${info.subject} not found in org${info.org ? ' ' + info.org : ''}.`);
+          if (res.droppedColumns && res.droppedColumns.length) {
+            addConsoleEntry('warn', `↳ Note: column(s) ${res.droppedColumns.join(', ')} don't exist on this object in the connected org (installed package version differs from the source); the query was rewritten without them.`);
+          }
           if (info.byId) {
             const sysNote = res.mode === 'system'
               ? ' This ran in system mode (FLS/CRUD/sharing bypassed), so a missing permission is NOT the cause — the record genuinely is not in the org.'
@@ -1590,17 +1823,18 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
             addConsoleEntry('warn', `↳ This record does not exist in the connected org (it may be a transient record that was already cleaned up).${sysNote} Any code that dereferences this empty result will get null — and will throw a NullPointerException, exactly as it would in real Apex. No data is being generated to hide this.`);
           }
           renderConsolePanel();
-        } else {
+        } else if (!probe) {
           addConsoleEntry('info', `✓ ${res.records.length} row(s) from org${res.mode === 'system' ? ' (system mode — full permissions)' : res.mode === 'user' ? ' (user mode)' : ''}`);
           if (res.droppedColumns && res.droppedColumns.length) {
-            addConsoleEntry('warn', `⚠ Column(s) ${res.droppedColumns.join(', ')} not visible outside the managed package — fetched without them.`);
+            addConsoleEntry('warn', `⚠ Column(s) ${res.droppedColumns.join(', ')} don't exist on this object in the connected org (the installed managed-package version differs from the source) — fetched without them, so those fields read as null. No data is fabricated.`);
           }
         }
         return res.records;
       } finally {
         debugState.orgFetching = false;
+        debugState.currentQueryText = null;
         updateLiveOrgIndicator();
-        renderConsolePanel();
+        if (!probe) renderConsolePanel();
       }
     },
     dml: async (op, value) => {
@@ -1617,7 +1851,9 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
         if (!debugState.engineOrgEvalCache) debugState.engineOrgEvalCache = new Map();
         if (debugState.engineOrgEvalCache.has(apexExpr)) return debugState.engineOrgEvalCache.get(apexExpr);
         debugState.orgFetching = true;
+        debugState.currentQueryText = apexExpr.replace(/\s+/g, ' ').trim().slice(0, 90);
         updateLiveOrgIndicator();
+        maybeOpenOrgTabForLiveQuery();
         addConsoleEntry('info', `⚙ Resolving in org: ${apexExpr}`);
         renderConsolePanel();
         let r = await _runEvalApex(apexExpr);
@@ -1644,6 +1880,7 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
         return { ok: false, error: e?.message || String(e) };
       } finally {
         debugState.orgFetching = false;
+        debugState.currentQueryText = null;
         updateLiveOrgIndicator();
         renderConsolePanel();
       }
@@ -1657,7 +1894,10 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
       if (!debugState.engineDescribeCache) debugState.engineDescribeCache = new Map();
       const key = String(name).toLowerCase();
       if (debugState.engineDescribeCache.has(key)) return debugState.engineDescribeCache.get(key);
-      debugState.orgFetching = true; updateLiveOrgIndicator();
+      debugState.orgFetching = true;
+      debugState.currentQueryText = `Describe ${name}`;
+      updateLiveOrgIndicator();
+      maybeOpenOrgTabForLiveQuery();
       addConsoleEntry('info', `⚙ Describing ${name} in org…`); renderConsolePanel();
       let r = await _runDescribeViaApex(name);
       // Retry with the package namespace prefix when the bare name isn't found
@@ -1672,7 +1912,7 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
       const out = (r && r.names) ? r : { names: [], error: (r && r.error) || 'describe failed' };
       if (out.names && out.names.length) addConsoleEntry('info', `↳ ${name}: ${out.names.length} fields resolved from org`);
       else addConsoleEntry('warn', `Describe ${name} returned no fields${out.error ? ' — ' + out.error : ''}`);
-      debugState.orgFetching = false; updateLiveOrgIndicator(); renderConsolePanel();
+      debugState.orgFetching = false; debugState.currentQueryText = null; updateLiveOrgIndicator(); renderConsolePanel();
       debugState.engineDescribeCache.set(key, out);
       return out;
     },
@@ -1685,11 +1925,7 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
         return src ? { source: src, path: file } : null;
       } catch (_) { return null; }
     },
-    getBreakpoint: (file, line) => {
-      const bps = debugState.breakpoints.get(file);
-      if (!bps || !bps.has(line)) return null;
-      return bps.get(line) || {};
-    },
+    getBreakpoint: (file, line) => activeBreakpoint(file, line),
     onPause: (info) => { onEnginePause(info); },
     // Fired as each line begins executing during a running session. We FOLLOW
     // execution across files (open the executing class + reveal/highlight the
@@ -1704,23 +1940,57 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
       if (!debugState.active) return;
       debugState.paused = false;
       debugState.engineRunning = false;
+      debugState.pausedElsewhere = null;
       clearCurrentLineHighlight();
+      _updateExecStatus(null);
       if (result !== undefined && result !== null) {
         const plain = engineValToPlain(result);
         addConsoleEntry('result', `⏹ Method returned: ${typeof plain === 'object' ? JSON.stringify(plain, null, 2) : formatValue(plain)}`);
       }
-      addConsoleEntry('info', '✅ Execution finished. Restart (⟳) to run again.');
-      updateDebugPanels();
+      addConsoleEntry('info', '✅ Execution finished.');
+      // Issue 1: the run is complete, so leave the DEBUGGING state entirely —
+      // stop the spinner, disable stepping, drop the "querying" banner. The
+      // console output above (including the returned value) stays visible.
+      // Re-run via "Debug with Request".
+      stopDebugSession();
     },
-    onError: (err) => {
+    onError: async (err) => {
       if (!debugState.active) return;
       debugState.paused = false;
       debugState.engineRunning = false;
+      debugState.pausedElsewhere = null;
+      _updateExecStatus(null);
       const msg = err && err.apexType ? `${err.apexType}: ${err.apexMessage}` : (err && err.message) || String(err);
       addConsoleEntry('error', `✖ Uncaught exception: ${msg}`);
       if (err && err.apexStack && err.apexStack.length) {
-        addConsoleEntry('error', err.apexStack.map(f => `    at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'));
+        // Record the throw site so we can mark the EXACT failing line inline.
+        debugState.exceptionInfo = {
+          type: err.apexType || 'Exception',
+          message: err.apexMessage || err.message || '',
+          reason: 'exception',
+          stack: err.apexStack.map(f => ({ file: f.file, line: f.line, className: f.className, methodName: f.methodName })),
+        };
+        const site = debugState.exceptionInfo.stack[0];
+        if (site && site.file) {
+          const siteName = site.file.split('/').pop() || site.file;
+          addConsoleEntry('error', `💥 ${debugState.exceptionInfo.type} thrown at ${siteName}:${site.line} (${site.className}.${site.methodName}) — ${debugState.exceptionInfo.message}`);
+        }
+        addConsoleEntry('error', err.apexStack.map((f, i) => `      ${i === 0 ? '➤ throw ' : '  called '}at ${f.className}.${f.methodName} (${(f.file || '').split('/').pop()}:${f.line})`).join('\n'));
+        // A fatal error is exactly where the user needs to look — open that file and
+        // navigate to the throw line automatically, then mark it 💥.
+        renderConsolePanel();
+        if (site && site.file) {
+          if (site.file !== debugState.currentFile) {
+            debugState.currentFile = site.file;
+            await navigateToFile(site.file, site.line);
+          } else {
+            debugState.currentLine = site.line;
+            navigateToLine(site.line);
+          }
+          paintExceptionMarkers();
+        }
       }
+      setDebugBusyUI();
       updateDebugPanels();
     },
   };
@@ -1764,9 +2034,16 @@ async function startEngineSession(filePath, methodName, requestParams, source) {
 function engineStep(action) {
   const eng = debugState.engineSession;
   if (!eng) return;
+  if (debugState.engineRunning || debugState.orgFetching) return; // ignore while already busy
+  debugState.engineAction = action;
+  debugState.pausedElsewhere = null;
+  debugState.exceptionInfo = null;
+  clearExceptionMarkers();
   debugState.paused = false;
   debugState.engineRunning = true;
   clearCurrentLineHighlight();
+  _updateExecStatus(null);
+  setDebugBusyUI();
   eng.resume(action);
 }
 
@@ -1780,7 +2057,7 @@ async function evaluateEngineConsole(expr) {
   try {
     const val = await eng.evalExpressionSandboxed(expr, eng.topFrame(), false);
     const plain = engineValToPlain(val);
-    if (plain !== null && typeof plain === 'object') addConsoleEntry('result-json', JSON.stringify(plain, null, 2));
+    if (plain !== null && typeof plain === 'object') addConsoleEntry('result-json', JSON.stringify(plain, null, 2), null, plain);
     else addConsoleEntry('result', formatValue(plain));
     // Assignments may have mutated scope — refresh panels
     mirrorEngineStack(eng.getCallStack());
@@ -1850,6 +2127,27 @@ function cleanSfNoise(text) {
 }
 
 /**
+ * Build a clean, actionable error string when `sf apex run` returns no parseable
+ * JSON. Old Salesforce CLI versions crash with a JS "Maximum call stack size
+ * exceeded" while serializing a very large --json payload (e.g. a big FINEST debug
+ * log). That's a CLI bug, not an org/data problem — the method still ran in the org
+ * (savepoint + rollback, nothing modified), so we say so and recommend updating the CLI
+ * instead of dumping the raw stack trace + update-nag banner.
+ */
+function describeOrgRunFailure(stderr, stdout) {
+  const combined = `${stderr || ''}\n${stdout || ''}`;
+  if (/Maximum call stack size exceeded|RangeError/i.test(combined)) {
+    const upd = combined.match(/update available from ([\d.]+) to ([\d.]+)/i);
+    const updHint = upd
+      ? ` Your Salesforce CLI is ${upd[1]}; update it to ${upd[2]} (run \`npm i -g @salesforce/cli\`), then Restart (⟳).`
+      : ' Update the Salesforce CLI (\`npm i -g @salesforce/cli\`), then Restart (⟳).';
+    return `The Salesforce CLI crashed while returning the org response ("Maximum call stack size exceeded"). This is a known CLI bug with very large debug logs — the method DID run in the org and nothing was modified.${updHint}`;
+  }
+  const cleaned = cleanSfNoise(stderr) || cleanSfNoise(stdout);
+  return (cleaned || 'No response from the Salesforce CLI.').split('\n').slice(0, 5).join('\n');
+}
+
+/**
  * Normalize a compile-error string from the CLI: flatten newlines to spaces,
  * collapse whitespace, and cap at 300 chars so the real error text is visible.
  */
@@ -1893,10 +2191,20 @@ function toSoqlLiteral(val) {
   if (val === null || val === undefined) return 'null';
   if (typeof val === 'number') return String(val);
   if (typeof val === 'boolean') return String(val);
-  if (Array.isArray(val)) return '(' + val.map(toSoqlLiteral).join(', ') + ')';
+  // Engine collection (ApexSet/ApexMap) that slipped through un-normalized.
+  if (val && typeof val.items === 'function') val = val.items();
+  else if (val && typeof val.vals === 'function') val = val.vals();
+  if (Array.isArray(val)) {
+    // Empty IN-bind matches nothing in Apex; `IN ()` is invalid SOQL, so emit
+    // `(null)` which is valid and returns 0 rows for id/reference filters.
+    if (val.length === 0) return '(null)';
+    return '(' + val.map(toSoqlLiteral).join(', ') + ')';
+  }
   if (val instanceof Date) return val.toISOString();
   if (typeof val === 'object') {
     // sObject-like: bind on Id if present, else stringify
+    if (typeof val.iso === 'function') return val.iso();
+    if (val.__sobjectType) return `'${String(val.__sobjectType).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
     if (val.Id) return `'${String(val.Id).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
     return `'${String(val).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
   }
@@ -1910,23 +2218,44 @@ function buildLiveQuery(rawQuery, scope) {
   const m = q.match(/^\[([\s\S]*)\]\s*;?$/);
   q = (m ? m[1] : q.replace(/^\[/, '').replace(/\]\s*;?$/, '')).trim();
   // Replace SOQL bind expressions like :varName or : obj.field with real values.
-  q = q.replace(/:\s*([A-Za-z_]\w*(?:\.\w+)*)/g, (whole, expr) => {
+  // An optional leading comparison operator is captured so a collection bound with
+  // `=`/`!=` is rewritten to `IN`/`NOT IN` (matching Apex bind semantics).
+  q = q.replace(/(=|!=|<>)?(\s*):\s*([A-Za-z_]\w*(?:\.\w+)*)/g, (whole, op, ws, expr) => {
     const val = resolveProperty(scope, expr);
     if (val === undefined) return whole; // leave unresolved — surface the error
-    return toSoqlLiteral(val);
+    const lit = toSoqlLiteral(val);
+    const isColl = Array.isArray(val) || (val && (typeof val.items === 'function' || typeof val.vals === 'function'));
+    if (isColl && op === '=') return 'IN ' + lit;
+    if (isColl && (op === '!=' || op === '<>')) return 'NOT IN ' + lit;
+    return (op || '') + ws + lit;
   });
   return q;
 }
 
-/** Recursively strip Salesforce "attributes" noise from returned records. */
+/** Recursively strip Salesforce "attributes" noise from returned records, but
+ *  preserve the SObject type token (`attributes.type`) so the engine can resolve
+ *  overloads, getSObjectType(), and instanceof-style checks. Field iteration in
+ *  the engine already skips `attributes`, so keeping the type adds no noise. */
 function cleanSObject(rec) {
   if (Array.isArray(rec)) return rec.map(cleanSObject);
   if (rec && typeof rec === 'object') {
     const out = {};
+    if (rec.attributes && rec.attributes.type) out.attributes = { type: rec.attributes.type };
     for (const k of Object.keys(rec)) {
       if (k === 'attributes') continue;
       const v = rec[k];
-      out[k] = (v && typeof v === 'object') ? cleanSObject(v) : v;
+      // Child-relationship subquery result. Salesforce returns a parent-to-child
+      // subquery (e.g. `(SELECT ... FROM Attributes__r)`) as a wrapper object
+      // { totalSize, done, records:[...] }. In Apex that field IS a List, so unwrap
+      // it to the (cleaned) array — otherwise `for (X x : parent.Child__r)` throws a
+      // bogus "System.TypeException: Cannot iterate over SObject". A null child
+      // relationship (no rows) becomes an empty list, matching Apex.
+      if (v && typeof v === 'object' && !Array.isArray(v)
+          && Array.isArray(v.records) && ('done' in v || 'totalSize' in v)) {
+        out[k] = v.records.map(cleanSObject);
+      } else {
+        out[k] = (v && typeof v === 'object') ? cleanSObject(v) : v;
+      }
     }
     return out;
   }
@@ -2002,7 +2331,21 @@ async function execSoql(soql) {
       } else if (compileErr && !r2.error) {
         result = { ...r2, soql: nsSoql };           // bare name didn't compile; namespaced did (0 rows, truthful)
       } else if (compileErr && r2.error) {
-        result = { ...result, error: `${result.error} (also tried ${ns} namespace: ${r2.error})` };
+        // The namespaced ENTITY can resolve while some COLUMNS don't exist in the
+        // package version installed in this org (e.g. Apttus_Config2__TempObject__c
+        // has no Data__c/ConfigurationId__c here). In that case adopt the namespaced
+        // query so the drop-missing-column retry below can strip the absent fields and
+        // still return the real row — degrading those fields to null instead of hard
+        // failing the whole query. Only keep the combined error when even the
+        // namespaced entity is unknown (a genuine object/type mismatch).
+        const nsEntityResolved = /No such column\s+'[\w.]+'\s+on entity\s+'[\w.]+'/i.test(r2.error)
+          || /INVALID_FIELD/i.test(r2.error)
+          || /Didn.?t understand relationship/i.test(r2.error);
+        if (nsEntityResolved) {
+          result = { ...r2, soql: nsSoql };
+        } else {
+          result = { ...result, error: `${result.error} (also tried ${ns} namespace: ${r2.error})` };
+        }
       }
       // (emptyResult && r2 also empty) → keep the original 0-row result: truly not found.
     }
@@ -2033,19 +2376,211 @@ async function execSoql(soql) {
   return result;
 }
 
+/* ======================================================================
+ * SYSTEM-MODE helper class
+ * ----------------------------------------------------------------------
+ * Anonymous Apex runs in the connected user's context and CANNOT self-escalate
+ * to system mode — Salesforce blocks both `AccessLevel.SYSTEM_MODE` and the
+ * `WITH SYSTEM_MODE` clause there (verified: "Cannot use SYSTEM_MODE access
+ * level in anonymous execution of Apex."). The only truthful way to read
+ * managed-package data the user lacks FLS/CRUD for is to run the query inside a
+ * DEPLOYED `without sharing` class, which we then call from anonymous Apex. That
+ * class executes in system mode, so blocked objects/fields are returned intact.
+ *
+ * We never deploy without consent: the first time an org needs system mode and
+ * the helper isn't present, we show a pop-up explaining exactly what will be
+ * deployed. Deploy only happens on the user's OK; otherwise we fall back to
+ * user-mode queries. Status is cached per org for the session.
+ * ==================================================================== */
+const SYS_HELPER_CLASS = 'CongaCodeSystemQuery';
+const SYS_HELPER_API_VERSION = '58.0';
+
+/** The read-only system-mode helper class source. */
+function sysHelperApexBody() {
+  return [
+    'public without sharing class ' + SYS_HELPER_CLASS + ' {',
+    '    // Deployed by the CongaCode Apex debugger. Runs READ-ONLY SOQL that you',
+    '    // trigger in system mode (AccessLevel.SYSTEM_MODE), so managed-package',
+    "    // data your user lacks permission for (e.g. Apttus_Config2__TempObject__c)",
+    '    // can be inspected truthfully. It never performs any DML.',
+    '    public static String ccQuery(String soql) {',
+    '        List<SObject> rows = Database.query(soql, AccessLevel.SYSTEM_MODE);',
+    '        return JSON.serialize(rows);',
+    '    }',
+    '}',
+    '',
+  ].join('\n');
+}
+
+/** Minimal HTML escaping for text interpolated into the consent modal. */
+function dbgEscapeHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/** Helper-class presence on the org: true (present), false (absent), null (couldn't check). */
+async function systemHelperExists(org) {
+  if (!org || !org.org) return null;
+  const folder = window.state?.folderPath;
+  const cmd = `sf data query --use-tooling-api --query "SELECT Id FROM ApexClass WHERE Name='${SYS_HELPER_CLASS}' LIMIT 1" --json --target-org ${org.org}`;
+  try {
+    const { stdout } = await window.congacode.sfExec(cmd, folder, 60000);
+    const parsed = parseSfJson(stdout);
+    if (parsed && parsed.status === 0 && parsed.result) {
+      return (parsed.result.records || []).length > 0;
+    }
+  } catch (_) { /* fall through → unknown */ }
+  return null; // query itself failed (auth/CLI) — org not verifiable right now
+}
+
+/** Deploy the helper class via a throwaway SFDX project. Returns { ok, error }. */
+async function deploySystemHelper(org) {
+  if (!org || !org.org) return { ok: false, error: 'no org' };
+  try {
+    const paths = await window.congacode.getPaths?.();
+    const base = (paths?.congacodeDir || paths?.home || '.') + '/.cc_sys_helper';
+    const projFile = `${base}/sfdx-project.json`;
+    const clsFile = `${base}/force-app/main/default/classes/${SYS_HELPER_CLASS}.cls`;
+    const metaFile = `${clsFile}-meta.xml`;
+    await window.congacode.writeFile(projFile, JSON.stringify({
+      packageDirectories: [{ path: 'force-app', default: true }],
+      namespace: '', sourceApiVersion: SYS_HELPER_API_VERSION,
+    }, null, 2));
+    await window.congacode.writeFile(clsFile, sysHelperApexBody());
+    await window.congacode.writeFile(metaFile,
+      `<?xml version="1.0" encoding="UTF-8"?>\n<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata">\n    <apiVersion>${SYS_HELPER_API_VERSION}</apiVersion>\n    <status>Active</status>\n</ApexClass>\n`);
+    const cmd = `sf project deploy start --source-dir force-app --target-org ${org.org} --json`;
+    const { stdout, stderr } = await window.congacode.sfExec(cmd, base, 120000);
+    const parsed = parseSfJson(stdout);
+    if (parsed && parsed.status === 0 && parsed.result && parsed.result.success) return { ok: true };
+    return { ok: false, error: sfErrorText(parsed, stderr, stdout, 'Deploy failed') };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+/**
+ * Consent pop-up shown before deploying the helper class. Explains what will be
+ * deployed and why. Resolves true (deploy) or false (use user mode).
+ */
+function showSystemHelperConsent(org) {
+  return new Promise((resolve) => {
+    const prev = document.getElementById('cc-syshelper-overlay');
+    if (prev) prev.remove();
+    const orgLabel = org?.info?.alias || org?.org || 'the connected org';
+    const overlay = document.createElement('div');
+    overlay.id = 'cc-syshelper-overlay';
+    overlay.className = 'modal-overlay';
+    overlay.style.cssText = 'z-index:2000;';
+    overlay.innerHTML = `
+      <div class="curl-import-modal" style="width:540px;max-width:92vw;">
+        <div class="curl-import-header" style="padding:10px 16px;">
+          <span class="curl-import-title">⚡ Enable system mode on ${dbgEscapeHtml(orgLabel)}</span>
+        </div>
+        <div class="curl-import-body" style="padding:14px 16px;line-height:1.55;font-size:13px;">
+          <p style="margin:0 0 10px;">Some managed-package data (for example <code>Apttus_Config2__TempObject__c</code> and its <code>Data__c</code> field) isn't readable by your connected user, so queries fail with <em>"sObject type not supported"</em> or <em>"No such column"</em> and the debugger can't see the real values.</p>
+          <p style="margin:0 0 8px;">To read that data <strong>truthfully</strong> — without changing any permissions — CongaCode needs to deploy one small Apex helper class to this org:</p>
+          <ul style="margin:0 0 10px 18px;padding:0;">
+            <li><code>${dbgEscapeHtml(SYS_HELPER_CLASS)}</code> — a <code>without sharing</code> class that runs the <strong>read-only SELECT</strong> queries you trigger in <strong>system mode</strong> (bypasses object/field permissions).</li>
+            <li>It <strong>never</strong> inserts, updates, or deletes anything. It's reusable across runs, and you can delete it from the org anytime.</li>
+          </ul>
+          <p style="margin:0;color:var(--text-secondary,#8a8a8a);font-size:12px;">Deploys to: ${dbgEscapeHtml(org?.org || '')}</p>
+        </div>
+        <div class="curl-import-footer" style="padding:10px 16px;">
+          <button id="cc-syshelper-decline" class="curl-import-btn curl-import-cancel">Not now (use user mode)</button>
+          <button id="cc-syshelper-deploy" class="curl-import-btn curl-import-apply">Deploy helper class</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const finish = (val) => {
+      overlay.remove();
+      document.removeEventListener('keydown', onKey);
+      resolve(val);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); finish(false); } };
+    overlay.querySelector('#cc-syshelper-deploy').addEventListener('click', () => finish(true));
+    overlay.querySelector('#cc-syshelper-decline').addEventListener('click', () => finish(false));
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) finish(false); });
+    document.addEventListener('keydown', onKey);
+    setTimeout(() => overlay.querySelector('#cc-syshelper-deploy')?.focus(), 60);
+  });
+}
+
+/**
+ * Ensure the system-mode helper is usable on the org. Returns 'ready',
+ * 'declined', or 'unavailable'. Prompts for consent + deploys only when needed.
+ * Caches per org (and dedupes concurrent callers via an in-flight promise).
+ */
+async function ensureSystemHelper(org) {
+  if (!org || !org.org) return 'unavailable';
+  const key = org.org;
+  const cached = debugState.sysHelper.get(key);
+  if (typeof cached === 'string') return cached;
+  if (cached && typeof cached.then === 'function') return cached;
+
+  const p = (async () => {
+    const exists = await systemHelperExists(org);
+    if (exists === true) return 'ready';
+    if (exists === null) return 'unavailable'; // org not verifiable now → use user mode, don't prompt
+    const ok = await showSystemHelperConsent(org);
+    if (!ok) return 'declined';
+    addConsoleEntry('info', `⏳ Deploying system-mode helper class ${SYS_HELPER_CLASS} to ${org.info?.alias || org.org}…`);
+    renderConsolePanel();
+    const res = await deploySystemHelper(org);
+    if (res.ok) {
+      addConsoleEntry('info', `✓ ${SYS_HELPER_CLASS} deployed — SOQL now runs in system mode (full read permissions, no data fabricated).`);
+      renderConsolePanel();
+      return 'ready';
+    }
+    addConsoleEntry('error', `Helper class deploy failed: ${res.error}. Falling back to user-mode queries (permission-limited).`);
+    renderConsolePanel();
+    return 'unavailable';
+  })();
+
+  debugState.sysHelper.set(key, p);
+  const status = await p;
+  debugState.sysHelper.set(key, status);
+  return status;
+}
+
+/**
+ * Proactive check when the user connects/switches to an org. If the helper is
+ * already present we stay silent; otherwise we prompt (unless a check is already
+ * in flight). 'declined'/'unavailable' are re-evaluated so a fresh connect can
+ * re-offer the deploy, per the user's request.
+ */
+async function onOrgConnectedCheckHelper(org) {
+  if (!org || !org.org || !org.connected) return;
+  const v = debugState.sysHelper.get(org.org);
+  if (v === 'ready' || (v && typeof v.then === 'function')) return;
+  debugState.sysHelper.delete(org.org);
+  try { await ensureSystemHelper(org); } catch (_) { /* non-fatal */ }
+}
+
 /**
  * Single SOQL invocation (no caching, no namespace retry).
  *
- * Prefers a SYSTEM-MODE fetch via anonymous Apex (`Database.query` runs without
- * FLS/CRUD and `without sharing` by default) so the debugger sees the same data
- * the managed-package classes see in production, even when the connected user
- * lacks explicit object/field read permission. Falls back to the USER-MODE REST
- * Query API only when the Apex path can't run (auth/CLI failure or no FINEST log).
- * Returns { records, error, soql }.
+ * Order of preference:
+ *   1. SYSTEM MODE via the deployed helper class (`Database.query(soql,
+ *      AccessLevel.SYSTEM_MODE)`) — bypasses the connected user's FLS/CRUD, so
+ *      managed-package data is returned intact. Requires the helper to be
+ *      deployed (consent-gated).
+ *   2. USER MODE via anonymous Apex (`Database.query(soql)`) — when the helper
+ *      isn't available (declined / deploy failed / older org).
+ *   3. USER MODE via the REST Query API — when the Apex path can't run at all.
+ * Returns { records, error, soql, mode }.
  */
 async function _runSoqlOnce(soql) {
   if (liveOrgAvailable()) {
-    const viaApex = await _runSoqlViaApex(soql);
+    const org = getActiveOrg();
+    let status = 'unavailable';
+    try { status = await ensureSystemHelper(org); } catch (_) { /* fall through */ }
+    if (status === 'ready') {
+      const viaSystem = await _runSoqlViaApexSystem(soql);
+      if (viaSystem && !viaSystem._apexUnavailable) return viaSystem;
+    }
+    const viaApex = await _runSoqlViaApexUser(soql);
     if (viaApex && !viaApex._apexUnavailable) return viaApex;
   }
   return _runSoqlViaRest(soql);
@@ -2073,22 +2608,95 @@ async function _runSoqlViaRest(soql) {
 }
 
 /**
- * SYSTEM-MODE fetch: run the query inside anonymous Apex via `sf apex run` and
- * pull the serialized rows back out of the FINEST debug log. `Database.query`
- * in an anonymous block runs in system context (no FLS/CRUD, without sharing),
- * so records blocked from the connected user by permissions are still returned.
+ * SYSTEM-MODE fetch: run the query through the deployed helper class
+ * (`CongaCodeSystemQuery.ccQuery`, which uses `Database.query(soql,
+ * AccessLevel.SYSTEM_MODE)`), invoked from a thin anonymous Apex wrapper. Because
+ * the query executes inside a compiled `without sharing` class, it bypasses the
+ * connected user's object/field permissions — so managed-package data the user
+ * can't otherwise read (e.g. Apttus_Config2__TempObject__c.Data__c) is returned
+ * intact. Rows come back via chunked FINEST-log markers (results can be large).
  *
- * Returns { records, error, soql } like the REST path. A genuine query error
- * (e.g. "sObject type 'X' is not supported") is surfaced as `error` so the
- * caller's namespace-retry still fires. Returns { _apexUnavailable: true } only
- * when the Apex mechanism itself can't run (auth/CLI failure, no debug log),
- * signalling the caller to fall back to the REST Query API. No data is fabricated.
+ * Returns { records, error, soql, mode:'system' }. A genuine query error is
+ * surfaced as `error` so the caller's namespace-retry still fires. Returns
+ * { _apexUnavailable: true } when the mechanism can't run (auth/CLI failure, no
+ * debug log, or the helper class isn't callable) so the caller falls back to the
+ * user-mode path. No data is fabricated.
  */
-async function _runSoqlViaApex(soql) {
+async function _runSoqlViaApexSystem(soql) {
+  const org = getActiveOrg();
+  if (!org) return { _apexUnavailable: true };
+  // Escape for an Apex single-quoted literal. escapeApexString also converts raw
+  // newlines to \n — critical because the source SOQL is often multi-line
+  // (e.g. ConfigRequest.getRequestSO), and raw newlines make the wrapper fail to
+  // compile, which would silently drop us to user mode and defeat system mode.
+  const escaped = escapeApexString(soql);
+  const apex = [
+    `String ccOut = '[]';`,
+    `String ccErr = '';`,
+    `try {`,
+    `    ccOut = ${SYS_HELPER_CLASS}.ccQuery('${escaped}');`,
+    `} catch (Exception ccE) {`,
+    `    ccErr = ccE.getTypeName() + ': ' + ccE.getMessage();`,
+    `}`,
+    `if (String.isBlank(ccOut)) ccOut = '[]';`,
+    `Integer ccChunk = 3000;`,
+    `for (Integer i = 0; i < ccOut.length(); i += ccChunk) { System.debug(LoggingLevel.ERROR, '__CC_SOQL__' + ccOut.substring(i, Math.min(i + ccChunk, ccOut.length()))); }`,
+    `System.debug(LoggingLevel.ERROR, '__CC_SOQLEND__');`,
+    `System.debug(LoggingLevel.ERROR, '__CC_SOQLERR__' + ccErr);`,
+  ].join('\n');
+  try {
+    const paths = await window.congacode.getPaths?.();
+    const dir = paths?.congacodeDir || paths?.home || '.';
+    const tmpFile = `${dir}/.cc_debug_soql_sys.apex`;
+    await window.congacode.writeFile(tmpFile, apex);
+    const cmd = `sf apex run --file "${tmpFile}" --json --target-org ${org.org}`;
+    const { stdout, stderr } = await window.congacode.sfExec(cmd, window.state?.folderPath, 60000);
+    const cli = parseSfJson(stdout);
+    if (!cli) return { _apexUnavailable: true };
+    const res = (cli.result || cli.data) || {};
+    const log = res.logs || '';
+    if (cli.status && cli.status !== 0 && !log) return { _apexUnavailable: true }; // auth/IP/CLI failure
+    if (res.compiled === false) return { _apexUnavailable: true };                  // helper missing / wrapper didn't compile
+    const chunks = [];
+    let qErr = '', sawMarker = false;
+    for (const line of log.split('\n')) {
+      const pipe = line.split('|');
+      const msg = pipe.length >= 5 ? pipe.slice(4).join('|') : '';
+      if (msg.startsWith('__CC_SOQL__')) { chunks.push(msg.slice('__CC_SOQL__'.length)); sawMarker = true; }
+      else if (msg.startsWith('__CC_SOQLEND__')) { sawMarker = true; }
+      else if (msg.startsWith('__CC_SOQLERR__')) { qErr = msg.slice('__CC_SOQLERR__'.length); sawMarker = true; }
+    }
+    if (!sawMarker) return { _apexUnavailable: true }; // no markers (FINEST off) → fall back
+    if (qErr) return { records: [], error: qErr, soql };
+    let recs = [];
+    try { recs = JSON.parse(chunks.join('')) || []; } catch { recs = []; }
+    if (!Array.isArray(recs)) recs = recs ? [recs] : [];
+    return { records: recs.map(cleanSObject), error: null, soql, mode: 'system' };
+  } catch (e) {
+    return { _apexUnavailable: true };
+  }
+}
+
+/**
+ * USER-MODE fetch: run the query inside anonymous Apex via `sf apex run` and pull
+ * the serialized rows out of the FINEST debug log. Anonymous Apex executes as the
+ * connected user and enforces their object/field permissions, so this is the
+ * fallback used when the system-mode helper isn't available (declined / deploy
+ * failed / older org). Rows blocked by permissions will error here, exactly as
+ * they would for that user in the org.
+ *
+ * Returns { records, error, soql, mode:'user' }. A genuine query error is
+ * surfaced as `error` so the caller's namespace-retry still fires. Returns
+ * { _apexUnavailable: true } only when the Apex mechanism itself can't run
+ * (auth/CLI failure, no debug log), signalling a fall back to the REST Query API.
+ */
+async function _runSoqlViaApexUser(soql) {
   const org = getActiveOrg();
   if (!org) return { _apexUnavailable: true };
   // Escape for embedding inside an Apex single-quoted string literal.
-  const escaped = soql.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  // escapeApexString also converts raw newlines to \n so multi-line SOQL still
+  // compiles inside the anonymous wrapper.
+  const escaped = escapeApexString(soql);
   const apex = [
     `List<SObject> ccRows = new List<SObject>();`,
     `String ccErr = '';`,
@@ -2127,7 +2735,7 @@ async function _runSoqlViaApex(soql) {
     let recs = [];
     try { recs = JSON.parse(raw) || []; } catch { recs = []; }
     if (!Array.isArray(recs)) recs = recs ? [recs] : [];
-    return { records: recs.map(cleanSObject), error: null, soql, mode: 'system' };
+    return { records: recs.map(cleanSObject), error: null, soql, mode: 'user' };
   } catch (e) {
     return { _apexUnavailable: true };
   }
@@ -2136,26 +2744,47 @@ async function _runSoqlViaApex(soql) {
 /**
  * Describe an SObject in the connected org via anonymous Apex, returning REAL
  * field API names (+ label / key prefix). Uses the same FINEST-log marker
- * mechanism as _runSoqlViaApex so it runs in system mode. No fabrication: if the
- * type can't be described, returns an error and an empty field list.
+ * mechanism as the SOQL fetch. No fabrication: if the type can't be described,
+ * returns an error and an empty field list.
  */
 async function _runDescribeViaApex(sobjectName) {
   const org = getActiveOrg();
   if (!org) return { error: 'no org' };
   const esc = String(sobjectName).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   const apex = [
-    `List<String> ccNames = new List<String>();`,
+    `List<Map<String,Object>> ccFields = new List<Map<String,Object>>();`,
     `String ccErr = '', ccLabel = '', ccPrefix = '', ccPlural = '';`,
+    `Map<String,Object> ccObj = new Map<String,Object>();`,
     `try {`,
     `    Schema.DescribeSObjectResult ccD = Schema.describeSObjects(new String[]{'${esc}'})[0];`,
-    `    for (Schema.SObjectField ccF : ccD.fields.getMap().values()) { ccNames.add(ccF.getDescribe().getName()); }`,
+    `    for (Schema.SObjectField ccF : ccD.fields.getMap().values()) {`,
+    `        Schema.DescribeFieldResult d = ccF.getDescribe();`,
+    `        List<String> ccRef = new List<String>();`,
+    `        if (d.getType() == Schema.DisplayType.REFERENCE) { for (Schema.SObjectType rt : d.getReferenceTo()) ccRef.add(String.valueOf(rt)); }`,
+    `        List<Map<String,Object>> ccPick = new List<Map<String,Object>>();`,
+    `        if (d.getType() == Schema.DisplayType.PICKLIST || d.getType() == Schema.DisplayType.MULTIPICKLIST) {`,
+    `            for (Schema.PicklistEntry pe : d.getPicklistValues()) ccPick.add(new Map<String,Object>{'label'=>pe.getLabel(),'value'=>pe.getValue(),'active'=>pe.isActive(),'default'=>pe.isDefaultValue()}); }`,
+    `        ccFields.add(new Map<String,Object>{`,
+    `            'name'=>d.getName(),'label'=>d.getLabel(),'type'=>String.valueOf(d.getType()),`,
+    `            'custom'=>d.isCustom(),'html'=>d.isHtmlFormatted(),'calc'=>d.isCalculated(),`,
+    `            'precision'=>d.getPrecision(),'scale'=>d.getScale(),'length'=>d.getLength(),`,
+    `            'nillable'=>d.isNillable(),'defaultValue'=>d.getDefaultValue(),'referenceTo'=>ccRef,`,
+    `            'nameField'=>d.isNameField(),'unique'=>d.isUnique(),'externalId'=>d.isExternalID(),`,
+    `            'updateable'=>d.isUpdateable(),'createable'=>d.isCreateable(),'sortable'=>d.isSortable(),`,
+    `            'filterable'=>d.isFilterable(),'relationshipName'=>d.getRelationshipName(),'picklist'=>ccPick });`,
+    `    }`,
     `    ccLabel = ccD.getLabel();`,
     `    ccPlural = ccD.getLabelPlural();`,
     `    if (ccD.getKeyPrefix() != null) ccPrefix = ccD.getKeyPrefix();`,
+    `    ccObj = new Map<String,Object>{'accessible'=>ccD.isAccessible(),'createable'=>ccD.isCreateable(),`,
+    `        'updateable'=>ccD.isUpdateable(),'deletable'=>ccD.isDeletable(),'queryable'=>ccD.isQueryable(),`,
+    `        'searchable'=>ccD.isSearchable(),'mergeable'=>ccD.isMergeable(),'custom'=>ccD.isCustom(),`,
+    `        'customSetting'=>ccD.isCustomSetting(),'feedEnabled'=>ccD.isFeedEnabled(),'undeletable'=>ccD.isUndeletable()};`,
     `} catch (Exception ccE) { ccErr = ccE.getTypeName() + ': ' + ccE.getMessage(); }`,
     `String ccOut;`,
-    `try { ccOut = JSON.serialize(new Map<String,Object>{'names'=>ccNames,'label'=>ccLabel,'prefix'=>ccPrefix,'plural'=>ccPlural}); } catch (Exception e) { ccOut = '{}'; }`,
-    `System.debug(LoggingLevel.ERROR, '__CC_DESC__' + ccOut);`,
+    `try { ccOut = JSON.serialize(new Map<String,Object>{'fields'=>ccFields,'label'=>ccLabel,'prefix'=>ccPrefix,'plural'=>ccPlural,'obj'=>ccObj}); } catch (Exception e) { ccOut = '{}'; }`,
+    `Integer ccChunk = 3000;`,
+    `for (Integer i = 0; i < ccOut.length(); i += ccChunk) { System.debug(LoggingLevel.ERROR, '__CC_DESC__' + ccOut.substring(i, Math.min(i + ccChunk, ccOut.length()))); }`,
     `System.debug(LoggingLevel.ERROR, '__CC_DESCERR__' + ccErr);`,
   ].join('\n');
   try {
@@ -2169,19 +2798,20 @@ async function _runDescribeViaApex(sobjectName) {
     if (!cli) return { error: 'CLI unavailable' };
     const res = (cli.result || cli.data) || {};
     const log = res.logs || '';
-    let raw = null, dErr = '';
+    let raw = '', dErr = '';
     for (const line of log.split('\n')) {
       const pipe = line.split('|');
       const msg = pipe.length >= 5 ? pipe.slice(4).join('|') : '';
-      if (msg.startsWith('__CC_DESC__')) raw = msg.slice('__CC_DESC__'.length);
-      else if (msg.startsWith('__CC_DESCERR__')) dErr = msg.slice('__CC_DESCERR__'.length);
+      if (msg.startsWith('__CC_DESCERR__')) dErr = msg.slice('__CC_DESCERR__'.length);
+      else if (msg.startsWith('__CC_DESC__')) raw += msg.slice('__CC_DESC__'.length);
     }
     if (dErr) return { error: dErr };
-    if (raw == null) return { error: 'no describe marker (FINEST logs off?)' };
+    if (!raw) return { error: 'no describe marker (FINEST logs off?)' };
     let obj = {};
     try { obj = JSON.parse(raw) || {}; } catch { obj = {}; }
-    const names = Array.isArray(obj.names) ? obj.names : [];
-    return { names, label: obj.label || sobjectName, prefix: obj.prefix || '', plural: obj.plural || sobjectName, error: names.length ? null : 'no fields' };
+    const fields = Array.isArray(obj.fields) ? obj.fields : [];
+    const names = fields.map(f => f && f.name).filter(Boolean);
+    return { fields, names, label: obj.label || sobjectName, prefix: obj.prefix || '', plural: obj.plural || sobjectName, obj: obj.obj || null, error: names.length ? null : 'no fields' };
   } catch (e) {
     return { error: e?.message || String(e) };
   }
@@ -2289,7 +2919,13 @@ function stripColumnFromSoql(soql, col) {
   if (filtered.length === parts.length) return null; // wasn't removed
   if (filtered.length === 0) return null;             // would leave an empty SELECT
 
-  return soql.slice(0, selectEnd) + filtered.join(',') + soql.slice(fromStart);
+  // Guarantee whitespace remains between the SELECT list and FROM. If the removed
+  // column was the LAST item in the list, its trailing whitespace (e.g. the "\n "
+  // before FROM) goes with it, which would fuse the previous column onto FROM
+  // ("SELECT Id" + "FROM" = "SELECT IdFROM…", invalid SOQL). Re-add a single space.
+  let newSelect = filtered.join(',');
+  if (!/\s$/.test(newSelect)) newSelect += ' ';
+  return soql.slice(0, selectEnd) + newSelect + soql.slice(fromStart);
 }
 
 /** Prefix unqualified custom (__c/__r/__mdt/…) API names in a SOQL string with the namespace. */
@@ -2341,7 +2977,7 @@ async function evaluateSoqlInOrg(rawQuery, frame) {
     q = q.replace(new RegExp(':\\s*' + escapeRegex(b) + '\\b', 'g'), lit);
   }
   if (unresolved.length) {
-    return { error: `Can't resolve bind variable(s): ${unresolved.join(', ')}. They're runtime collections/objects built inside the method — enable Live Org and use ▶ Run in Org, then step to this line so they're populated (or set a value in the Console, e.g. \`${unresolved[0]} = ['id1','id2']\`).`, soql: q, unresolved };
+    return { error: `Can't resolve bind variable(s): ${unresolved.join(', ')}. They're runtime collections/objects built inside the method — turn on the ⚡ Live Org toggle to run the method in the org, then step to this line so they're populated (or set a value in the Console, e.g. \`${unresolved[0]} = ['id1','id2']\`).`, soql: q, unresolved };
   }
   const res = await execSoql(q);
   return { ...res, unresolved: [] };
@@ -2351,27 +2987,19 @@ async function evaluateSoqlInOrg(rawQuery, frame) {
 function updateLiveOrgIndicator() {
   const checkbox = _$('#dbg-liveorg-checkbox');
   const status = _$('#dbg-liveorg-status');
-  const runBtn = _$('#dbg-btn-run-org');
   const org = getActiveOrg();
   const connected = !!(org && org.connected && org.org);
   if (checkbox) {
     checkbox.disabled = !connected;
     checkbox.checked = debugState.liveOrgMode && connected;
   }
-  if (runBtn) {
-    const canRun = connected && debugState.liveOrgMode && debugState.active && !debugState.orgRunning;
-    runBtn.disabled = !canRun;
-    runBtn.textContent = debugState.orgRunning ? '⏳ Running…' : '▶ Run in Org';
-    runBtn.classList.toggle('active', debugState.liveOrgMode && connected);
-  }
   if (status) {
-    if (debugState.orgRunning) {
-      status.textContent = '⏳ executing in org…';
-      status.className = 'dbg-liveorg-status fetching';
-    } else if (debugState.orgFetching) {
-      status.textContent = '⏳ querying org…';
-      status.className = 'dbg-liveorg-status fetching';
-    } else if (!connected) {
+    // The connection pill shows ONLY the org connection state — never the
+    // in-flight query/running text. That live progress is shown in ONE place
+    // (the yellow "Querying the org…" banner + the in-editor in-progress band),
+    // so it isn't duplicated here, and the pill's width stays stable so the
+    // toolbar buttons never shift while a query is running.
+    if (!connected) {
       status.textContent = 'no org connected';
       status.className = 'dbg-liveorg-status disconnected';
     } else if (debugState.liveOrgMode) {
@@ -2385,6 +3013,61 @@ function updateLiveOrgIndicator() {
   // When orgFetching changes, update the executing-line decoration class so the
   // user can see "something is happening at this line" via the loading animation.
   _refreshExecDecoration();
+  // Reflect busy state on the toolbar buttons (disabled while running/querying).
+  setDebugBusyUI();
+  // Drive the big, always-visible query loader overlay.
+  updateQueryBanner();
+}
+
+/**
+ * Show/hide the prominent Live-Org query loader overlaid on the editor. It's
+ * driven purely by state (orgFetching / orgRunning) so it looks identical no
+ * matter which file is open — fixing the "loader is tiny / inconsistent" issue.
+ */
+function updateQueryBanner() {
+  const banner = _$('#dbg-query-banner');
+  if (!banner) return;
+  const titleEl = banner.querySelector('.dbg-query-banner-title');
+  const detailEl = _$('#dbg-query-banner-detail');
+  const show = debugState.active && (debugState.orgFetching || debugState.orgRunning);
+  banner.classList.toggle('hidden', !show);
+  if (!show) return;
+  if (titleEl) titleEl.textContent = debugState.orgRunning ? 'Running in the org…' : 'Querying the org…';
+  if (detailEl) detailEl.textContent = debugState.orgRunning
+    ? 'Executing the method against the connected org (read-only, rolled back)'
+    : (debugState.currentQueryText || 'Fetching real data from the connected org…');
+}
+
+/**
+ * User clicked the yellow "querying / running" banner: jump the editor to WHERE
+ * execution currently is, so they can watch it, drop a breakpoint, or stop there.
+ * This is ALWAYS explicit (a click) — free-running execution never moves the
+ * viewport on its own. Uses the live interpreter's current line (still valid
+ * while it awaits an on-demand org query); during a whole-method org run (replay
+ * build) where no single JS line exists, falls back to the entry method.
+ */
+async function revealCurrentExecution() {
+  if (!debugState.active) return;
+  let file = debugState._execCurrentFile || debugState.currentFile || null;
+  let line = debugState._execCurrentLine || debugState.currentLine || 0;
+  if (debugState.orgRunning && !debugState._execCurrentLine) {
+    file = debugState.entryFile || file;
+    line = debugState.entryLine || line;
+  }
+  if (!file || !line) {
+    window.showToast?.('No execution line to jump to yet — the run is still starting.', 'info');
+    return;
+  }
+  try {
+    if (file !== debugState.currentFile) {
+      debugState.currentFile = file;
+      await navigateToFile(file, line);
+      if (!debugState.paused) setTimeout(() => highlightExecutingLine(line, file), 60);
+    } else {
+      navigateToLine(line);
+      if (!debugState.paused) highlightExecutingLine(line, file);
+    }
+  } catch (_) { /* keep whatever is open */ }
 }
 
 /** Toggle Live Org mode from the toolbar checkbox. */
@@ -2401,11 +3084,15 @@ function toggleLiveOrgMode() {
   updateLiveOrgIndicator();
 
   if (debugState.liveOrgMode) {
+    // Re-running via the toggle is "a new run" — refresh all prior output first so
+    // old Console/Org-Log lines never mix with the fresh execution.
+    if (debugState.active && !debugState.orgRunning) resetRunOutput();
     addConsoleEntry('info', `⚡ Live Org ON — hovering/console now pull real values from "${getActiveOrg().org}" on demand.`);
-    // Auto-capture the full picture: replay the entry method once so every line's
-    // real values are ready without a separate "Run in Org" click.
-    if (debugState.active && !debugState.orgRunning && !debugState.replayMode) {
-      addConsoleEntry('info', '↻ Auto-running the method in the org to capture real values for every line…');
+    // Auto-run the entry method in the org so every line's real values are ready.
+    // This is now the ONLY way to (re)run: there's no separate "Run in Org" button —
+    // toggle Live Org OFF then ON (or press Restart ⟳) to run the method again.
+    if (debugState.active && !debugState.orgRunning) {
+      addConsoleEntry('info', '↻ Running the method in the org to capture real values for every line…');
       runEntryMethodInOrg();
     }
   } else {
@@ -2447,7 +3134,7 @@ function getEntrySignature(source, methodName) {
           if (parts.length >= 2) params.push({ type: parts.slice(0, -1).join(' '), name: parts[parts.length - 1] });
         }
       }
-      return { returnType: (m[3] || '').trim(), isStatic: !!m[2], params };
+      return { returnType: (m[3] || '').trim(), isStatic: !!m[2], params, signatureLine: i + 1 };
     }
   }
   return null;
@@ -2576,44 +3263,119 @@ function parseApexLog(log) {
  *  Uses the Tooling API. Trace flags auto-expire; they are debug-logging setup only
  *  and never touch business data. Returns true if a flag is in place. */
 async function ensureFinestLogging(orgAlias) {
+  if (!orgAlias) return false;
+  const nowMs = Date.now();
+  const SAFETY = 5 * 60 * 1000; // refresh a flag that is within 5 min of expiring
+  const cached = debugState._finestWarm.get(orgAlias);
+  // Reuse an in-flight or still-valid warm-up: an in-flight entry (expiresAt==null)
+  // is shared so a background warm-up and the actual run never race to create two
+  // trace flags; a resolved entry with comfortable time left skips the CLI dance
+  // entirely (this is what makes 2nd+ runs in a session near-instant).
+  if (cached && cached.promise && (cached.expiresAt == null || cached.expiresAt - nowMs > SAFETY)) {
+    return cached.promise;
+  }
+  const entry = {
+    promise: null,
+    expiresAt: null,
+    userId: cached?.userId || null,
+    debugLevelId: cached?.debugLevelId || null,
+  };
+  entry.promise = (async () => {
+    const ok = await _ensureFinestLoggingUncached(orgAlias, entry);
+    // On failure drop the cache so a later run gets a clean retry (don't cache "false").
+    if (!ok) debugState._finestWarm.delete(orgAlias);
+    return ok;
+  })();
+  debugState._finestWarm.set(orgAlias, entry);
+  return entry.promise;
+}
+
+/**
+ * The real trace-flag setup (uncached). Parallelizes the two independent lookups
+ * (running user's Id vs. our FINEST DebugLevel) and REUSES an existing non-expired
+ * CongaCodeFinest DEVELOPER_LOG trace flag instead of delete+recreating one every
+ * time. Only touches debug metadata (DebugLevel / TraceFlag) — never business data.
+ * `entry` is mutated with the resolved userId / debugLevelId / expiresAt for caching.
+ */
+async function _ensureFinestLoggingUncached(orgAlias, entry) {
   const folder = window.state?.folderPath;
   const run = (cmd) => window.congacode.sfExec(cmd, folder, 60000);
   const jparse = (s) => parseSfJson(s);
   try {
-    // 1. Resolve the running user's Id.
-    const disp = jparse((await run(`sf org display --json --target-org ${orgAlias}`)).stdout);
-    const username = disp?.result?.username;
-    if (!username) return false;
-    const uq = jparse((await run(`sf data query --json --target-org ${orgAlias} -q "SELECT Id FROM User WHERE Username = '${username}'"`)).stdout);
-    const userId = uq?.result?.records?.[0]?.Id;
-    if (!userId) return false;
+    // (a) Resolve the running user's Id and (b) find/create the FINEST DebugLevel in
+    //     parallel — neither depends on the other, so this removes a full CLI
+    //     cold-start from the critical path.
+    const userIdP = (async () => {
+      if (entry.userId) return entry.userId;
+      const disp = jparse((await run(`sf org display --json --target-org ${orgAlias}`)).stdout);
+      const username = disp?.result?.username;
+      if (!username) return null;
+      const uq = jparse((await run(`sf data query --json --target-org ${orgAlias} -q "SELECT Id FROM User WHERE Username = '${username}'"`)).stdout);
+      return uq?.result?.records?.[0]?.Id || null;
+    })();
+    const dlIdP = (async () => {
+      if (entry.debugLevelId) return entry.debugLevelId;
+      // ApexCode=FINEST is what emits the STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT
+      // events the replay engine needs.
+      const dlq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id FROM DebugLevel WHERE DeveloperName = 'CongaCodeFinest'"`)).stdout);
+      let id = dlq?.result?.records?.[0]?.Id;
+      if (!id) {
+        const created = jparse((await run(`sf data create record --use-tooling-api --sobject DebugLevel --target-org ${orgAlias} --json --values "DeveloperName=CongaCodeFinest MasterLabel=CongaCodeFinest ApexCode=FINEST ApexProfiling=NONE Callout=NONE Database=FINEST System=FINE Validation=NONE Visualforce=NONE Workflow=NONE"`)).stdout);
+        id = created?.result?.id;
+      } else {
+        // Ensure a pre-existing level is really at FINEST (it may have been created
+        // wrong in an earlier build), otherwise the log won't contain step detail.
+        await run(`sf data update record --use-tooling-api --sobject DebugLevel --record-id ${id} --target-org ${orgAlias} --json --values "ApexCode=FINEST Database=FINEST System=FINE"`);
+      }
+      return id || null;
+    })();
 
-    // 2. Find or create a FINEST DebugLevel. ApexCode=FINEST is what emits the
-    //    STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT events the replay engine needs.
-    let dlId;
-    const dlq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id FROM DebugLevel WHERE DeveloperName = 'CongaCodeFinest'"`)).stdout);
-    dlId = dlq?.result?.records?.[0]?.Id;
-    if (!dlId) {
-      const created = jparse((await run(`sf data create record --use-tooling-api --sobject DebugLevel --target-org ${orgAlias} --json --values "DeveloperName=CongaCodeFinest MasterLabel=CongaCodeFinest ApexCode=FINEST ApexProfiling=NONE Callout=NONE Database=FINEST System=FINE Validation=NONE Visualforce=NONE Workflow=NONE"`)).stdout);
-      dlId = created?.result?.id;
-    } else {
-      // Ensure a pre-existing level is really at FINEST (it may have been created
-      // wrong in an earlier build), otherwise the log won't contain step detail.
-      await run(`sf data update record --use-tooling-api --sobject DebugLevel --record-id ${dlId} --target-org ${orgAlias} --json --values "ApexCode=FINEST Database=FINEST System=FINE"`);
+    const [userId, dlId] = await Promise.all([userIdP, dlIdP]);
+    if (!userId || !dlId) return false;
+    entry.userId = userId;
+    entry.debugLevelId = dlId;
+
+    // Inspect this user's developer-log trace flags. If a non-expired one already
+    // points at our FINEST DebugLevel, REUSE it — skip the delete+recreate entirely.
+    const tfq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id, DebugLevelId, ExpirationDate FROM TraceFlag WHERE TracedEntityId = '${userId}' AND LogType = 'DEVELOPER_LOG'"`)).stdout);
+    const flags = tfq?.result?.records || [];
+    const nowMs = Date.now();
+    const SAFETY = 5 * 60 * 1000;
+    const valid = flags.find(f =>
+      f.DebugLevelId === dlId && f.ExpirationDate &&
+      (new Date(f.ExpirationDate).getTime() - nowMs) > SAFETY);
+    if (valid) {
+      entry.expiresAt = new Date(valid.ExpirationDate).getTime();
+      return true;
     }
-    if (!dlId) return false;
 
-    // 3. Replace any existing developer-log trace flags for this user with a fresh 1h one.
-    const tfq = jparse((await run(`sf data query --use-tooling-api --json --target-org ${orgAlias} -q "SELECT Id FROM TraceFlag WHERE TracedEntityId = '${userId}' AND LogType = 'DEVELOPER_LOG'"`)).stdout);
-    for (const tf of (tfq?.result?.records || [])) {
+    // No usable flag → clear stale ones and create a fresh 1h flag.
+    for (const tf of flags) {
       await run(`sf data delete record --use-tooling-api --sobject TraceFlag --record-id ${tf.Id} --target-org ${orgAlias} --json`);
     }
     const now = new Date();
     const start = now.toISOString();
-    const exp = new Date(now.getTime() + 60 * 60 * 1000).toISOString();
+    const expMs = now.getTime() + 60 * 60 * 1000;
+    const exp = new Date(expMs).toISOString();
     const created = jparse((await run(`sf data create record --use-tooling-api --sobject TraceFlag --target-org ${orgAlias} --json --values "TracedEntityId=${userId} DebugLevelId=${dlId} LogType=DEVELOPER_LOG StartDate=${start} ExpirationDate=${exp}"`)).stdout);
-    return !!(created?.result?.id);
+    const ok = !!(created?.result?.id);
+    if (ok) entry.expiresAt = expMs;
+    return ok;
   } catch { return false; }
+}
+
+/**
+ * Kick FINEST-logging setup in the BACKGROUND (fire-and-forget) the moment a debug
+ * session starts with a connected org, so the ~7-call trace-flag dance overlaps the
+ * user reading code / the engine warming up instead of stalling the first org run.
+ * Cached + deduped, so the later run reuses this exact result rather than re-doing it.
+ */
+function warmUpLiveOrg() {
+  try {
+    if (!liveOrgAvailable()) return;
+    const org = getActiveOrg();
+    if (org?.org) ensureFinestLogging(org.org);
+  } catch (_) { /* non-fatal */ }
 }
 
 /** Fetch the most recent Apex debug log body from the org (used to get FINEST detail). */
@@ -2635,6 +3397,89 @@ async function fetchLatestApexLog(orgAlias) {
   } catch { return null; }
 }
 
+/**
+ * Fetch the newest ApexLog body as RAW TEXT (no --json). This deliberately avoids
+ * the `--json` output path that overflows the stack in old Salesforce CLI builds on
+ * very large logs — the CLI just streams the raw log, so it never serializes a huge
+ * object. Used to recover the real execution after `sf apex run --json` crashes.
+ */
+async function fetchLatestApexLogRaw(orgAlias) {
+  const folder = window.state?.folderPath;
+  const run = (cmd) => window.congacode.sfExec(cmd, folder, 90000);
+  try {
+    let id = null;
+    // The log LIST is metadata only (no bodies) so --json is small and safe here.
+    const list = parseSfJson((await run(`sf apex log list --json --target-org ${orgAlias}`)).stdout);
+    const recs = list?.result || [];
+    if (recs.length) {
+      recs.sort((a, b) => new Date(b.StartTime || 0) - new Date(a.StartTime || 0));
+      id = recs[0].Id || recs[0].id;
+    }
+    if (!id) {
+      const q = parseSfJson((await run(`sf data query --json --target-org ${orgAlias} -q "SELECT Id FROM ApexLog ORDER BY StartTime DESC LIMIT 1"`)).stdout);
+      id = q?.result?.records?.[0]?.Id || null;
+    }
+    if (!id) return null;
+    // Body WITHOUT --json → raw stream, so the CLI can't overflow serializing it.
+    const { stdout } = await run(`sf apex log get --log-id ${id} --target-org ${orgAlias}`);
+    return stdout || null;
+  } catch { return null; }
+}
+
+/**
+ * Recover a real-execution replay after the inline `sf apex run --json` crashed the
+ * CLI. The method already RAN in the org (the crash is only in returning the result),
+ * so we pull the FINEST log straight from the server as raw text and rebuild the
+ * timeline from it. Returns true if it populated the Org panel / entered replay.
+ */
+async function recoverReplayFromServerLog(org, className, methodName) {
+  try {
+    const raw = await fetchLatestApexLogRaw(org.org);
+    if (!raw || raw.length < 50) {
+      addConsoleEntry('error', '⚠ Could not recover the log from the server (none found or empty). Updating the Salesforce CLI (npm i -g @salesforce/cli) will fix the root cause.');
+      return false;
+    }
+    const parsed = parseApexLog(raw);
+    parsed.org = org.org;
+    parsed.entry = `${className}.${methodName}`;
+    parsed.rawLog = raw;
+    parsed.recovered = true;
+    if (!parsed.error && parsed.exceptionMessage) parsed.error = parsed.exceptionMessage;
+    debugState.orgActivity = parsed;
+    addConsoleEntry('info', `↩ Recovered the run from the server log (${raw.length}b) despite the CLI crash. SOQL: ${parsed.soql.length}, DML: ${parsed.dml.length} (rolled back).`);
+    const classIndex = await buildClassIndex();
+    const timeline = buildReplayTimeline(raw, classIndex, { file: debugState.entryFile, line: debugState.entryDeclLine });
+    if (timeline.steps.length && timeline.hasDetail) {
+      addConsoleEntry('info', `🎬 Reconstructed ${timeline.steps.length} steps from the recovered log — stepping is ready.`);
+      enterReplayMode(timeline);
+    } else {
+      addConsoleEntry('info', '⚠ Recovered the log but it lacked step detail (needs ApexCode=FINEST). The org activity above is real; enable FINEST or update the CLI, then Restart to step line-by-line.');
+    }
+    return true;
+  } catch (e) {
+    addConsoleEntry('error', `Recovery from server log failed: ${e?.message || e}`);
+    return false;
+  }
+}
+
+/**
+ * Clear the previous run's user-facing output and replay bookkeeping so a fresh
+ * run (or re-run via the Live Org toggle / Restart) starts clean — the user asked
+ * that starting a new run "refresh everything". Breakpoints/logpoints are NOT
+ * touched; they persist across runs like a normal debugger.
+ */
+function resetRunOutput() {
+  debugState.consoleLog = [];
+  debugState.orgLog = [];
+  debugState.orgActivity = null;
+  debugState.replayDebugHigh = -1;
+  debugState._condNoted = new Set();
+  debugState._unreachedReported = false;
+  debugState._userPinnedTab = false; // new run — auto-open Org tab again until the user picks a tab
+  renderConsolePanel();
+  scheduleOrgActivityRender();
+}
+
 /** Execute the entry method against the connected org (read-only) and show activity. */
 async function runEntryMethodInOrg() {
   if (!debugState.active) { window.showToast?.('Start a debug session first', 'warning'); return; }
@@ -2650,6 +3495,7 @@ async function runEntryMethodInOrg() {
   const sig = getEntrySignature(source, methodName);
   if (!sig) { window.showToast?.(`Could not parse signature for ${methodName}`, 'error'); return; }
   sig.__methodName = methodName;
+  debugState.entryDeclLine = sig.signatureLine || 0;
 
   const className = filePath.split('/').pop().replace(/\.(cls|trigger)$/, '');
   const argValues = (debugState.parsedRequest?.params) || [];
@@ -2662,6 +3508,7 @@ async function runEntryMethodInOrg() {
   const apex = buildEntryApex(className, sig, argValues);
 
   debugState.orgRunning = true;
+  debugState._userPinnedTab = false; // fresh run — allow the one auto-open below
   updateLiveOrgIndicator();
   renderOrgActivityPanel();
   switchToOrgTab();
@@ -2683,8 +3530,20 @@ async function runEntryMethodInOrg() {
 
     let cli = parseSfJson(stdout);
     if (!cli) {
-      debugState.orgActivity = { error: (stderr || stdout || 'No response from sf CLI').split('\n').slice(0, 5).join('\n') };
-      addConsoleEntry('error', `sf CLI returned non-JSON. stdout(${(stdout||'').length}b): ${(stdout||'').slice(0,300)} | stderr: ${(stderr||'').slice(0,300)}`);
+      // The CLI returned no parseable JSON. If it CRASHED serializing a huge inline
+      // payload (old-CLI RangeError), the method still RAN — recover by pulling the
+      // FINEST log straight from the server as raw text and replay that instead of
+      // dead-ending. Only falls back to the clean error if recovery can't help.
+      const crashed = /Maximum call stack size exceeded|RangeError/i.test(`${stderr || ''}\n${stdout || ''}`);
+      let recovered = false;
+      if (crashed) {
+        addConsoleEntry('info', '⚠ The Salesforce CLI crashed returning the inline result (old-CLI bug on very large logs). The method DID run in the org — recovering the FINEST log directly from the server…');
+        recovered = await recoverReplayFromServerLog(org, className, methodName);
+      }
+      if (!recovered) {
+        debugState.orgActivity = { error: describeOrgRunFailure(stderr, stdout) };
+        addConsoleEntry('error', `sf CLI returned non-JSON. stdout(${(stdout||'').length}b): ${(stdout||'').slice(0,300)} | stderr: ${(stderr||'').slice(0,300)}`);
+      }
     } else if (cli.truncated) {
       debugState.orgActivity = { error: cli.message };
       addConsoleEntry('error', `Org run failed: ${cli.message}`);
@@ -2730,7 +3589,7 @@ async function runEntryMethodInOrg() {
         try {
           const classIndex = await buildClassIndex();
           let logForReplay = res.logs || '';
-          let timeline = buildReplayTimeline(logForReplay, classIndex);
+          let timeline = buildReplayTimeline(logForReplay, classIndex, { file: filePath, line: sig.signatureLine });
 
           // The inline `sf apex run` log is frequently empty or truncated, so the
           // authoritative source is the full ApexLog recorded on the server. When
@@ -2739,7 +3598,7 @@ async function runEntryMethodInOrg() {
             addConsoleEntry('info', '⏳ Fetching the full recorded FINEST log from the org…');
             const full = await fetchLatestApexLog(org.org);
             if (full && full.length) {
-              const fullTimeline = buildReplayTimeline(full, classIndex);
+              const fullTimeline = buildReplayTimeline(full, classIndex, { file: filePath, line: sig.signatureLine });
               if (fullTimeline.steps.length >= timeline.steps.length) {
                 logForReplay = full;
                 timeline = fullTimeline;
@@ -2762,8 +3621,11 @@ async function runEntryMethodInOrg() {
       }
     }
   } catch (e) {
-    debugState.orgActivity = { error: e?.message || String(e) };
-    addConsoleEntry('error', `Run in Org failed: ${e?.message || e}`);
+    const msg = e?.message || String(e);
+    debugState.orgActivity = { error: /Maximum call stack size exceeded/i.test(msg)
+      ? `Processing the org response overflowed the stack (very large or deeply-nested data). The method DID run in the org (nothing was modified) — press Restart (⟳) to try again. Details: ${msg}`
+      : msg };
+    addConsoleEntry('error', `Run in Org failed: ${msg}`);
   } finally {
     debugState.orgRunning = false;
     updateLiveOrgIndicator();
@@ -2777,27 +3639,75 @@ function switchToOrgTab() {
   if (tab) tab.click();
 }
 
+/**
+ * While the method is free-running (NOT paused at a breakpoint), surface the Org
+ * Activity tab so the developer watches real queries stream in live. We back off in
+ * three cases so we never fight the user: when paused (they're inspecting Variables/
+ * Watch and any query is one THEY triggered), when they've manually clicked a tab
+ * this run (_userPinnedTab), or when the Org tab is already active.
+ */
+function maybeOpenOrgTabForLiveQuery() {
+  if (!debugState.active || debugState.paused) return;
+  if (debugState._userPinnedTab) return; // the user chose a tab — respect it
+  const tab = _$('#debug-panel .dbg-panel-tab[data-tab="dbg-orgactivity"]');
+  if (tab && !tab.classList.contains('active')) tab.click();
+}
+
 /** Render the Org Activity panel from debugState.orgActivity. */
 function renderOrgActivityPanel() {
   const container = _$('#dbg-orgactivity-body');
   if (!container) return;
 
+  // A persistent status banner so the user always sees the real state. While the
+  // method is running we say "Connecting…/preparing" (buttons are still disabled),
+  // and only switch to the steady green "Connected" once the run has finished and
+  // the debugger is ready to step — so "Connected" never contradicts a spinner.
+  const org = getActiveOrg();
+  const connected = !!(org && org.connected && org.org);
+  let connBanner;
+  if (!connected) {
+    connBanner = `<div class="dbg-org-conn disconnected">○ No org connected — connect one in the Salesforce panel</div>`;
+  } else if (debugState.orgRunning) {
+    connBanner = `<div class="dbg-org-conn connecting">⏳ Connecting to <b>${_esc(org.org)}</b>… preparing real data</div>`;
+  } else {
+    connBanner = `<div class="dbg-org-conn connected">⚡ Connected to <b>${_esc(org.org)}</b> — ready</div>`;
+  }
+
+  // Sticky "running query" banner: while a live org call is in flight, pin the exact
+  // query at the top of the panel so the user ALWAYS sees the currently-executing
+  // query without scrolling — no matter how long the activity log has grown. It stays
+  // put (position:sticky) as the log scrolls beneath it.
+  const runningBanner = (debugState.orgFetching && debugState.currentQueryText)
+    ? `<div class="dbg-org-running" title="Running against the org right now — click to jump to the executing line">`
+      + `<span class="dbg-org-running-spin"></span>`
+      + `<span class="dbg-org-running-label">Running now</span>`
+      + `<code class="dbg-org-running-q">${_esc(debugState.currentQueryText)}</code>`
+      + `<span class="dbg-org-running-jump">↪ jump</span>`
+      + `</div>`
+    : '';
+  const header = connBanner + runningBanner;
+
   if (debugState.orgRunning) {
-    container.innerHTML = '<div class="dbg-org-loader"><span class="dbg-spinner"></span> Executing in org… fetching real data (this can take a moment).</div>';
+    container.innerHTML = header + '<div class="dbg-org-loader"><span class="dbg-spinner"></span> Executing in org… fetching real data (this can take a moment).</div>';
     return;
   }
 
   const a = debugState.orgActivity;
   if (!a) {
-    container.innerHTML = '<div class="dbg-empty">Enable ⚡ Live Org and click "Run in Org" to execute the entry method against the connected org (read-only — changes are rolled back).</div>';
+    const hint = connected
+      ? 'Turn on the ⚡ Live Org toggle to run the entry method against this org (read-only — changes are rolled back). Toggle it OFF then ON, or press Restart ⟳, to run again.'
+      : 'Connect a Salesforce org, then turn on the ⚡ Live Org toggle to run the entry method against it (read-only — changes are rolled back).';
+    container.innerHTML = header + `<div class="dbg-empty">${hint}</div>` + renderOrgLogSection();
+    _scrollOrgLog(container);
     return;
   }
   if (a.error && !a.entry) {
-    container.innerHTML = `<div class="dbg-org-error">✕ ${_esc(a.error)}</div>`;
+    container.innerHTML = header + `<div class="dbg-org-error">✕ ${_esc(a.error)}</div>` + renderOrgLogSection();
+    _scrollOrgLog(container);
     return;
   }
 
-  let html = '';
+  let html = header;
   html += `<div class="dbg-org-summary">`;
   html += `<div class="dbg-org-head">⚡ ${_esc(a.entry || '')} <span class="dbg-org-org">@ ${_esc(a.org || '')}</span></div>`;
   if (a.compileProblem) html += `<div class="dbg-org-error">Compile error: ${_esc(a.compileProblem)}</div>`;
@@ -2856,13 +3766,67 @@ function renderOrgActivityPanel() {
     html += `</div>`;
   }
 
-  container.innerHTML = html;
+  container.innerHTML = html + renderOrgLogSection();
+  _scrollOrgLog(container);
 }
 
-/* ================================================================
-   REPLAY ENGINE — reconstruct a step-by-step timeline from the
-   org's Apex debug log, with real variable values at every line.
-   ================================================================ */
+/** Auto-scroll the activity log to the newest entry and wire up its interactions. */
+function _scrollOrgLog(container) {
+  if (!container) return;
+  // Org & Log payloads are expandable/copyable just like the Console.
+  _attachTreeToggles(container);
+  _attachPayloadCopy(container);
+  const ol = container.querySelector('.dbg-orglog');
+  if (ol) ol.scrollTop = ol.scrollHeight;
+  // Terminal-style "follow the tail": keep the newest activity (the running query and
+  // its result) visible without the user scrolling. While a query/run is in flight we
+  // always pin to the bottom; otherwise we only pin when the user was already near the
+  // bottom, so scrolling up to read earlier history is never yanked back down.
+  const nearBottom = (container.scrollHeight - container.scrollTop - container.clientHeight) < 80;
+  if (debugState.orgFetching || debugState.orgRunning || nearBottom || container._dbgStickBottom) {
+    container.scrollTop = container.scrollHeight;
+  }
+  if (!container._dbgScrollWired) {
+    container._dbgScrollWired = true;
+    container.addEventListener('scroll', () => {
+      container._dbgStickBottom =
+        (container.scrollHeight - container.scrollTop - container.clientHeight) < 80;
+    });
+    container._dbgStickBottom = true;
+    // Clicking the pinned "Running now" query jumps the editor to where execution
+    // currently is — same behaviour as the yellow query banner, so the developer can
+    // watch it, drop a breakpoint, or stop there. Delegated because the banner is
+    // rebuilt on every render.
+    container.addEventListener('click', (e) => {
+      if (e.target.closest('.dbg-org-running')) revealCurrentExecution();
+    });
+  }
+}
+
+/**
+ * Render the org/engine activity log (debugState.orgLog) — SOQL, DML, branch/loop
+ * traces, status, warnings and errors that used to clutter the Console. Shown in
+ * the ⚡ Org tab so the Console stays clean for user output only. Caps the visible
+ * rows so a long run stays responsive.
+ */
+function renderOrgLogSection() {
+  const log = debugState.orgLog;
+  if (!log || !log.length) return '';
+  const ICON = { soql: '🔎', dml: '✏️', info: '·', warn: '⚠', error: '✕', branch: '↳', loop: '↻', call: '→', var: '=', nav: '⇢', bp: '●', orgdebug: '🐞' };
+  const CAP = 400;
+  const start = Math.max(0, log.length - CAP);
+  let rows = '';
+  if (start > 0) rows += `<div class="dbg-orglog-row dbg-orglog-info"><span class="dbg-orglog-msg">… ${start} earlier entr${start === 1 ? 'y' : 'ies'}</span></div>`;
+  for (let i = start; i < log.length; i++) {
+    const e = log[i];
+    const icon = ICON[e.type] || '·';
+    rows += `<div class="dbg-orglog-row dbg-orglog-${e.type}">`
+      + `<span class="dbg-orglog-icon">${icon}</span>`
+      + (e.line ? `<span class="dbg-org-line">L${e.line}</span>` : '')
+      + `<span class="dbg-orglog-msg">${renderEntryPayload(e, i, 'org')}</span></div>`;
+  }
+  return `<div class="dbg-org-section"><div class="dbg-org-title">Activity log (${log.length})</div><div class="dbg-orglog">${rows}</div></div>`;
+}
 
 /** Parse a debug-log value token into a JS value (objects, refs, primitives). */
 function parseLogValue(raw, addrMap) {
@@ -2925,8 +3889,8 @@ function resolveAddresses(value, addrMap, seen, memo, depth) {
  * Requires the log to contain STATEMENT_EXECUTE + VARIABLE_ASSIGNMENT (FINEST).
  * @returns { steps: [...], returnRaw, hasDetail }
  */
-function buildReplayTimeline(log, classIndex) {
-  const result = { steps: [], returnRaw: null, hasDetail: false, fatalError: null };
+function buildReplayTimeline(log, classIndex, entry) {
+  const result = { steps: [], returnRaw: null, hasDetail: false, fatalError: null, skippedInit: 0 };
   if (!log) return result;
   const clsIdx = classIndex || {};
   const lines = log.split('\n');
@@ -3032,7 +3996,15 @@ function buildReplayTimeline(log, classIndex) {
         break;
       case 'USER_DEBUG': {
         const msg = parts.slice(4).join('|');
-        if (msg.startsWith('__CC_RET__')) result.returnRaw = msg.slice('__CC_RET__'.length);
+        if (msg.startsWith('__CC_')) {
+          if (msg.startsWith('__CC_RET__')) result.returnRaw = msg.slice('__CC_RET__'.length);
+          // other __CC_* markers are harness control tokens — ignore in replay
+        } else if (result.steps.length) {
+          // Real user System.debug output — attach to the statement that just ran
+          // so replayGoto can stream it to the Console as the cursor reaches it.
+          const step = result.steps[result.steps.length - 1];
+          (step.debugs || (step.debugs = [])).push({ line: lineNo, raw: msg });
+        }
         break;
       }
       case 'FATAL_ERROR':
@@ -3061,6 +4033,25 @@ function buildReplayTimeline(log, classIndex) {
       }
     }
   }
+  // Salesforce runs class static/instance initialization before the entry method's
+  // body and attributes those implicit steps to the class-declaration line (and the
+  // static-field lines) — all ABOVE the method the user chose to debug. Left as-is the
+  // replay opens on e.g. `line 8: public class Foo {` and only reaches the method after
+  // a step, which looks like the cursor "jumped to the top." Trim that leading init
+  // prefix so replay starts on the entry method's first executed statement. Nothing is
+  // hidden — every statement the method actually runs (and all nested calls) is kept,
+  // and the full org activity + raw log remain available. Fully general: keyed off the
+  // passed entry file + signature line, so it works for ANY entry method in ANY class.
+  if (entry && entry.file && entry.line && result.steps.length) {
+    const entryBase = String(entry.file).split('/').pop();
+    let k = 0;
+    while (k < result.steps.length) {
+      const s = result.steps[k];
+      if (s.file && String(s.file).split('/').pop() === entryBase && s.line >= entry.line) break;
+      k++;
+    }
+    if (k > 0 && k < result.steps.length) { result.steps = result.steps.slice(k); result.skippedInit = k; }
+  }
   return result;
 }
 
@@ -3069,11 +4060,29 @@ function enterReplayMode(timeline) {
   if (!timeline.steps.length) return false;
   debugState.replayMode = true;
   debugState.replayTimeline = timeline.steps;
-  debugState.replayIndex = 0;
+  // Start the cursor "before" step 0 so replayGoto(0) counts step 0 as a forward
+  // advance and fires any logpoint sitting on the very first line.
+  debugState.replayIndex = -1;
+  debugState.replayDebugHigh = -1;
+  debugState._condNoted = new Set();
+  // Index the lines that ACTUALLY executed (per file) so we can later tell the
+  // user, honestly, when a breakpoint/logpoint they set is on a line the real org
+  // run never reached — instead of silently running to the end.
+  debugState._replayLineIndex = new Map();
+  for (const s of timeline.steps) {
+    if (!s.file) continue;
+    let set = debugState._replayLineIndex.get(s.file);
+    if (!set) { set = new Set(); debugState._replayLineIndex.set(s.file, set); }
+    set.add(s.line);
+  }
+  debugState._unreachedReported = false;
   debugState.replayFatalError = timeline.fatalError || null;
   debugState.active = true;
   debugState.paused = true;
   addConsoleEntry('info', `🎬 Replay mode — stepping ${timeline.steps.length} recorded statements with real org values. Use Step/Continue.`);
+  if (timeline.skippedInit) {
+    addConsoleEntry('info', `↧ Replay starts at ${debugState.entryMethod || 'the entry method'} — skipped ${timeline.skippedInit} class-initialization step(s) the org ran before it (real setup, still counted in Org Activity).`);
+  }
   if (timeline.fatalError) {
     addConsoleEntry('error', `⚠ Execution ended with an uncatchable error: ${timeline.fatalError.split('\n')[0]}. You can still step through everything up to that point.`);
   }
@@ -3081,11 +4090,43 @@ function enterReplayMode(timeline) {
   return true;
 }
 
+/**
+ * Pure planner for what a replay cursor move must emit — the invariant that keeps
+ * time-travel (step back / forward) TRUTHFUL:
+ *   • Recorded org System.debug output is a SINGLE real execution: emit each step's
+ *     recorded debug at most once, tracked by a high-water mark. Stepping back and
+ *     then forward again must NOT duplicate it (that would fabricate output).
+ *   • Logpoints are "print when execution passes this line": they re-fire on every
+ *     FORWARD advance across the line (Chrome V8 behaviour), independent of the mark.
+ * Returns { debugSteps:[idx…], logpointSteps:[idx…], debugHigh:newHighWater }.
+ * Assumes prev/target are already clamped to valid indices. Pure → unit-testable.
+ */
+function planReplayEmit(prevIndex, targetIndex, debugHigh) {
+  const debugSteps = [];
+  if (targetIndex > debugHigh) {
+    for (let j = debugHigh + 1; j <= targetIndex; j++) debugSteps.push(j);
+    debugHigh = targetIndex;
+  }
+  const logpointSteps = [];
+  if (targetIndex > prevIndex) {
+    for (let j = prevIndex + 1; j <= targetIndex; j++) logpointSteps.push(j);
+  }
+  return { debugSteps, logpointSteps, debugHigh };
+}
+
 /** Move the replay cursor to a specific step and refresh the UI. */
 async function replayGoto(index) {
   const steps = debugState.replayTimeline;
   if (!steps.length) return;
   index = Math.max(0, Math.min(index, steps.length - 1));
+  const prevIndex = debugState.replayIndex;
+  // Recorded org System.debug (emit once via high-water mark) + logpoints (re-fire
+  // on every forward advance). Centralised in planReplayEmit so stepping back then
+  // forward never duplicates recorded output — see planReplayEmit for the invariant.
+  const plan = planReplayEmit(prevIndex, index, debugState.replayDebugHigh);
+  for (const j of plan.debugSteps) emitReplayRecordedDebug(steps[j]);
+  debugState.replayDebugHigh = plan.debugHigh;
+  for (const j of plan.logpointSteps) fireReplayLogpoint(steps[j]);
   debugState.replayIndex = index;
   const step = steps[index];
   debugState.callStack = step.frames;
@@ -3096,13 +4137,324 @@ async function replayGoto(index) {
     highlightCurrentLine();
   }
   updateDebugPanels();
+  updateReplayPositionUI();
 }
 
-/** True if a step's file+line has an active breakpoint. */
-function stepHasBreakpoint(step) {
+/**
+ * Route a replay step's recorded (real org) System.debug output to the ⚡ Org &
+ * Log tab — NOT the Console. In Live-Org replay this is the DEPLOYED code's debug
+ * log (framework + app System.debug at every level), which is org activity and
+ * mostly noise; the Console is reserved for errors + the user's own logpoints.
+ */
+function emitReplayRecordedDebug(step) {
+  if (!step || !step.debugs) return;
+  for (const d of step.debugs) {
+    const parsed = parseApexDebugValue(d.raw);
+    if (parsed !== null && typeof parsed === 'object') {
+      addConsoleEntry('orgdebug', d.raw, d.line, parsed);
+    } else {
+      addConsoleEntry('orgdebug', typeof parsed === 'string' ? parsed : String(parsed), d.line);
+    }
+  }
+}
+
+/**
+ * The text a step's logpoint would print, or null when there is no logpoint or a
+ * conditional logpoint's condition is false. Pure (no UI) so it is unit-testable.
+ */
+function replayLogpointText(step) {
+  const p = _bpLogPayload(stepLogpoint(step), step);
+  return p ? p.text : null;
+}
+
+/** {text, value}|null for the logpoint (if any) attached to a replay step. */
+function replayLogpointPayload(step) {
+  return _bpLogPayload(stepLogpoint(step), step);
+}
+
+/** Back-compat string accessor (tests): the logpoint's printed text, or null. */
+function _bpLogText(bp, step) {
+  const p = _bpLogPayload(bp, step);
+  return p ? p.text : null;
+}
+
+/**
+ * Pure: given a logpoint bp (may be null) + step, produce {text, value}|null.
+ * Chrome-style semantics: the log message is an EXPRESSION, not just literal text.
+ *  - a bare message (`logger`) or a sole `{logger}` → evaluate it and print the
+ *    VALUE (an object/list becomes an expandable tree via `value`);
+ *  - a mixed template (`count={count} of {total}`) → interpolate placeholders into
+ *    a string;
+ *  - a conditional logpoint whose condition is false → null (gated off).
+ */
+function _bpLogPayload(bp, step) {
+  if (!bp || !bp.logMessage) return null;
+  if (bp.condition) {
+    const r = evalReplayCondition(bp.condition, step);
+    if (r.evaluated && !r.value) return null; // conditional logpoint gated off
+  }
+  const raw = String(bp.logMessage);
+  const scope = replayStepScope(step);
+  const soleBrace = raw.match(/^\s*\{([^{}]+)\}\s*$/);
+  if (soleBrace) return _logExpressionPayload(soleBrace[1], scope);   // {logger}
+  if (raw.indexOf('{') === -1) return _logExpressionPayload(raw, scope); // logger
+  return { text: evalReplayLogTemplate(raw, step), value: undefined };  // mixed template
+}
+
+/**
+ * Evaluate a bare logpoint expression against captured org state and build a
+ * printable payload — the Chrome DevTools behaviour where a logpoint of `logger`
+ * prints the logger object (expandable), not the literal word "logger".
+ *  - object/list → {text:'expr =', value} so the Console renders an expandable tree;
+ *  - scalar      → {text:'expr = <value>'};
+ *  - a plain identifier/path we can't resolve from the log → an honest "not
+ *    captured" note (never fabricate);
+ *  - free-form prose that isn't an expression → printed verbatim.
+ */
+function _logExpressionPayload(expr, scope) {
+  const trimmed = String(expr).trim();
+  let v;
+  try { v = evaluateExpression(trimmed, scope); } catch (_) { v = undefined; }
+  if (v !== undefined) {
+    if (v !== null && typeof v === 'object') return { text: `${trimmed} =`, value: v };
+    if (typeof v === 'string') return { text: `${trimmed} = ${v}`, value: undefined };
+    return { text: `${trimmed} = ${formatValue(v)}`, value: undefined };
+  }
+  if (/^[A-Za-z_][\w.]*$/.test(trimmed)) {
+    return { text: `${trimmed} — ‹not captured in the org log at this line›`, value: undefined };
+  }
+  return { text: expr, value: undefined }; // free-form text → print verbatim
+}
+
+/** Fire a logpoint attached to a replay step (Chrome-style: print, never pause). */
+function fireReplayLogpoint(step) {
+  const p = replayLogpointPayload(step);
+  if (p) addConsoleEntry('debug', p.text, step.line, p.value);
+}
+
+/** The logpoint (if any) attached to a replay step's file+line. */
+function stepLogpoint(step) {
+  if (!step || !step.file) return null;
+  const bp = activeBreakpoint(step.file, step.line);
+  return bp && bp.logMessage ? bp : null;
+}
+
+/** Substitute {expr} placeholders in a replay logpoint from the step's captured variables. */
+function evalReplayLogTemplate(template, step) {
+  const vars = replayStepScope(step);
+  return String(template).replace(/\{([^{}]+)\}/g, (m, expr) => {
+    const v = lookupVarPath(vars, expr.trim());
+    return v === undefined ? m : (typeof v === 'string' ? v : formatValue(v));
+  });
+}
+
+/** Flatten a replay step's frames into a plain {name: value} scope (top frame wins). */
+function replayStepScope(step) {
+  const top = step && step.frames && step.frames[step.frames.length - 1];
+  return top ? { ...(top.classFields || {}), ...(top.variables || {}) } : {};
+}
+
+/**
+ * Evaluate a breakpoint/logpoint CONDITION against a replay step's real captured
+ * org variables. Returns {evaluated, value}: evaluated=false means the expression
+ * couldn't be resolved from the captured state (unknown var, unsupported syntax),
+ * so callers can degrade honestly rather than guess. Never throws.
+ *
+ * We pre-scan for root variable references that aren't present in the captured
+ * scope. Without this, `evaluateExpression` coerces an unresolved operand
+ * (`undefined > 3` → false, `undefined == 1` → false), which would silently
+ * fabricate a concrete answer and make a conditional breakpoint quietly never
+ * fire. An unknown variable ⇒ unknown result ⇒ the caller pauses to be safe.
+ */
+function evalReplayCondition(condition, step) {
+  try {
+    const scope = replayStepScope(step);
+    const missing = _unresolvedConditionRoots(condition, scope);
+    if (missing.length) return { evaluated: false, value: false, error: `unknown variable ${missing[0]}` };
+    const v = evaluateExpression(condition, scope);
+    if (v === undefined) return { evaluated: false, value: false };
+    return { evaluated: true, value: v };
+  } catch (e) {
+    return { evaluated: false, value: false, error: e && e.message };
+  }
+}
+
+/**
+ * Root variable identifiers referenced by a condition that are NOT present in the
+ * captured scope. Conservative: skips string-literal contents, keywords, numeric
+ * literals, function/method-call names (`foo(`), and static type calls
+ * (`String.isBlank(x)`, `Math.max(...)`). A dotted reference (`acct.Name`) is
+ * judged only by its root (`acct`) — an absent nested field is a resolved-but-null
+ * comparison, not an unresolved reference. Returning a non-empty list means
+ * "can't honestly evaluate — degrade."
+ */
+function _unresolvedConditionRoots(condition, scope) {
+  const KEYWORDS = new Set(['true', 'false', 'null', 'new', 'instanceof', 'and', 'or', 'not']);
+  const noStr = String(condition)
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""');
+  const missing = [];
+  const seen = new Set();
+  const re = /(^|[^\w.])([A-Za-z_]\w*)/g;
+  let m;
+  while ((m = re.exec(noStr))) {
+    const name = m[2];
+    if (KEYWORDS.has(name) || seen.has(name)) continue;
+    const after = noStr.slice(m.index + m[0].length);
+    if (/^\s*\(/.test(after)) continue;                          // function/method call name
+    if (/^[A-Z]/.test(name) && /^\s*\.\s*[A-Za-z_]\w*\s*\(/.test(after)) continue; // Type.method(...) static call
+    seen.add(name);
+    if (!Object.prototype.hasOwnProperty.call(scope, name)) missing.push(name);
+  }
+  return missing;
+}
+
+/** Note (once per line) that a replay condition couldn't be evaluated. */
+function _noteReplayCondFallback(step, condition, err) {
+  debugState._condNoted = debugState._condNoted || new Set();
+  const key = step.file + ':' + step.line;
+  if (debugState._condNoted.has(key)) return;
+  debugState._condNoted.add(key);
+  addConsoleEntry('info', `⚠ Conditional breakpoint at line ${step.line}: couldn't evaluate "${condition}" from captured org state${err ? ' (' + err + ')' : ''} — pausing to be safe.`);
+}
+
+/** Resolve a dotted path (a.b.c) against a plain variables object. */
+function lookupVarPath(vars, path) {
+  let cur = vars;
+  for (const seg of path.split('.')) {
+    if (cur == null || typeof cur !== 'object' || !(seg in cur)) return undefined;
+    cur = cur[seg];
+  }
+  return cur;
+}
+
+/**
+ * Best-effort parse of an Apex debug-log value string into structured JS so the
+ * Console can render it as an expandable tree. Handles JSON, SObject toString
+ * (Type:{k=v,…}), lists ((a, b, c)), maps/sets ({k=v} / {a, b}). Falls back to
+ * the raw string when the shape isn't cleanly structural. Never throws.
+ */
+function parseApexDebugValue(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (s === '') return '';
+  if ((s[0] === '{' && s[s.length - 1] === '}') || (s[0] === '[' && s[s.length - 1] === ']')) {
+    try { return JSON.parse(s); } catch (_) { /* not JSON — try Apex shapes */ }
+  }
+  try {
+    const structured = parseApexToString(s);
+    if (structured !== undefined) return structured;
+  } catch (_) { /* fall through */ }
+  return s;
+}
+
+function parseApexToString(s) {
+  s = s.trim();
+  const typed = s.match(/^([A-Za-z_][\w.]*)\s*:\s*\{([\s\S]*)\}$/);
+  if (typed) {
+    const obj = parseApexKvBody(typed[2]);
+    return obj === undefined ? undefined : obj;
+  }
+  if (s[0] === '{' && s[s.length - 1] === '}') {
+    const body = s.slice(1, -1);
+    if (body.trim() === '') return {};
+    const obj = parseApexKvBody(body);
+    if (obj !== undefined) return obj;
+    return splitTopLevel(body).map(parseApexScalarOrNested);
+  }
+  if (s[0] === '(' && s[s.length - 1] === ')') {
+    const body = s.slice(1, -1);
+    if (body.trim() === '') return [];
+    return splitTopLevel(body).map(parseApexScalarOrNested);
+  }
+  return undefined;
+}
+
+function parseApexKvBody(body) {
+  const parts = splitTopLevel(body);
+  const obj = {};
+  let any = false;
+  for (const p of parts) {
+    const eq = findTopLevelEquals(p);
+    if (eq < 0) return undefined; // not k=v → treat as a set, not an object
+    const k = p.slice(0, eq).trim();
+    if (!k) return undefined;
+    obj[k] = parseApexScalarOrNested(p.slice(eq + 1).trim());
+    any = true;
+  }
+  return any ? obj : undefined;
+}
+
+function parseApexScalarOrNested(v) {
+  v = v.trim();
+  const nested = parseApexToString(v);
+  if (nested !== undefined) return nested;
+  if (v === 'null') return null;
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  if (/^-?\d+$/.test(v)) return parseInt(v, 10);
+  if (/^-?\d+\.\d+$/.test(v)) return parseFloat(v);
+  return v;
+}
+
+/** Split on top-level commas (not nested in (), {}, []). */
+function splitTopLevel(s) {
+  const out = [];
+  let depth = 0, last = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '{' || c === '[') depth++;
+    else if (c === ')' || c === '}' || c === ']') depth--;
+    else if (c === ',' && depth === 0) { out.push(s.slice(last, i)); last = i + 1; }
+  }
+  out.push(s.slice(last));
+  return out.map(x => x.trim()).filter(x => x !== '');
+}
+
+/** Index of the first top-level single '=' (skips == and =>). */
+function findTopLevelEquals(s) {
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(' || c === '{' || c === '[') depth++;
+    else if (c === ')' || c === '}' || c === ']') depth--;
+    else if (c === '=' && depth === 0) {
+      if (s[i + 1] === '=' || s[i - 1] === '<' || s[i - 1] === '>' || s[i - 1] === '!') { continue; }
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Whether the replay cursor should PAUSE at this step's line. Mirrors Chrome V8:
+ *  - a LOGPOINT never pauses (it prints and execution continues);
+ *  - a CONDITIONAL breakpoint pauses only when its condition is true, evaluated
+ *    against the step's real captured org variables;
+ *  - a PLAIN breakpoint always pauses.
+ * If a condition can't be evaluated from the captured state we pause to be safe
+ * (better to stop than silently skip a breakpoint) and note it once.
+ */
+function replayStepPauses(step) {
   if (!step || !step.file) return false;
-  const bps = debugState.breakpoints.get(step.file);
-  return !!(bps && bps.has(step.line));
+  const bp = activeBreakpoint(step.file, step.line);
+  const d = _bpPauseDecision(bp, step);
+  if (d.unresolved) _noteReplayCondFallback(step, bp.condition, d.error);
+  return d.pause;
+}
+
+/**
+ * Pure pause decision for a breakpoint object at a step. Returns
+ * {pause, unresolved?, error?}. logpoint→never pause; conditional→pause when the
+ * condition is true; unresolved condition→pause to be safe; plain→always pause.
+ */
+function _bpPauseDecision(bp, step) {
+  if (!bp) return { pause: false };
+  if (bp.logMessage) return { pause: false };            // logpoint (incl. conditional): print-only
+  if (!bp.condition) return { pause: true };              // plain breakpoint
+  const r = evalReplayCondition(bp.condition, step);
+  if (!r.evaluated) return { pause: true, unresolved: true, error: r.error };
+  return { pause: !!r.value };
 }
 
 /** Advance the replay cursor forward to the first step matching a predicate. */
@@ -3110,7 +4462,7 @@ async function replayAdvance(predicate, stopAtBreakpoints) {
   const steps = debugState.replayTimeline;
   let i = debugState.replayIndex + 1;
   for (; i < steps.length; i++) {
-    if (stopAtBreakpoints && stepHasBreakpoint(steps[i])) break;
+    if (stopAtBreakpoints && replayStepPauses(steps[i])) break;
     if (predicate(steps[i])) break;
   }
   if (i >= steps.length) {
@@ -3123,9 +4475,54 @@ async function replayAdvance(predicate, stopAtBreakpoints) {
     if (debugState.orgActivity?.returnValue !== undefined) {
       addConsoleEntry('info', `return → ${formatValue(debugState.orgActivity.returnValue)}`);
     }
+    // Be honest about breakpoints/logpoints that never fired because their line
+    // did not run in the real org execution (a common surprise — e.g. a return or
+    // fatal error before them, or a branch that wasn't taken).
+    _reportUnreachedBreakpoints();
     return;
   }
   await replayGoto(i);
+}
+
+/**
+ * After a Continue/step reaches the end of the recorded run, tell the user —
+ * truthfully — about any breakpoint or logpoint they set on a line that the real
+ * org execution never reached, so a breakpoint that "didn't stop" is explained
+ * rather than silently ignored. Only considers files that took part in this run
+ * (unrelated breakpoints elsewhere stay quiet) and reports once per run.
+ */
+function _reportUnreachedBreakpoints() {
+  if (debugState._unreachedReported) return;
+  const notes = _unreachedBreakpointNotes(debugState.breakpoints, debugState._replayLineIndex)
+    .map(n => `${n.kind} at ${(n.file || '').split('/').pop()}:${n.line}`);
+  if (!notes.length) return;
+  debugState._unreachedReported = true;
+  const last = debugState.replayTimeline[debugState.replayTimeline.length - 1];
+  const endedAt = last ? `${(last.file || '').split('/').pop()}:${last.line}` : 'the end';
+  const why = debugState.replayFatalError
+    ? `execution ended early at ${endedAt} — ${debugState.replayFatalError.split('\n')[0]}`
+    : `those lines did not run in this execution (a branch that wasn't taken, a method that wasn't called, or a return before them). Execution ended at ${endedAt}`;
+  addConsoleEntry('info', `⚠ ${notes.join(', ')} ${notes.length > 1 ? 'were' : 'was'} never reached — ${why}. The debugger skipped nothing; this reflects the real org run. Tip: to see a value at a line that DID run, put a logpoint there.`);
+}
+
+/**
+ * Pure: given the breakpoint map (Map<file, Map<line, bp>>) and the executed-line
+ * index (Map<file, Set<line>>) from the replay, return one note per breakpoint/
+ * logpoint whose line did NOT execute — but only for files that participated in
+ * the run (so unrelated breakpoints in other files stay silent). Unit-testable.
+ */
+function _unreachedBreakpointNotes(breakpoints, lineIndex) {
+  const notes = [];
+  if (!lineIndex || !breakpoints || !breakpoints.size) return notes;
+  for (const [file, bps] of breakpoints) {
+    const execLines = lineIndex.get(file);
+    if (!execLines) continue; // this file didn't participate in the run — stay silent
+    for (const [line, bp] of bps) {
+      if (execLines.has(line)) continue; // the line really executed
+      notes.push({ kind: bp && bp.logMessage ? 'Logpoint' : 'Breakpoint', file, line });
+    }
+  }
+  return notes;
 }
 
 async function replayStepInto() { await replayAdvance(() => true, true); }
@@ -3137,6 +4534,27 @@ async function replayStepOver() {
 async function replayStepOut() {
   const depth = debugState.replayTimeline[debugState.replayIndex]?.depth ?? 1;
   await replayAdvance((s) => s.depth < depth, true);
+}
+
+/**
+ * Reverse step — move the replay cursor one recorded statement BACK. This is the
+ * time-travel control: because the whole run is a recorded timeline of REAL org
+ * values, going back is truthful (we re-show the exact state that was recorded at
+ * that step, never re-fabricated). replayGoto's high-water mark ensures recorded
+ * System.debug output is NOT duplicated on the way back; logpoints re-fire only
+ * when you step forward across them again (Chrome-style). Lets the developer walk
+ * backward to find where a value first diverged, then step forward again.
+ */
+async function replayStepBack() {
+  if (debugState.replayIndex <= 0) {
+    window.showToast?.('Already at the first recorded step.', 'info');
+    return;
+  }
+  if (!debugState._steppedBackNoted) {
+    debugState._steppedBackNoted = true;
+    addConsoleEntry('info', '⏪ Stepping back through the recorded timeline — real values at each earlier step. Step forward (F10/F11) to replay again and spot where a value first changed.');
+  }
+  await replayGoto(debugState.replayIndex - 1);
 }
 
 /**
@@ -3670,11 +5088,10 @@ async function executeCurrentStatement() {
 
   debugState.currentLine = nextStmt.line;
 
-  // Check breakpoint
-  const bpKey = debugState.currentFile;
-  if (debugState.breakpoints.has(bpKey) && debugState.breakpoints.get(bpKey).has(nextStmt.line)) {
-    const bpInfo = debugState.breakpoints.get(bpKey).get(nextStmt.line);
-    if (bpInfo && bpInfo.condition) {
+  // Check breakpoint (disabled ones are skipped but kept for later re-enable)
+  const bpInfo = activeBreakpoint(debugState.currentFile, nextStmt.line);
+  if (bpInfo) {
+    if (bpInfo.condition) {
       // Conditional breakpoint — evaluate condition
       const bpScope = { ...(frame.classFields || {}), ...frame.variables };
       const condResult = evaluateExpression(bpInfo.condition, bpScope);
@@ -3789,7 +5206,7 @@ function assignProperty(scope, path, value) {
 
 async function debugContinue() {
   if (!debugState.active) return;
-  if (debugState.engineMode) { engineStep('continue'); return; }
+  if (debugState.engineMode) { engineForwardViaHistory('continue'); engineStep('continue'); return; }
   if (debugState.replayMode) { await replayContinue(); return; }
   debugState.paused = false;
   debugState.stepMode = 'continue';
@@ -3811,7 +5228,7 @@ async function debugContinue() {
 
 async function debugStepOver() {
   if (!debugState.active || !debugState.paused) return;
-  if (debugState.engineMode) { engineStep('over'); return; }
+  if (debugState.engineMode) { if (engineForwardViaHistory('over')) return; engineStep('over'); return; }
   if (debugState.replayMode) { await replayStepOver(); return; }
   debugState.stepMode = 'stepOver';
   debugState.stepDepth = debugState.callStack.length;
@@ -3829,7 +5246,7 @@ async function debugStepOver() {
 
 async function debugStepInto() {
   if (!debugState.active || !debugState.paused) return;
-  if (debugState.engineMode) { engineStep('into'); return; }
+  if (debugState.engineMode) { if (engineForwardViaHistory('into')) return; engineStep('into'); return; }
   if (debugState.replayMode) { await replayStepInto(); return; }
   debugState.stepMode = 'stepInto';
   debugState.stepDepth = debugState.callStack.length;
@@ -3847,7 +5264,7 @@ async function debugStepInto() {
 
 async function debugStepOut() {
   if (!debugState.active || !debugState.paused) return;
-  if (debugState.engineMode) { engineStep('out'); return; }
+  if (debugState.engineMode) { if (engineForwardViaHistory('out')) return; engineStep('out'); return; }
   if (debugState.replayMode) { await replayStepOut(); return; }
   debugState.stepMode = 'stepOut';
   debugState.stepDepth = debugState.callStack.length;
@@ -3875,22 +5292,235 @@ async function debugRestart() {
   await startDebugSession(debugState.entryFile, debugState.entryMethod, params);
 }
 
+/**
+ * Step Back (reverse). Only meaningful in replay mode, where the run is a recorded
+ * timeline that can be re-walked truthfully. In the live interpreter / engine modes
+ * there is no recorded history to reverse into (reversing live execution would mean
+ * un-doing real side effects), so we say so honestly instead of pretending.
+ */
+async function debugStepBack() {
+  if (!debugState.active) return;
+  // Engine history first: if the live interpreter is driving (as it is in "Debug with
+  // Request", even with Live Org on), Step Back walks the captured per-line snapshots.
+  const hasEngineHist = debugState.engineMode
+    && Array.isArray(debugState.engineHistory) && debugState.engineHistory.length > 0;
+  if (hasEngineHist) {
+    await engineStepBack();
+    return;
+  }
+  if (debugState.replayMode) {
+    if (debugState.orgFetching || debugState.orgRunning) return;
+    await replayStepBack();
+    return;
+  }
+  window.showToast?.('Step Back needs a paused run — use ▶ Debug with Request, or turn on ⚡ Live Org for a recorded replay.', 'info');
+}
+
+/**
+ * Reflect the replay cursor position in the toolbar: show "Step N / total" and
+ * enable Step Back only when there is an earlier recorded step to go to. Hidden
+ * entirely outside replay mode (no recorded timeline to scrub).
+ */
+function updateReplayPositionUI() {
+  const back = _$('#dbg-btn-step-back');
+  if (!back) return;
+  // Engine history takes PRECEDENCE over the replay timeline. When the live interpreter
+  // is driving (onEnginePause is capturing real per-line snapshots), Step Back walks
+  // THAT — even when Live Org is on and a replay timeline also exists (which it may,
+  // empty, when the org log came back without step detail). Only a pure replay run with
+  // no engine session falls back to the replay cursor.
+  const hasEngineHist = debugState.active && debugState.engineMode
+    && Array.isArray(debugState.engineHistory) && debugState.engineHistory.length > 0;
+  const inReplay = debugState.active && debugState.replayMode && !hasEngineHist
+    && Array.isArray(debugState.replayTimeline);
+  let canBack = false;
+  if (hasEngineHist) {
+    // View-only redisplay of a captured snapshot — safe whenever the engine is PAUSED.
+    // Background org activity (a parallel Live-Org run/fetch) must NOT block looking back.
+    canBack = debugState.engineHistoryIndex > 0 && !debugState.engineRunning;
+  } else if (inReplay) {
+    const busy = debugState.active && (debugState.orgFetching || debugState.orgRunning);
+    canBack = debugState.replayIndex > 0 && !busy;
+  }
+  back.disabled = !canBack;
+  back.classList.toggle('dbg-busy-disabled', debugState.engineRunning || debugState.orgFetching || debugState.orgRunning);
+  back.title = (hasEngineHist || inReplay)
+    ? 'Step Back (⇧F10) — return to the previous step with the real values captured there'
+    : 'Step Back (⇧F10) — available once a run has paused, so there is an earlier step to return to';
+}
+
 /* ================================================================
    8. BREAKPOINT MANAGEMENT
    ================================================================ */
 
-function toggleBreakpoint(filePath, lineNumber, condition) {
+function toggleBreakpoint(filePath, lineNumber, condition, logMessage) {
   if (!debugState.breakpoints.has(filePath)) {
     debugState.breakpoints.set(filePath, new Map());
   }
   const bps = debugState.breakpoints.get(filePath);
-  if (bps.has(lineNumber) && condition === undefined) {
+  // A bare toggle (no condition/logpoint args) removes an existing breakpoint.
+  if (bps.has(lineNumber) && condition === undefined && logMessage === undefined) {
     bps.delete(lineNumber);
   } else {
-    bps.set(lineNumber, { condition: condition || null });
+    const existing = bps.get(lineNumber) || {};
+    bps.set(lineNumber, {
+      condition: condition || null,
+      logMessage: logMessage || null,
+      // Preserve the enable/disable state across edits; new breakpoints start enabled.
+      enabled: existing.enabled === false ? false : true,
+      // Remember the source line so the panel shows WHAT the breakpoint sits on.
+      snippet: existing.snippet || _lineSnippet(filePath, lineNumber),
+    });
   }
   renderBreakpointDecorations(filePath);
   updateBreakpointsPanel();
+  saveBreakpoints();
+}
+
+/** Remove any breakpoint/logpoint/condition on a line. */
+function removeBreakpoint(filePath, lineNumber) {
+  const bps = debugState.breakpoints.get(filePath);
+  if (bps && bps.has(lineNumber)) {
+    bps.delete(lineNumber);
+    renderBreakpointDecorations(filePath);
+    updateBreakpointsPanel();
+    saveBreakpoints();
+  }
+}
+
+/** The breakpoint at file:line, but ONLY if it is enabled. Disabled breakpoints
+ *  stay stored and visible (so the user can re-enable them, even days later), but
+ *  they never pause, never log, and never affect execution. Used at every
+ *  execution decision site (live engine + replay + local sim). */
+function activeBreakpoint(file, line) {
+  const bps = debugState.breakpoints.get(file);
+  const bp = bps && bps.get(line);
+  return bp && bp.enabled !== false ? bp : null;
+}
+
+/** Best-effort trimmed source text for a line, captured when the file is open so
+ *  the Breakpoints panel can show a code snippet next to each breakpoint. */
+function _lineSnippet(filePath, line) {
+  try {
+    const editor = window.state?.editor;
+    const model = editor && editor.getModel();
+    if (model) {
+      const uri = model.uri;
+      if ((uri.fsPath || uri.path) === filePath || monaco.Uri.file(filePath).toString() === uri.toString()) {
+        return (model.getLineContent(line) || '').trim().slice(0, 140);
+      }
+    }
+  } catch (_) {}
+  return '';
+}
+
+const DBG_BREAKPOINTS_KEY = 'congacode.debug.breakpoints.v1';
+
+/** Persist all breakpoints (condition, logpoint, enabled state, snippet) so they
+ *  survive app restarts — the user keeps their breakpoints across days until they
+ *  explicitly remove them. */
+function saveBreakpoints() {
+  try {
+    const out = {};
+    for (const [file, bpMap] of debugState.breakpoints) {
+      if (!bpMap || !bpMap.size) continue;
+      const lines = {};
+      for (const [line, info] of bpMap) {
+        lines[line] = {
+          condition: info.condition || null,
+          logMessage: info.logMessage || null,
+          enabled: info.enabled === false ? false : true,
+          snippet: info.snippet || '',
+        };
+      }
+      out[file] = lines;
+    }
+    localStorage.setItem(DBG_BREAKPOINTS_KEY, JSON.stringify(out));
+  } catch (_) { /* storage full / unavailable — non-fatal */ }
+}
+
+/** Restore persisted breakpoints on startup, then paint gutter glyphs + panel. */
+function loadBreakpoints() {
+  let data;
+  try { data = JSON.parse(localStorage.getItem(DBG_BREAKPOINTS_KEY) || '{}'); }
+  catch (_) { data = {}; }
+  if (!data || typeof data !== 'object') return;
+  for (const file of Object.keys(data)) {
+    const lines = data[file];
+    if (!lines || typeof lines !== 'object') continue;
+    let bpMap = debugState.breakpoints.get(file);
+    if (!bpMap) { bpMap = new Map(); debugState.breakpoints.set(file, bpMap); }
+    for (const lineStr of Object.keys(lines)) {
+      const line = parseInt(lineStr, 10);
+      if (!Number.isFinite(line)) continue;
+      const info = lines[lineStr] || {};
+      bpMap.set(line, {
+        condition: info.condition || null,
+        logMessage: info.logMessage || null,
+        enabled: info.enabled === false ? false : true,
+        snippet: info.snippet || '',
+      });
+    }
+  }
+  renderAllBreakpointDecorations();
+  updateBreakpointsPanel();
+}
+
+// A minimal, always-available prompt. Electron disables window.prompt() (it
+// silently returns undefined and shows nothing), which is why the old
+// logpoint/condition entry never appeared — so we use the app's in-DOM modal.
+function _askInput(title, message, initial) {
+  if (typeof window !== 'undefined' && typeof window.showInputDialog === 'function') {
+    return window.showInputDialog(title, message, initial || '');
+  }
+  return Promise.resolve(null);
+}
+
+/**
+ * Add or edit a CONDITIONAL breakpoint on a line (Chrome-style). The debugger
+ * pauses here only when the Apex expression is true, evaluated against the real
+ * captured org variables at that line. Empty input clears the condition (keeps a
+ * plain breakpoint / any logpoint). Cancel leaves everything unchanged.
+ */
+async function editConditionalBreakpoint(filePath, line) {
+  const cur = debugState.breakpoints.get(filePath)?.get(line) || null;
+  const c = await _askInput(
+    'Conditional Breakpoint',
+    "Pause here only when this Apex expression is true — e.g.  quantity > 5  or  acct.Name == 'Acme'. Leave empty to clear the condition.",
+    cur?.condition || ''
+  );
+  if (c === null) return; // cancelled
+  const cond = c.trim() || null;
+  if (!cond && !cur?.logMessage) {
+    // No condition and no logpoint → fall back to a plain breakpoint so the line
+    // still stops (never silently drop the user's breakpoint).
+    if (cur) toggleBreakpoint(filePath, line, null, null);
+    else toggleBreakpoint(filePath, line);
+    return;
+  }
+  toggleBreakpoint(filePath, line, cond, cur?.logMessage || null);
+}
+
+/**
+ * Add or edit a LOGPOINT on a line (Chrome-style). A logpoint PRINTS a message
+ * and never pauses. Wrap variables in { } to interpolate real captured values,
+ * e.g.  startTime={startTime}  or  cart id={cart.Id}. Empty input removes the
+ * logpoint (keeping a plain/conditional breakpoint if one exists).
+ */
+async function editLogpoint(filePath, line) {
+  const cur = debugState.breakpoints.get(filePath)?.get(line) || null;
+  const m = await _askInput(
+    'Logpoint',
+    'Expression or message to log (Chrome-style). A variable name like  logger  or  cart.Id  prints its VALUE (objects expand). Inside a sentence, wrap variables in { }, e.g.  count={count}. Leave empty to remove.',
+    cur?.logMessage || ''
+  );
+  if (m === null) return; // cancelled
+  if (m.trim() === '') {
+    if (cur?.condition) toggleBreakpoint(filePath, line, cur.condition, null); // keep conditional bp
+    else removeBreakpoint(filePath, line);
+    return;
+  }
+  toggleBreakpoint(filePath, line, cur?.condition || null, m);
 }
 
 function renderBreakpointDecorations(filePath) {
@@ -3910,13 +5540,22 @@ function renderBreakpointDecorations(filePath) {
 
   if (bps) {
     for (const [line, bpInfo] of bps) {
-      const isCond = bpInfo && bpInfo.condition;
+      const isLog = !!(bpInfo && bpInfo.logMessage);
+      const isCond = !!(bpInfo && bpInfo.condition);
+      const disabled = bpInfo && bpInfo.enabled === false;
+      let cls = isLog ? 'debug-logpoint' : isCond ? 'debug-breakpoint-conditional' : 'debug-breakpoint';
+      if (disabled) cls += ' debug-breakpoint-disabled';
+      const kind = isLog ? 'Logpoint' : isCond ? 'Conditional breakpoint' : 'Breakpoint';
+      const detail = isLog
+        ? `Logpoint: ${bpInfo.logMessage}${isCond ? ` (when ${bpInfo.condition})` : ''}`
+        : isCond ? `Conditional breakpoint: ${bpInfo.condition}` : 'Breakpoint';
+      const hover = disabled ? `${kind} (disabled) — ${detail}` : detail;
       newDecos.push({
         range: new monaco.Range(line, 1, line, 1),
         options: {
           isWholeLine: false,
-          glyphMarginClassName: isCond ? 'debug-breakpoint-conditional' : 'debug-breakpoint',
-          glyphMarginHoverMessage: { value: isCond ? `Conditional: ${bpInfo.condition}` : 'Breakpoint' },
+          glyphMarginClassName: cls,
+          glyphMarginHoverMessage: { value: hover },
           stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
         }
       });
@@ -3970,6 +5609,71 @@ function clearCurrentLineHighlight() {
 }
 
 /**
+ * Mark the EXACT line an exception was thrown on (and every frame of the failing
+ * call chain that lives in the file currently on screen) so the user can see —
+ * right on the code — which file/line threw and why. The throw site gets a red
+ * band, a 💥 glyph, and inline end-of-line text with the exception message; other
+ * frames of the chain get a subtler amber marker. Reapplied after each navigation.
+ */
+function paintExceptionMarkers() {
+  const editor = window.state?.editor;
+  clearExceptionMarkers();
+  if (!editor || !debugState.active || !debugState.exceptionInfo) return;
+  const model = editor.getModel && editor.getModel();
+  const info = debugState.exceptionInfo;
+  const openFile = debugState.currentFile;
+  if (!openFile || !info.stack || !info.stack.length) return;
+  const label = `${info.type || 'Exception'}: ${info.message || ''}`.trim();
+  const throwSite = info.stack[0] || {};
+  const throwName = (throwSite.file || '').split('/').pop() || throwSite.file || '';
+  const decos = [];
+  const seen = new Set();
+  info.stack.forEach((f, idx) => {
+    if (!f.file || !f.line || f.file !== openFile) return;
+    if (seen.has(f.line)) return;
+    seen.add(f.line);
+    const isThrow = idx === 0;
+    const hover = isThrow
+      ? `**💥 ${label}**\n\nThrown here — \`${f.className}.${f.methodName}\`, line ${f.line}.`
+      : `**↳ In the failing call chain**\n\nThis call led to **${label}**, thrown at \`${throwName}:${throwSite.line}\`.`;
+    // 1) Whole-line band + glyph + hover.
+    decos.push({
+      range: new monaco.Range(f.line, 1, f.line, 1),
+      options: {
+        isWholeLine: true,
+        className: isThrow ? 'debug-exception-line' : 'debug-exception-chain-line',
+        glyphMarginClassName: isThrow ? 'debug-exception-glyph' : 'debug-exception-chain-glyph',
+        glyphMarginHoverMessage: { value: hover },
+        hoverMessage: { value: hover },
+        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      }
+    });
+    // 2) End-of-line inline message (error-lens style) — rendered AFTER the last
+    //    column so it never shifts the actual code.
+    const endCol = model ? model.getLineMaxColumn(f.line) : 1;
+    decos.push({
+      range: new monaco.Range(f.line, endCol, f.line, endCol),
+      options: {
+        after: {
+          content: isThrow ? `    💥 ${label}` : `    ↳ threw at ${throwName}:${throwSite.line}`,
+          inlineClassName: isThrow ? 'debug-exception-inline' : 'debug-exception-chain-inline',
+        },
+        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      }
+    });
+  });
+  if (decos.length) debugState.exceptionDecoration = editor.deltaDecorations([], decos);
+}
+
+function clearExceptionMarkers() {
+  const editor = window.state?.editor;
+  if (editor && debugState.exceptionDecoration && debugState.exceptionDecoration.length) {
+    editor.deltaDecorations(debugState.exceptionDecoration, []);
+  }
+  debugState.exceptionDecoration = [];
+}
+
+/**
  * Follow the interpreter as it executes, so the user can SEE where execution
  * currently is — even when it steps into another class file. We open the
  * executing file (if different from the one on screen), reveal the line, and
@@ -3981,6 +5685,12 @@ function clearCurrentLineHighlight() {
 function followExecutingLine(info) {
   if (!info || !debugState.active) return;
   debugState._execPending = info;
+  // Persist "where execution is right now" so the clickable query banner can jump
+  // there even while the engine is blocked awaiting an on-demand org query (no new
+  // onExecLine fires until the query returns). Cleared only on stop/full reset —
+  // NOT in clearExecutingLineHighlight — so it survives across pauses/queries.
+  debugState._execCurrentFile = info.file || debugState._execCurrentFile;
+  debugState._execCurrentLine = info.line || debugState._execCurrentLine;
   if (debugState._execThrottled) return;
   flushExecFollow();
   debugState._execThrottled = true;
@@ -3998,7 +5708,7 @@ async function flushExecFollow() {
   if (!i || !debugState.active || debugState.paused) return;
   debugState._execShownLine = i.line;
   debugState._execShownFile = i.file;
-  await revealExecutingLocation(i.line, i.file);
+  await revealExecutingLocation(i.line, i.file, i.stack);
 }
 
 /**
@@ -4008,31 +5718,281 @@ async function flushExecFollow() {
  * indicator instead. Only a PAUSE (breakpoint, step, exception) may open files
  * (that's handled by onEnginePause, not here).
  */
-async function revealExecutingLocation(line, file) {
+async function revealExecutingLocation(line, file, stack) {
   const editor = window.state?.editor;
   if (!editor || !debugState.active || debugState.paused || !line) return;
-  if (file && file !== debugState.currentFile && /\.(cls|trigger)$/.test(file)) {
-    // Execution has moved to a different file — do NOT open it automatically.
-    // Show a non-intrusive status indicator so the user knows where execution is.
-    const shortName = file.split('/').pop() || file;
-    const msg = debugState.orgFetching
-      ? `⏳ waiting for org… ${shortName}:${line}`
-      : `Running… ${shortName}:${line}`;
-    _updateExecStatus(msg);
+
+  // Execution is "here, on screen" only when the TOP frame's line is in the file
+  // the user has open AND actually visible in the viewport. Otherwise execution
+  // has descended into a call — a DIFFERENT file, OR the SAME file scrolled away
+  // (e.g. stepping into getConfigRequest() whose body lives elsewhere in this
+  // very file). In both cases we keep the nearest VISIBLE ancestor call-site lit
+  // as "in progress" so the parent line (e.g. line 3138) blinks while its child
+  // call runs, instead of the highlight silently vanishing off-screen.
+  const onScreen = file === debugState.currentFile && _lineIsVisible(editor, line);
+  if (onScreen) {
+    _stopInProgressTimer();
+    // Progress/query text lives ONLY in the yellow banner + the in-editor band —
+    // never echoed onto the toolbar exec-status pill (avoids the duplicate the
+    // user flagged and keeps the toolbar width stable).
+    _updateExecStatus(null);
+    if (!debugState.active || debugState.paused) return;
+    highlightExecutingLine(line, file);
+    // Intentionally NO scroll here: free-running execution must never move the
+    // user's viewport. Only an explicit PAUSE may reveal an off-screen line.
     return;
   }
-  _updateExecStatus(null); // on the visible file — clear any "running elsewhere" text
-  if (!debugState.active || debugState.paused) return;
-  highlightExecutingLine(line, file);
-  try { editor.revealLineInCenterIfOutsideViewport(line); } catch (_) { /* ignore */ }
+
+  const shortName = (file || '').split('/').pop() || file || '';
+  // Do NOT mirror "Running… file:line" / "waiting for org…" onto the toolbar pill.
+  // The nearest VISIBLE ancestor line already shows the live in-progress band
+  // (elapsed timer + what it's waiting on), and org fetches show the yellow banner.
+  _updateExecStatus(null);
+  const anc = _findVisibleAncestor(editor, stack);
+  if (anc) {
+    _paintInProgressLine(anc.line, shortName, line);
+  } else if (!debugState._inProgCtx) {
+    // No visible ancestor AND no parent loader already up → clear any stale band.
+    // If a loader IS up, keep it frozen (a transient hop with no visible ancestor,
+    // e.g. a System.*/Label resolution, must not make it flicker — reads as a jump).
+    _clearExecBandOnly();
+  }
 }
 
-/** Update the exec-status span in the debug toolbar. Pass null to hide it. */
-function _updateExecStatus(text) {
+/** True when `line` is currently within the editor's visible viewport. Falls
+ *  back to true if the range can't be determined (safe default = normal paint). */
+function _lineIsVisible(editor, line) {
+  try {
+    const ranges = editor.getVisibleRanges ? editor.getVisibleRanges() : null;
+    if (!ranges || !ranges.length) return true;
+    for (const r of ranges) {
+      if (line >= r.startLineNumber && line <= r.endLineNumber) return true;
+    }
+    return false;
+  } catch (_) { return true; }
+}
+
+/** Walk the engine's live stack (bottom-first {file,line} frames) from the TOP
+ *  (nearest execution) down, and return the first frame that is in the file on
+ *  screen AND whose call-site line is currently VISIBLE — i.e. the closest parent
+ *  call-site the user can actually see while execution runs deeper (in this file
+ *  or another). Returns null if no such visible ancestor exists. */
+function _findVisibleAncestor(editor, stack) {
+  if (!Array.isArray(stack) || !debugState.currentFile) return null;
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const f = stack[i];
+    if (f && f.file === debugState.currentFile && f.line && _lineIsVisible(editor, f.line)) return f;
+  }
+  return null;
+}
+
+/** Paint an ancestor call-site line as "in progress": amber loading band +
+ *  gutter progress dot + an end-of-line elapsed timer showing how long the
+ *  descended call has been running and what it's waiting on. A ~400ms interval
+ *  keeps the elapsed time ticking until execution returns to this file. */
+function _paintInProgressLine(ancLine, offFile, offLine) {
+  if (debugState._inProgLine !== ancLine) {
+    debugState._inProgStart = Date.now();
+    debugState._inProgLine = ancLine;
+  }
+  debugState._inProgCtx = { ancLine, offFile, offLine };
+  _renderInProgress();
+  if (!debugState._inProgTimer) {
+    debugState._inProgTimer = setInterval(() => {
+      if (!debugState.active || debugState.paused || !debugState._inProgCtx) { _stopInProgressTimer(); return; }
+      _renderInProgress();
+    }, 150);
+  }
+}
+
+function _renderInProgress() {
+  const editor = window.state?.editor;
+  const ctx = debugState._inProgCtx;
+  if (!editor || !ctx || !debugState.active || debugState.paused) return;
+  const model = editor.getModel ? editor.getModel() : null;
+  const elapsedMs = Date.now() - (debugState._inProgStart || Date.now());
+  const secs = (elapsedMs / 1000).toFixed(1);
+  let detail;
+  if (debugState.orgFetching && debugState.currentQueryText) {
+    const q = debugState.currentQueryText.length > 54 ? debugState.currentQueryText.slice(0, 54) + '…' : debugState.currentQueryText;
+    detail = `waiting on org · ${q}`;
+  } else {
+    detail = `↓ inside ${ctx.offFile}:${ctx.offLine}`;
+  }
+  // Indeterminate moving progress bar (we don't know the total, so a sweeping
+  // cursor communicates "working" without faking a percentage).
+  const slots = 12;
+  const pos = Math.floor(elapsedMs / 120) % slots;
+  let bar = '';
+  for (let k = 0; k < slots; k++) bar += (k === pos || k === (pos + 1) % slots) ? '█' : '░';
+  const endCol = model ? model.getLineMaxColumn(ctx.ancLine) : 1;
+  const decos = [
+    {
+      range: new monaco.Range(ctx.ancLine, 1, ctx.ancLine, 1),
+      options: {
+        isWholeLine: true,
+        className: 'debug-inprogress-band',
+        glyphMarginClassName: 'debug-inprogress-glyph',
+        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      }
+    },
+    {
+      range: new monaco.Range(ctx.ancLine, endCol, ctx.ancLine, endCol),
+      options: {
+        after: { content: `   ⏳ ${bar}  ${secs}s · ${detail}`, inlineClassName: 'debug-inprogress-inline' },
+        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+      }
+    },
+  ];
+  debugState.execLineDecoration = editor.deltaDecorations(debugState.execLineDecoration || [], decos);
+}
+
+function _stopInProgressTimer() {
+  if (debugState._inProgTimer) { clearInterval(debugState._inProgTimer); debugState._inProgTimer = null; }
+  debugState._inProgLine = null;
+  debugState._inProgStart = null;
+  debugState._inProgCtx = null;
+}
+
+/** Remove just the executing-line band/decoration (keep the status pill + any
+ *  pending/throttle state) and stop the in-progress timer. */
+function _clearExecBandOnly() {
+  const editor = window.state?.editor;
+  _stopInProgressTimer();
+  if (editor && debugState.execLineDecoration && debugState.execLineDecoration.length > 0) {
+    editor.deltaDecorations(debugState.execLineDecoration, []);
+    debugState.execLineDecoration = [];
+  }
+}
+
+/** Update the exec-status span in the debug toolbar. Pass null to hide it.
+ *  Optional onClick makes the pill a clickable link (e.g. "open paused file").
+ *  isError renders it as a red error pill (used for exception pauses). */
+function _updateExecStatus(text, onClick, isError) {
   const el = _$('#dbg-exec-status');
   if (!el) return;
   el.textContent = text || '';
   el.style.display = text ? '' : 'none';
+  el._onClick = (text && typeof onClick === 'function') ? onClick : null;
+  el.classList.toggle('clickable', !!el._onClick);
+  el.classList.toggle('error', !!(text && isError));
+}
+
+/**
+ * Enable/disable the stepping controls based on whether the engine is busy.
+ * While running or querying the org, Continue / Step Over / Step Into / Step Out /
+ * Restart are disabled so the user can SEE that work is in progress and can't
+ * queue conflicting commands. Stop stays enabled so a hang can always be aborted.
+ */
+function setDebugBusyUI() {
+  const busy = debugState.active && (debugState.engineRunning || debugState.orgFetching || debugState.orgRunning);
+  for (const id of ['dbg-btn-continue', 'dbg-btn-step-over', 'dbg-btn-step-into', 'dbg-btn-step-out', 'dbg-btn-restart']) {
+    const b = _$('#' + id);
+    if (b) { b.disabled = busy; b.classList.toggle('dbg-busy-disabled', busy); }
+  }
+  const stop = _$('#dbg-btn-stop');
+  if (stop) stop.disabled = !debugState.active;
+  const bar = _$('#debug-toolbar') || _$('.dbg-toolbar');
+  if (bar) bar.classList.toggle('dbg-busy', busy);
+  updateReplayPositionUI();
+}
+
+/* ----------------------------------------------------------------
+   Draggable, position-persistent debug toolbar.
+   The bar is LEFT-anchored (not centre-anchored) so that when its status text
+   grows or shrinks the extra width extends to the RIGHT — the step buttons on
+   the left never move, so the user can't accidentally click the wrong one. The
+   user can also drag it anywhere by the "⠿ DEBUGGING" grip, and the position is
+   remembered across sessions.
+   ---------------------------------------------------------------- */
+const DBG_TOOLBAR_POS_KEY = 'congacode.dbgToolbarPos';
+
+function _clampToolbarPos(left, top, el) {
+  const w = el.offsetWidth || 320;
+  const h = el.offsetHeight || 36;
+  const maxLeft = Math.max(4, window.innerWidth - w - 4);
+  const maxTop = Math.max(4, window.innerHeight - h - 4);
+  return {
+    left: Math.min(Math.max(4, left), maxLeft),
+    top: Math.min(Math.max(4, top), maxTop),
+  };
+}
+
+/** Place the toolbar: honour the saved (dragged) position if present, otherwise
+ *  centre it once horizontally and then LEFT-anchor it in px so it never
+ *  re-centres and shifts the buttons when its content width changes. */
+function positionDebugToolbar() {
+  const bar = _$('#debug-toolbar');
+  if (!bar || bar.classList.contains('hidden')) return;
+  let pos = null;
+  try { pos = JSON.parse(localStorage.getItem(DBG_TOOLBAR_POS_KEY) || 'null'); } catch (_) {}
+  if (!pos || typeof pos.left !== 'number' || typeof pos.top !== 'number') {
+    const w = bar.offsetWidth || 320;
+    pos = { left: Math.round((window.innerWidth - w) / 2), top: 36 };
+  }
+  pos = _clampToolbarPos(pos.left, pos.top, bar);
+  bar.style.left = pos.left + 'px';
+  bar.style.top = pos.top + 'px';
+  bar.style.transform = 'none';
+}
+
+function initDebugToolbarDrag() {
+  const bar = _$('#debug-toolbar');
+  const handle = _$('#dbg-drag-handle');
+  if (!bar || !handle || bar._dragWired) return;
+  bar._dragWired = true;
+  let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+  const onMove = (e) => {
+    if (!dragging) return;
+    const p = _clampToolbarPos(startLeft + (e.clientX - startX), startTop + (e.clientY - startY), bar);
+    bar.style.left = p.left + 'px';
+    bar.style.top = p.top + 'px';
+    bar.style.transform = 'none';
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    bar.classList.remove('dragging');
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    try {
+      localStorage.setItem(DBG_TOOLBAR_POS_KEY, JSON.stringify({
+        left: parseInt(bar.style.left, 10) || 0,
+        top: parseInt(bar.style.top, 10) || 0,
+      }));
+    } catch (_) {}
+  };
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    // Anchor in px from the current on-screen rect before dragging so the first
+    // move doesn't jump (the CSS default uses a centre transform).
+    const rect = bar.getBoundingClientRect();
+    startLeft = rect.left; startTop = rect.top;
+    bar.style.left = startLeft + 'px';
+    bar.style.top = startTop + 'px';
+    bar.style.transform = 'none';
+    startX = e.clientX; startY = e.clientY;
+    dragging = true;
+    bar.classList.add('dragging');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  // Double-click the grip to reset back to the default centred position.
+  handle.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    try { localStorage.removeItem(DBG_TOOLBAR_POS_KEY); } catch (_) {}
+    positionDebugToolbar();
+  });
+
+  // Keep it on-screen if the window is resized.
+  window.addEventListener('resize', () => {
+    if (bar.classList.contains('hidden')) return;
+    const p = _clampToolbarPos(parseInt(bar.style.left, 10) || 0, parseInt(bar.style.top, 10) || 36, bar);
+    bar.style.left = p.left + 'px';
+    bar.style.top = p.top + 'px';
+  });
 }
 
 /**
@@ -4042,6 +6002,10 @@ function _updateExecStatus(text) {
 function _refreshExecDecoration() {
   const editor = window.state?.editor;
   if (!editor || !debugState.active || debugState.paused) return;
+  // If a parent call-site "in progress" band is up (execution descended off the
+  // viewport), that renderer OWNS the exec decoration — just refresh it (so the
+  // org-query text updates) instead of repainting at the off-screen child line.
+  if (debugState._inProgCtx) { _renderInProgress(); return; }
   if (!debugState.execLineDecoration || !debugState.execLineDecoration.length) return;
   const line = debugState._execShownLine || debugState.currentLine;
   const file = debugState._execShownFile || debugState.currentFile;
@@ -4050,12 +6014,15 @@ function _refreshExecDecoration() {
   const cls = debugState.orgFetching
     ? 'debug-executing-line debug-executing-line-loading'
     : 'debug-executing-line';
+  const glyph = debugState.orgFetching
+    ? 'debug-executing-arrow debug-executing-arrow-loading'
+    : 'debug-executing-arrow';
   debugState.execLineDecoration = editor.deltaDecorations(debugState.execLineDecoration, [{
     range: new monaco.Range(line, 1, line, 1),
     options: {
       isWholeLine: true,
       className: cls,
-      glyphMarginClassName: 'debug-executing-arrow',
+      glyphMarginClassName: glyph,
       stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
     }
   }]);
@@ -4074,13 +6041,16 @@ function highlightExecutingLine(line, file) {
   const cls = debugState.orgFetching
     ? 'debug-executing-line debug-executing-line-loading'
     : 'debug-executing-line';
+  const glyph = debugState.orgFetching
+    ? 'debug-executing-arrow debug-executing-arrow-loading'
+    : 'debug-executing-arrow';
   debugState.execLineDecoration = editor.deltaDecorations([], [
     {
       range: new monaco.Range(line, 1, line, 1),
       options: {
         isWholeLine: true,
         className: cls,
-        glyphMarginClassName: 'debug-executing-arrow',
+        glyphMarginClassName: glyph,
         stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
       }
     }
@@ -4094,6 +6064,7 @@ function clearExecutingLineHighlight() {
   debugState._execPending = null;
   debugState._execShownLine = null;
   debugState._execShownFile = null;
+  _stopInProgressTimer(); // issue 3: kill the parent call-site elapsed timer
   _updateExecStatus(null); // also clear the "running elsewhere" status text
   if (!editor) return;
   if (debugState.execLineDecoration && debugState.execLineDecoration.length > 0) {
@@ -4105,7 +6076,48 @@ function clearExecutingLineHighlight() {
 function navigateToLine(line) {
   const editor = window.state?.editor;
   if (!editor || !line) return;
-  editor.revealLineInCenter(line);
+  // Only scroll if the target line is off-screen, so same-method stepping
+  // (e.g. 12 → 13 → 14, all visible) never jumps the viewport around.
+  try { editor.revealLineInCenterIfOutsideViewport(line); } catch (_) { editor.revealLineInCenter(line); }
+}
+
+// Reveal + highlight the paused line, correctly handling a just-switched file.
+// When Step Into/Over/Out crosses into another file, window.openFile() sets a NEW
+// Monaco model synchronously, but the editor still needs a layout pass before
+// revealLineInCenter() takes effect — a reveal fired in the same tick is silently
+// dropped and the file stays scrolled to the TOP (the exact bug: stepping into a
+// method opened the file but never scrolled to the yellow line; only clicking the
+// call-stack frame — which defers via navigateToFile — landed on it). So on a file
+// switch we defer to the next frames and FORCE-center; same-file stepping stays
+// synchronous and only scrolls when the line is off-screen.
+function revealPauseLocation(line, switchedFile) {
+  const editor = window.state?.editor;
+  if (!editor || !line) return;
+  const paint = () => {
+    highlightCurrentLine();
+    paintExceptionMarkers();
+    try { renderBreakpointDecorations(debugState.currentFile); } catch (_) { /* decorations are best-effort */ }
+  };
+  if (!switchedFile) {
+    paint();
+    navigateToLine(line);
+    return;
+  }
+  // New model → wait for layout. Two rAFs guarantee a full layout cycle across
+  // machines/refresh rates; a setTimeout fallback covers a backgrounded window
+  // where rAF is throttled. Force-center because the whole viewport changed.
+  let done = false;
+  const reveal = () => {
+    if (done) return;
+    done = true;
+    paint();
+    try { editor.revealLineInCenter(line); }
+    catch (_) { try { editor.revealLineInCenterIfOutsideViewport(line); } catch (_) { /* editor gone */ } }
+  };
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => requestAnimationFrame(reveal));
+  }
+  setTimeout(reveal, 60);
 }
 
 async function navigateToFile(filePath, line) {
@@ -4115,6 +6127,7 @@ async function navigateToFile(filePath, line) {
   setTimeout(() => {
     renderBreakpointDecorations(filePath);
     highlightCurrentLine();
+    paintExceptionMarkers();
     navigateToLine(line);
   }, 50);
 }
@@ -4123,9 +6136,41 @@ async function navigateToFile(filePath, line) {
    10. CONSOLE LOG
    ================================================================ */
 
-function addConsoleEntry(type, message, line) {
-  debugState.consoleLog.push({ type, message, line, time: new Date() });
-  renderConsolePanel();
+// Console holds USER-FACING output only (Chrome-style): real errors, the user's
+// own System.debug prints (local-sim), logpoint output, console evals, and the
+// method's return value. EVERYTHING else — SOQL, DML, describes, branch/loop
+// traces, status/info, warnings, and the org's captured debug log (deployed +
+// framework System.debug, which is noise) — is org/engine activity routed to
+// debugState.orgLog and shown in the ⚡ Org & Log tab, so the Console stays clean
+// until there's an error or the user explicitly asks for output.
+const CONSOLE_ENTRY_TYPES = new Set(['debug', 'result', 'result-json', 'eval', 'error']);
+
+function addConsoleEntry(type, message, line, value) {
+  const rec = { type, message, line, value, time: new Date() };
+  // Mirror to the DevTools console so the main process can capture the debugger's
+  // output — including failures — to a log file (no manual copy-paste needed).
+  try {
+    const fn = type === 'error' ? 'error' : type === 'warn' ? 'warn' : type === 'info' ? 'info' : 'log';
+    console[fn](`[CCDBG:${type}]`, typeof message === 'string' ? message : formatValue(message));
+  } catch (_) { /* console mirror must never break the debugger */ }
+  if (CONSOLE_ENTRY_TYPES.has(type)) {
+    debugState.consoleLog.push(rec);
+    renderConsolePanel();
+  } else {
+    debugState.orgLog.push(rec);
+    scheduleOrgActivityRender();
+  }
+}
+
+// Coalesce Org-tab re-renders so a burst of activity log lines (a live run can
+// emit dozens) repaints once per frame instead of rebuilding the panel per line.
+let _orgRenderScheduled = false;
+function scheduleOrgActivityRender() {
+  if (_orgRenderScheduled) return;
+  _orgRenderScheduled = true;
+  const run = () => { _orgRenderScheduled = false; renderOrgActivityPanel(); };
+  if (typeof window !== 'undefined' && window.requestAnimationFrame) window.requestAnimationFrame(run);
+  else setTimeout(run, 16);
 }
 
 function formatValue(val) {
@@ -4207,6 +6252,10 @@ function showDebugUI() {
   debugState.debugPanelVisible = true;
   _$('#debug-toolbar')?.classList.remove('hidden');
   _$('#debug-panel')?.classList.remove('hidden');
+  // Make the toolbar draggable and restore its remembered (or centred) position.
+  initDebugToolbarDrag();
+  positionDebugToolbar();
+  requestAnimationFrame(positionDebugToolbar);
   // Enable glyphMargin
   window.state?.editor?.updateOptions({ glyphMargin: true });
   // Trigger layout so editor shrinks above the panel
@@ -4278,9 +6327,10 @@ function applyUserOverridesToStack() {
 
 /** Commit a user-entered value for a variable, update the live context, refresh UI. */
 window._dbgCommitVar = function (scopeType, key, rawValue) {
+  const sel = selectedFrameIndex();
   const frame = scopeType === 'closure'
-    ? debugState.callStack[debugState.callStack.length - 2]
-    : debugState.callStack[debugState.callStack.length - 1];
+    ? debugState.callStack[sel - 1]
+    : debugState.callStack[sel];
   if (!frame) return;
   const value = parseUserInputValue(rawValue);
   const target = scopeType === 'field' ? (frame.classFields || (frame.classFields = {})) : frame.variables;
@@ -4294,9 +6344,10 @@ window._dbgCommitVar = function (scopeType, key, rawValue) {
 
 /** Clear a user override for a variable and re-render. */
 window._dbgClearVarOverride = function (scopeType, key) {
+  const sel = selectedFrameIndex();
   const frame = scopeType === 'closure'
-    ? debugState.callStack[debugState.callStack.length - 2]
-    : debugState.callStack[debugState.callStack.length - 1];
+    ? debugState.callStack[sel - 1]
+    : debugState.callStack[sel];
   if (!frame) return;
   const storeScope = scopeType === 'field' ? 'field' : 'local';
   delete debugState.userOverrides[overrideKey(frame.className, storeScope, key)];
@@ -4328,13 +6379,24 @@ function renderVariablesPanel() {
   const container = _$('#dbg-variables-body');
   if (!container) return;
 
-  const frame = debugState.callStack[debugState.callStack.length - 1];
+  const selIdx = selectedFrameIndex();
+  const topIdx = debugState.callStack.length - 1;
+  const frame = debugState.callStack[selIdx];
   if (!frame) {
     container.innerHTML = '<div class="dbg-empty">No active frame</div>';
     return;
   }
 
   let html = '';
+
+  // When viewing a CALLER frame (not the executing one), say so and offer a jump
+  // back — so the scope on screen is never mistaken for the live execution point.
+  if (selIdx !== topIdx) {
+    html += `<div class="dbg-frame-banner">`
+      + `Viewing caller <b>${_esc(frame.className || '')}${frame.methodName ? '.' + _esc(frame.methodName) : ''}()</b> — not the current line`
+      + `<button class="dbg-frame-return" onclick="window._dbgSelectFrame(${topIdx})">↩ back to current</button>`
+      + `</div>`;
+  }
 
   // --- Local Variables section ---
   const vars = frame.variables;
@@ -4360,9 +6422,9 @@ function renderVariablesPanel() {
     html += '</div>';
   }
 
-  // --- Closure / Parent Scope section (for stepped-into methods) ---
-  if (debugState.callStack.length > 1) {
-    const parentFrame = debugState.callStack[debugState.callStack.length - 2];
+  // --- Closure / Parent Scope section (the frame that called this one) ---
+  if (selIdx > 0) {
+    const parentFrame = debugState.callStack[selIdx - 1];
     html += '<div class="dbg-scope-section collapsed">';
     html += `<div class="dbg-scope-header" onclick="this.parentElement.classList.toggle('collapsed')">▶ Closure (${_esc(parentFrame.className)}.${_esc(parentFrame.methodName)})</div>`;
     for (const key of Object.keys(parentFrame.variables)) {
@@ -4383,7 +6445,7 @@ function renderWatchPanel() {
     return;
   }
 
-  const frame = debugState.callStack[debugState.callStack.length - 1];
+  const frame = debugState.callStack[selectedFrameIndex()];
   const watchScope = frame ? { ...(frame.classFields || {}), ...frame.variables } : {};
 
   let html = '';
@@ -4499,69 +6561,162 @@ window._dbgToggleVar = function(headerEl) {
   }
 };
 
+/** A signature for the current execution stop. Frame selection (clicking a caller
+ *  in the Call Stack) persists only while this stays the same; as soon as execution
+ *  moves (step / replay-goto / new pause) the selection auto-resets to the top
+ *  (currently-executing) frame, exactly like Chrome DevTools. */
+function _execSig() {
+  return [
+    debugState.replayMode ? debugState.replayIndex : -1,
+    debugState.currentLine,
+    debugState.callStack.length,
+  ].join(':');
+}
+
+/** The index of the frame the panels should show: the user-selected frame while it
+ *  is still valid for this stop, otherwise the top (executing) frame. */
+function selectedFrameIndex() {
+  const top = debugState.callStack.length - 1;
+  if (top < 0) return -1;
+  if (debugState.currentFrame == null) return top;
+  if (debugState._frameSelSig !== _execSig()) { debugState.currentFrame = null; return top; }
+  const i = debugState.currentFrame;
+  return (i >= 0 && i <= top) ? i : top;
+}
+
 function renderCallStackPanel() {
   const container = _$('#dbg-callstack-body');
   if (!container) return;
 
-  if (debugState.callStack.length === 0) {
-    container.innerHTML = '<div class="dbg-empty">No active call stack</div>';
+  const stack = debugState.callStack;
+  if (!stack || stack.length === 0) {
+    container.innerHTML = '<div class="dbg-empty">No active call stack — start a debug run to see the execution path.</div>';
     return;
   }
 
-  let html = '';
-  if (debugState.callStack.length > 1) {
-    html += '<div class="dbg-stack-hint">⇧F11 to step out and return to caller</div>';
+  const topIdx = stack.length - 1;
+  const selIdx = selectedFrameIndex();
+
+  // Header: how deep the call chain is right now (answers "how many levels").
+  let html = `<div class="dbg-stack-head">`
+    + `<span class="dbg-stack-head-title">Call stack</span>`
+    + `<span class="dbg-stack-head-count">${stack.length} ${stack.length === 1 ? 'level' : 'levels'} deep</span>`
+    + `</div>`;
+  if (stack.length > 1) {
+    html += '<div class="dbg-stack-hint">Click a frame to open its file and inspect its variables · ⇧F11 steps out to the caller</div>';
   }
-  for (let i = debugState.callStack.length - 1; i >= 0; i--) {
-    const frame = debugState.callStack[i];
-    const currentStmt = frame.statements[frame.pc];
+
+  // Top-first (current execution at the top, its callers below) — Chrome order.
+  for (let i = topIdx; i >= 0; i--) {
+    const frame = stack[i];
+    const currentStmt = frame.statements && frame.statements[frame.pc];
     const line = currentStmt ? currentStmt.line : frame.line;
-    const isCurrent = i === debugState.callStack.length - 1;
-    const depthArrow = i < debugState.callStack.length - 1 ? '← ' : '▶ ';
-    html += `<div class="dbg-stack-frame${isCurrent ? ' current' : ''}" onclick="window._dbgSelectFrame(${i})">`;
-    html += `<span class="dbg-stack-depth">${depthArrow}</span>`;
-    html += `<span class="dbg-stack-method">${_esc(frame.className)}.${_esc(frame.methodName)}()</span>`;
-    html += `<span class="dbg-stack-location">line ${line}</span>`;
-    html += `</div>`;
+    const isTop = i === topIdx;
+    const isSel = i === selIdx;
+    const level = i + 1; // 1 = entry (bottom), topIdx+1 = current (top)
+    const fileName = frame.file ? String(frame.file).split('/').pop() : '(source unavailable)';
+    const method = `${_esc(frame.className || '')}${frame.methodName ? '.' + _esc(frame.methodName) : ''}` || '(anonymous)';
+    const cls = ['dbg-stack-frame'];
+    if (isTop) cls.push('current');
+    if (isSel) cls.push('selected');
+    if (!frame.file) cls.push('no-src');
+    const marker = isTop ? '▶' : '·';
+    const badge = isTop ? 'current' : `L${level}`;
+    const clickable = frame.file ? ` onclick="window._dbgSelectFrame(${i})"` : '';
+    html += `<div class="${cls.join(' ')}"${clickable} title="${frame.file ? 'Jump to ' + _esc(fileName) + ':' + line : 'No source available for this frame'}">`;
+    html += `<span class="dbg-stack-marker">${marker}</span>`;
+    html += `<div class="dbg-stack-frame-body">`;
+    html += `<div class="dbg-stack-row1"><span class="dbg-stack-method">${method}<span class="dbg-stack-parens">()</span></span><span class="dbg-stack-badge">${badge}</span></div>`;
+    html += `<div class="dbg-stack-src">${_esc(fileName)}<span class="dbg-stack-lineno">:${line}</span></div>`;
+    html += `</div></div>`;
   }
   container.innerHTML = html;
 }
 
 window._dbgSelectFrame = async function(frameIdx) {
   const frame = debugState.callStack[frameIdx];
-  if (!frame) return;
-  await navigateToFile(frame.file, frame.statements[frame.pc]?.line || frame.line);
-  // Temporarily show this frame's variables
-  renderVariablesForFrame(frameIdx);
+  if (!frame || !frame.file) return;
+  // Remember the selection (tied to this exact stop) so the Variables/Watch panels
+  // follow the chosen frame until execution next moves.
+  debugState.currentFrame = frameIdx;
+  debugState._frameSelSig = _execSig();
+  debugState.currentFile = frame.file;   // so exception markers match the opened file
+  const line = (frame.statements && frame.statements[frame.pc]?.line) || frame.line;
+  await navigateToFile(frame.file, line);
+  // Re-render every panel so the Call Stack highlight moves and Variables/Watch show
+  // the selected frame's scope consistently (no bespoke one-off rendering).
+  updateDebugPanels();
 };
 
-function renderVariablesForFrame(frameIdx) {
-  const container = _$('#dbg-variables-body');
-  if (!container) return;
-  const frame = debugState.callStack[frameIdx];
-  if (!frame) return;
+// Character budget beyond which a plain string payload is collapsed to a one-line
+// preview (native <details>) instead of being dumped in full.
+const PAYLOAD_PREVIEW_MAX = 160;
 
-  let html = `<div class="dbg-frame-label">${_esc(frame.className)}.${_esc(frame.methodName)}()</div>`;
-
-  // Local variables
-  html += '<div class="dbg-scope-section">';
-  html += '<div class="dbg-scope-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">▼ Local</div>';
-  for (const key of Object.keys(frame.variables)) {
-    html += renderVarEntry(key, frame.variables[key], 'local', frame._iter && frame._iter[key]);
+/**
+ * Render a console/org entry's payload the Chrome-DevTools way:
+ *  - objects/arrays  → an expandable value tree (renderConsoleTreeValue) + copy;
+ *  - big/multi-line strings (e.g. a 2 KB SOQL) → a ONE-LINE preview that expands
+ *    to the full text on click (native <details>) + copy — so the user never has
+ *    to scroll a wall of text;
+ *  - short scalars   → inline.
+ * `idx`+`store` ('console'|'org') let the copy button fetch the exact value.
+ */
+function renderEntryPayload(entry, idx, store) {
+  const hasTree = entry.value !== null && entry.value !== undefined && typeof entry.value === 'object';
+  const copyBtn = `<button class="dbg-tree-copy" data-store="${store}" data-idx="${idx}" title="Copy value">📋</button>`;
+  if (hasTree) {
+    // Show a short label (e.g. a logpoint's "logger =") in front of the tree so the
+    // value has context; suppress long/multi-line prefixes so the tree stays clean.
+    const msg = entry.message == null ? '' : String(entry.message);
+    const label = (msg && msg.indexOf('\n') === -1 && msg.length <= 48)
+      ? `<span class="dbg-tree-label">${_esc(msg)}</span> `
+      : '';
+    return copyBtn + label + `<div class="dbg-tree-root">${renderConsoleTreeValue(entry.value, 0)}</div>`;
   }
-  html += '</div>';
-
-  // Class fields
-  if (frame.classFields && Object.keys(frame.classFields).length > 0) {
-    html += '<div class="dbg-scope-section">';
-    html += `<div class="dbg-scope-header" onclick="this.parentElement.classList.toggle('collapsed')">▼ Class Fields</div>`;
-    for (const key of Object.keys(frame.classFields)) {
-      html += renderVarEntry(key, frame.classFields[key]);
-    }
-    html += '</div>';
+  const msg = typeof entry.message === 'string' ? entry.message : formatValue(entry.message);
+  if (msg.length > PAYLOAD_PREVIEW_MAX || msg.indexOf('\n') >= 0) {
+    const preview = _esc(msg.replace(/\s+/g, ' ').trim().slice(0, PAYLOAD_PREVIEW_MAX)) + (msg.length > PAYLOAD_PREVIEW_MAX ? ' …' : '');
+    return copyBtn
+      + `<details class="dbg-expand"><summary class="dbg-expand-sum">${preview}</summary>`
+      + `<pre class="dbg-expand-full">${_esc(msg)}</pre></details>`;
   }
+  return `<span class="dbg-console-msg">${_esc(msg)}</span>`;
+}
 
-  container.innerHTML = html;
+/** Wire up Chrome-style nested-tree expand/collapse toggles inside a container. */
+function _attachTreeToggles(container) {
+  container.querySelectorAll('.cv-toggle').forEach(tog => {
+    tog.onclick = () => {
+      const node = tog.closest('.cv-node');
+      if (!node) return;
+      const kids = node.querySelector(':scope > .cv-children');
+      const arrow = tog.querySelector('.cv-arrow');
+      if (!kids) return;
+      const collapsed = kids.classList.toggle('collapsed');
+      if (arrow) arrow.textContent = collapsed ? '▶' : '▼';
+    };
+  });
+}
+
+/** Wire up the 📋 copy buttons for entry payloads (objects → JSON, else text). */
+function _attachPayloadCopy(container) {
+  container.querySelectorAll('.dbg-tree-copy').forEach(btn => {
+    btn.onclick = () => {
+      const store = btn.dataset.store === 'org' ? debugState.orgLog : debugState.consoleLog;
+      const e = store[parseInt(btn.dataset.idx)];
+      if (!e) return;
+      let text;
+      if (e.value !== null && e.value !== undefined && typeof e.value === 'object') {
+        try { text = JSON.stringify(e.value, null, 2); } catch (_) { text = String(e.value); }
+      } else {
+        text = typeof e.message === 'string' ? e.message : formatValue(e.message);
+      }
+      navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '✓';
+        setTimeout(() => { btn.textContent = '📋'; }, 1500);
+      });
+    };
+  });
 }
 
 function renderConsolePanel() {
@@ -4569,7 +6724,7 @@ function renderConsolePanel() {
   if (!container) return;
 
   if (debugState.consoleLog.length === 0) {
-    container.innerHTML = '<div class="dbg-empty">Debug console</div>';
+    container.innerHTML = '<div class="dbg-empty">Console — your System.debug() output appears here as the code runs.</div>';
     return;
   }
 
@@ -4579,7 +6734,7 @@ function renderConsolePanel() {
     const typeClass = `dbg-console-${entry.type}`;
 
     if (entry.type === 'result-json') {
-      // Collapsible JSON tree with copy button
+      // Collapsible pretty-printed JSON tree with copy button.
       const collapsed = entry.message.length > 200;
       html += `<div class="dbg-console-entry ${typeClass}">`;
       html += `<div class="dbg-json-header">`;
@@ -4590,16 +6745,18 @@ function renderConsolePanel() {
       html += `<pre class="dbg-json-block${collapsed ? ' collapsed' : ''}" data-idx="${ei}">${syntaxHighlightJSON(_esc(entry.message))}</pre>`;
       html += `</div>`;
     } else {
+      // Everything else (errors, System.debug prints, logpoints, evals): small
+      // scalars inline, objects as a tree, big/multi-line strings collapsed.
       html += `<div class="dbg-console-entry ${typeClass}">`;
       if (entry.line) html += `<span class="dbg-console-line">L${entry.line}</span>`;
-      html += `<span class="dbg-console-msg">${_esc(entry.message)}</span>`;
+      html += renderEntryPayload(entry, ei, 'console');
       html += `</div>`;
     }
   }
   container.innerHTML = html;
   container.scrollTop = container.scrollHeight;
 
-  // Attach toggle handlers
+  // result-json expand/collapse
   container.querySelectorAll('.dbg-json-toggle').forEach(btn => {
     btn.onclick = () => {
       const idx = btn.dataset.idx;
@@ -4610,8 +6767,6 @@ function renderConsolePanel() {
       }
     };
   });
-
-  // Attach copy handlers
   container.querySelectorAll('.dbg-json-copy').forEach(btn => {
     btn.onclick = () => {
       const idx = parseInt(btn.dataset.idx);
@@ -4622,6 +6777,212 @@ function renderConsolePanel() {
       });
     };
   });
+
+  _attachTreeToggles(container);
+  _attachPayloadCopy(container);
+}
+
+/**
+ * Salesforce debug logs render nested objects/collections as heap addresses
+ * (e.g. "0x638da0ab", sometimes stored as "→ 0x638da0ab"). When one couldn't be
+ * resolved back to real contents — the log didn't capture that heap object — we
+ * must show an HONEST note instead of a cryptic hex, and never a fabricated
+ * value. Returns a friendly label for a bare heap-address string, else null.
+ */
+function _heapRefLabel(v) {
+  if (typeof v !== 'string') return null;
+  const m = v.match(/^(?:→\s*)?(0x[0-9a-fA-F]{3,})$/);
+  return m ? `‹unresolved reference ${m[1]} — the object's contents were not captured in the org log›` : null;
+}
+
+/**
+ * Render a plain-JS value as an interactive Chrome-DevTools-style tree.
+ * Primitives render inline (colored); objects/arrays render as expandable nodes
+ * with a disclosure arrow. Top-level nodes start expanded; nested ones collapsed.
+ * Large collections are capped with a "… N more" marker so huge values stay fast.
+ */
+function renderConsoleTreeValue(v, depth, opts) {
+  depth = depth || 0;
+  // opts (hover tree only): { editable:true, path:[...] } → tag primitive leaves so a
+  // double-click can edit them and write the change back into the LIVE engine object.
+  // Absent/false → byte-for-byte the original read-only markup (console + tests rely on it).
+  const editable = !!(opts && opts.editable);
+  const path = (opts && opts.path) || [];
+  const leaf = (cls, inner, etype) => {
+    if (!editable) return `<span class="${cls}">${inner}</span>`;
+    return `<span class="${cls} cv-editable" data-ep="${_esc(JSON.stringify(path))}" data-et="${etype}" title="Double-click to edit (debugger override)">${inner}</span>`;
+  };
+  if (v === null) return leaf('cv-null', 'null', 'null');
+  if (v === undefined) return '<span class="cv-undef">undefined</span>';
+  const t = typeof v;
+  if (t === 'string') {
+    const ref = _heapRefLabel(v);
+    if (ref) return `<span class="cv-ref" title="Salesforce heap address from the debug log. The object's real contents weren't captured, so there is nothing to expand — shown honestly rather than as a fabricated value.">${_esc(ref)}</span>`;
+    return leaf('cv-str', `"${_esc(v)}"`, 'string');
+  }
+  if (t === 'number') return leaf('cv-num', _esc(String(v)), 'number');
+  if (t === 'boolean') return leaf('cv-bool', String(v), 'boolean');
+  if (t !== 'object') return `<span class="cv-str">${_esc(String(v))}</span>`;
+
+  const isArr = Array.isArray(v);
+  const keys = isArr ? null : Object.keys(v);
+  if (isArr && v.length === 0) return '<span class="cv-empty">[]</span>';
+  if (!isArr && keys.length === 0) return '<span class="cv-empty">{}</span>';
+
+  const preview = isArr
+    ? `Array(${v.length})`
+    : `{${keys.slice(0, 5).map(_esc).join(', ')}${keys.length > 5 ? ', …' : ''}}`;
+
+  const childOpts = (key) => editable ? { editable: true, path: path.concat(key) } : undefined;
+  const open = depth === 0;
+  let kids = '';
+  if (isArr) {
+    const cap = Math.min(v.length, 1000);
+    for (let i = 0; i < cap; i++) {
+      kids += `<div class="cv-prop"><span class="cv-key">${i}</span>: ${renderConsoleTreeValue(v[i], depth + 1, childOpts(i))}</div>`;
+    }
+    if (v.length > cap) kids += `<div class="cv-prop cv-more">… ${v.length - cap} more</div>`;
+  } else {
+    for (const k of keys) {
+      kids += `<div class="cv-prop"><span class="cv-key">${_esc(k)}</span>: ${renderConsoleTreeValue(v[k], depth + 1, childOpts(k))}</div>`;
+    }
+  }
+
+  return `<div class="cv-node">`
+    + `<span class="cv-toggle"><span class="cv-arrow">${open ? '▼' : '▶'}</span>`
+    + `<span class="cv-preview">${_esc(preview)}</span></span>`
+    + `<div class="cv-children${open ? '' : ' collapsed'}">${kids}</div>`
+    + `</div>`;
+}
+
+/* ================================================================
+   EDITABLE HOVER VALUES (Chrome-style "edit value" while paused)
+   ----------------------------------------------------------------
+   Double-clicking a primitive leaf in the floating hover tree lets the user
+   override that value in the LIVE engine object graph, so the rest of the run
+   sees the new value (exactly like editing a variable in Chrome DevTools). It is
+   an in-memory DEBUGGER OVERRIDE only — the connected org is never modified, and
+   we say so in a Console note. It only writes through the engine's own real
+   containers (ApexObject.setField / ApexMap.put / List index), so it can never
+   fabricate a field or silently change a value's type: number stays number,
+   boolean stays boolean, string stays string; a currently-null leaf infers its
+   type from what the user types.
+   ================================================================ */
+
+// Strip the top-level engine-internal (__) keys, matching the read-only hover path,
+// so overrides render against the same shape the user sees.
+function _cleanHoverValue(value) {
+  if (Array.isArray(value)) return value;
+  if (value === null || typeof value !== 'object') return value;
+  const o = {};
+  for (const k of Object.keys(value).filter(k => !k.startsWith('__'))) o[k] = value[k];
+  return o;
+}
+
+// Find the live ApexMap entry whose display key (built exactly like engineValToPlain)
+// equals seg, so we edit the SAME entry the user is looking at and keep key identity.
+function _hoverMapEntry(map, seg, E) {
+  for (const e of map.m.values()) {
+    const sk = (typeof e.k === 'string') ? e.k : (E && E.toApexString ? E.toApexString(e.k) : String(e.k));
+    if (sk === String(seg)) return e;
+  }
+  return null;
+}
+
+// Descend one level into a LIVE engine container by the display key/index.
+function _hoverChildVal(parent, seg, E) {
+  if (parent == null) return undefined;
+  if (Array.isArray(parent)) return parent[Number(seg)];
+  if (E && parent instanceof E.ApexMap) { const e = _hoverMapEntry(parent, seg, E); return e ? e.v : undefined; }
+  if (E && parent instanceof E.ApexSet) return parent.items()[Number(seg)];
+  if (E && parent instanceof E.ApexObject) return parent.getField(seg);
+  if (typeof parent === 'object') return parent[seg];
+  return undefined;
+}
+
+// Walk root along path[0..n-2]; return { parent, key } addressing the leaf path[n-1].
+function _hoverResolveParent(root, path, E) {
+  if (!Array.isArray(path) || path.length === 0) return null;
+  let cur = root;
+  for (let i = 0; i < path.length - 1; i++) {
+    cur = _hoverChildVal(cur, path[i], E);
+    if (cur == null) return null;
+  }
+  return { parent: cur, key: path[path.length - 1] };
+}
+
+// Set a leaf on a LIVE engine container using its native setter. Returns true on
+// success. Never creates a new field/key — only overrides an existing one.
+function _hoverSetLeaf(parent, seg, value, E) {
+  if (parent == null) return false;
+  if (Array.isArray(parent)) {
+    const i = Number(seg);
+    if (Number.isInteger(i) && i >= 0 && i < parent.length) { parent[i] = value; return true; }
+    return false;
+  }
+  if (E && parent instanceof E.ApexMap) {
+    const e = _hoverMapEntry(parent, seg, E);
+    if (e) { parent.put(e.k, value); return true; }
+    return false;
+  }
+  if (E && parent instanceof E.ApexObject) {
+    if (parent.hasField && parent.hasField(seg)) { parent.setField(seg, value); return true; }
+    if (parent.getField && parent.getField(seg) !== undefined) { parent.setField(seg, value); return true; }
+    return false;
+  }
+  if (E && parent instanceof E.ApexSet) return false; // set elements aren't addressable to mutate
+  if (typeof parent === 'object') {
+    if (Object.prototype.hasOwnProperty.call(parent, seg)) { parent[seg] = value; return true; }
+    return false;
+  }
+  return false;
+}
+
+function _stripQuotes(s) {
+  const str = String(s);
+  if (str.length >= 2) {
+    const a = str[0], b = str[str.length - 1];
+    if ((a === '"' && b === '"') || (a === "'" && b === "'")) return str.slice(1, -1);
+  }
+  return str;
+}
+
+// Parse edited text into a JS value, PRESERVING the leaf's original Apex type so an
+// override can't accidentally change a field's type. A currently-null leaf has no
+// known type, so its type is inferred from the input syntax.
+function _parseEditedValue(text, origType) {
+  const raw = String(text);
+  const trimmed = raw.trim();
+  if (origType === 'boolean') {
+    if (/^true$/i.test(trimmed)) return { ok: true, value: true };
+    if (/^false$/i.test(trimmed)) return { ok: true, value: false };
+    return { ok: false, error: 'Enter true or false' };
+  }
+  if (origType === 'number') {
+    if (trimmed === '') return { ok: false, error: 'Enter a number' };
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) return { ok: false, error: 'Not a valid number' };
+    return { ok: true, value: n };
+  }
+  if (origType === 'null') {
+    if (trimmed === '' || /^null$/i.test(trimmed)) return { ok: true, value: null };
+    if (/^true$/i.test(trimmed)) return { ok: true, value: true };
+    if (/^false$/i.test(trimmed)) return { ok: true, value: false };
+    if (Number.isFinite(Number(trimmed))) return { ok: true, value: Number(trimmed) };
+    return { ok: true, value: _stripQuotes(raw) };
+  }
+  // string (default): stays a string; `null` clears it.
+  if (/^null$/i.test(trimmed)) return { ok: true, value: null };
+  return { ok: true, value: _stripQuotes(raw) };
+}
+
+function _pathToText(path) {
+  return (path || []).map(seg => (typeof seg === 'number' ? `[${seg}]` : `.${seg}`)).join('');
+}
+function _fmtEdit(v) {
+  if (v === null) return 'null';
+  if (typeof v === 'string') return `'${v}'`;
+  return String(v);
 }
 
 function syntaxHighlightJSON(escaped) {
@@ -4638,29 +6999,57 @@ function renderBreakpointsPanel() {
   const container = _$('#dbg-breakpoints-body');
   if (!container) return;
 
+  // Gather + sort: group by file, lines ascending within each file, files A→Z.
+  const groups = [];
   let count = 0;
-  let html = '';
   for (const [filePath, bpMap] of debugState.breakpoints) {
-    for (const [line, bpInfo] of bpMap) {
-      const filename = filePath.split('/').pop();
-      count++;
-      const condLabel = bpInfo.condition ? ` [${_esc(bpInfo.condition)}]` : '';
-      html += `<div class="dbg-bp-entry${bpInfo.condition ? ' conditional' : ''}" onclick="window._dbgGoToBreakpoint('${_esc(filePath)}', ${line})">`;
-      html += `<span class="dbg-bp-dot">${bpInfo.condition ? '◆' : '●'}</span>`;
-      html += `<span class="dbg-bp-file">${_esc(filename)}</span>`;
+    const lines = [...bpMap.keys()].sort((a, b) => a - b);
+    if (!lines.length) continue;
+    groups.push([filePath, lines, bpMap]);
+    count += lines.length;
+  }
+  groups.sort((a, b) => (a[0].split('/').pop() || '').localeCompare(b[0].split('/').pop() || ''));
+
+  // Reflect the total on the tab so the user can always see how many are set.
+  const tabBtn = document.querySelector('.dbg-panel-tab[data-tab="dbg-breakpoints"]');
+  if (tabBtn) tabBtn.textContent = count ? `Breakpoints (${count})` : 'Breakpoints';
+
+  if (!count) {
+    container.innerHTML = '<div class="dbg-empty">No breakpoints set. Click in the gutter margin (or right-click a line) to add a breakpoint, conditional breakpoint, or logpoint.</div>';
+    return;
+  }
+
+  let html = '';
+  for (const [filePath, lines, bpMap] of groups) {
+    const filename = filePath.split('/').pop();
+    html += `<div class="dbg-bp-group">`;
+    html += `<div class="dbg-bp-group-head" title="${_esc(filePath)}">`
+      + `<span class="dbg-bp-group-name">${_esc(filename)}</span>`
+      + `<span class="dbg-bp-group-count">${lines.length}</span>`
+      + `<button class="dbg-bp-group-clear" onclick="event.stopPropagation(); window._dbgClearFileBreakpoints('${_esc(filePath)}')" title="Remove all breakpoints in this file">Clear</button>`
+      + `</div>`;
+    for (const line of lines) {
+      const bpInfo = bpMap.get(line);
+      const isLog = !!bpInfo.logMessage;
+      const isCond = !!bpInfo.condition;
+      const enabled = bpInfo.enabled !== false;
+      const dot = isLog ? '◉' : isCond ? '◆' : '●';
+      const kindClass = (isLog ? ' logpoint' : isCond ? ' conditional' : '') + (enabled ? '' : ' disabled');
+      const kindTitle = isLog ? 'Logpoint' : isCond ? 'Conditional breakpoint' : 'Breakpoint';
+      html += `<div class="dbg-bp-entry${kindClass}" onclick="window._dbgGoToBreakpoint('${_esc(filePath)}', ${line})" title="Go to ${_esc(filename)}:${line}">`;
+      html += `<input type="checkbox" class="dbg-bp-check" ${enabled ? 'checked' : ''} onclick="event.stopPropagation(); window._dbgToggleBreakpointEnabled('${_esc(filePath)}', ${line}, this.checked)" title="${enabled ? 'Disable' : 'Enable'} this breakpoint" />`;
+      html += `<span class="dbg-bp-dot" title="${kindTitle}${enabled ? '' : ' (disabled)'}">${dot}</span>`;
       html += `<span class="dbg-bp-line">:${line}</span>`;
-      if (bpInfo.condition) html += `<span class="dbg-bp-cond">${condLabel}</span>`;
-      html += `<button class="dbg-bp-edit" onclick="event.stopPropagation(); window._dbgEditBreakpoint('${_esc(filePath)}', ${line})" title="Edit condition">✎</button>`;
+      if (bpInfo.snippet) html += `<span class="dbg-bp-snippet" title="${_esc(bpInfo.snippet)}">${_esc(bpInfo.snippet)}</span>`;
+      if (isLog) html += `<span class="dbg-bp-cond">“${_esc(bpInfo.logMessage)}”${isCond ? ` when ${_esc(bpInfo.condition)}` : ''}</span>`;
+      else if (isCond) html += `<span class="dbg-bp-cond">[${_esc(bpInfo.condition)}]</span>`;
+      html += `<button class="dbg-bp-edit" onclick="event.stopPropagation(); window._dbgEditBreakpoint('${_esc(filePath)}', ${line})" title="Edit">✎</button>`;
       html += `<button class="dbg-bp-remove" onclick="event.stopPropagation(); window._dbgRemoveBreakpoint('${_esc(filePath)}', ${line})" title="Remove">✕</button>`;
       html += `</div>`;
     }
+    html += `</div>`;
   }
-
-  if (count === 0) {
-    html = '<div class="dbg-empty">No breakpoints set. Click in the gutter margin to add breakpoints.</div>';
-  } else {
-    html += `<button class="dbg-bp-clear-all" onclick="window._dbgClearAllBreakpoints()">Remove All</button>`;
-  }
+  html += `<button class="dbg-bp-clear-all" onclick="window._dbgClearAllBreakpoints()">Remove all (${count})</button>`;
   container.innerHTML = html;
 }
 
@@ -4675,10 +7064,10 @@ window._dbgRemoveBreakpoint = function(filePath, line) {
 window._dbgEditBreakpoint = function(filePath, line) {
   const bps = debugState.breakpoints.get(filePath);
   const current = bps?.get(line);
-  const condition = prompt('Enter breakpoint condition (leave empty for unconditional):', current?.condition || '');
-  if (condition !== null) {
-    toggleBreakpoint(filePath, line, condition || null);
-  }
+  // A logpoint edits its message; anything else edits its condition. Both use the
+  // in-app modal (window.prompt is disabled in Electron).
+  if (current?.logMessage) editLogpoint(filePath, line);
+  else editConditionalBreakpoint(filePath, line);
 };
 
 window._dbgClearAllBreakpoints = function() {
@@ -4692,6 +7081,28 @@ window._dbgClearAllBreakpoints = function() {
   }
   debugState.breakpointDecorations.clear();
   updateBreakpointsPanel();
+  saveBreakpoints();
+};
+
+window._dbgClearFileBreakpoints = function(filePath) {
+  const bps = debugState.breakpoints.get(filePath);
+  if (!bps) return;
+  // Remove line-by-line through the canonical path so gutter glyphs are cleared
+  // exactly like the per-breakpoint ✕ button (which already works correctly).
+  for (const line of [...bps.keys()]) toggleBreakpoint(filePath, line);
+  updateBreakpointsPanel();
+  saveBreakpoints();
+};
+
+/** Enable/disable a single breakpoint (checkbox). Keeps it stored + visible so
+ *  the user can re-enable it later; a disabled breakpoint never fires. */
+window._dbgToggleBreakpointEnabled = function(filePath, line, enabled) {
+  const bp = debugState.breakpoints.get(filePath)?.get(line);
+  if (!bp) return;
+  bp.enabled = !!enabled;
+  renderBreakpointDecorations(filePath);
+  updateBreakpointsPanel();
+  saveBreakpoints();
 };
 
 function updateBreakpointsPanel() {
@@ -5096,6 +7507,278 @@ function inferVarTypeFromSource(model, uptoLine, varName) {
 }
 
 /**
+ * Render an object/array as a COMPACT first-level JSON view: primitive fields are
+ * shown as-is, but nested objects/arrays collapse to a `{ N fields }` / `[ N items ]`
+ * summary (Chrome-style) instead of the full deep dump. Used by the static markdown
+ * hover (free-run / split editor) so a big object never floods the tooltip.
+ */
+function _compactFirstLevelJson(val) {
+  const fmtPrim = (v) => {
+    const ref = _heapRefLabel(v); if (ref) return ref;
+    if (v === null) return 'null';
+    if (typeof v === 'string') return JSON.stringify(v);
+    return String(v);
+  };
+  const summary = (v) => {
+    if (v !== null && typeof v === 'object') {
+      if (Array.isArray(v)) return `[ ${v.length} item${v.length === 1 ? '' : 's'} ]`;
+      const n = Object.keys(v).filter(k => !k.startsWith('__')).length;
+      return `{ ${n} field${n === 1 ? '' : 's'} }`;
+    }
+    return fmtPrim(v);
+  };
+  if (Array.isArray(val)) {
+    if (val.length === 0) return '[]';
+    const cap = Math.min(val.length, 50);
+    const lines = [];
+    for (let i = 0; i < cap; i++) lines.push('  ' + summary(val[i]) + (i < cap - 1 || val.length > cap ? ',' : ''));
+    if (val.length > cap) lines.push(`  … ${val.length - cap} more`);
+    return '[\n' + lines.join('\n') + '\n]';
+  }
+  const keys = Object.keys(val).filter(k => !k.startsWith('__'));
+  if (keys.length === 0) return '{}';
+  const cap = Math.min(keys.length, 60);
+  const lines = [];
+  for (let i = 0; i < cap; i++) {
+    const k = keys[i];
+    lines.push(`  ${JSON.stringify(k)}: ${summary(val[k])}${i < cap - 1 || keys.length > cap ? ',' : ''}`);
+  }
+  if (keys.length > cap) lines.push(`  … ${keys.length - cap} more`);
+  return '{\n' + lines.join('\n') + '\n}';
+}
+
+/* ---- Interactive expandable hover (Chrome DevTools style) -------------------
+ * Monaco's built-in hover renders static markdown, so it can't host click-to-
+ * expand. For object/array values while paused or in replay we instead show our
+ * OWN floating panel (a body-level <div>, positioned at the token): the top level
+ * is expanded, nested nodes are collapsed and expand on click, and the whole thing
+ * is copyable — exactly like Chrome. It stays open while the pointer is inside it.
+ * We deliberately AVOID Monaco content widgets here: their layout lifecycle can
+ * throw during a hover computation, which would break ALL hovers. A plain fixed-
+ * position div driven by editor coordinates is bullet-proof by comparison. */
+let _dbgHoverTreeEl = null;      // the floating panel element (in document.body)
+let _dbgHoverTreeRange = null;   // the token range it's anchored to
+let _dbgHoverTreeKey = null;     // path currently shown (so re-hover keeps expand state)
+let _dbgHoverTreeHideTimer = null;
+let _dbgHoverTreeWired = false;
+
+function _scheduleHoverTreeHide() {
+  if (_dbgHoverEditing) return;   // never dismiss the panel mid-edit
+  if (_dbgHoverTreeHideTimer) clearTimeout(_dbgHoverTreeHideTimer);
+  _dbgHoverTreeHideTimer = setTimeout(_hideHoverTree, 240);
+}
+function _cancelHoverTreeHide() {
+  if (_dbgHoverTreeHideTimer) { clearTimeout(_dbgHoverTreeHideTimer); _dbgHoverTreeHideTimer = null; }
+}
+function _hideHoverTree() {
+  if (_dbgHoverEditing) return;   // keep open while an inline editor is active
+  _cancelHoverTreeHide();
+  if (_dbgHoverTreeEl) _dbgHoverTreeEl.style.display = 'none';
+  _dbgHoverTreeRange = null;
+  _dbgHoverTreeKey = null;
+}
+
+function _ensureHoverTreeEl() {
+  if (_dbgHoverTreeEl) return _dbgHoverTreeEl;
+  const el = document.createElement('div');
+  el.className = 'dbg-hover-tree';
+  el.style.display = 'none';
+  // Keep it open while the pointer is inside so the user can expand nodes / copy.
+  el.addEventListener('mouseenter', _cancelHoverTreeHide);
+  el.addEventListener('mouseleave', _scheduleHoverTreeHide);
+  document.body.appendChild(el);
+  _dbgHoverTreeEl = el;
+  return el;
+}
+
+function _wireHoverTreeDismiss(editor) {
+  if (_dbgHoverTreeWired) return;
+  _dbgHoverTreeWired = true;
+  // Hide when the pointer leaves the anchored token (unless it moved into the panel,
+  // whose mouseenter cancels the pending hide). Scroll invalidates the anchor.
+  editor.onMouseMove((e) => {
+    if (!_dbgHoverTreeRange || !_dbgHoverTreeEl || _dbgHoverTreeEl.style.display === 'none') return;
+    const pos = e.target && e.target.position;
+    if (pos && _dbgHoverTreeRange.containsPosition(pos)) _cancelHoverTreeHide();
+    else _scheduleHoverTreeHide();
+  });
+  editor.onMouseLeave(() => _scheduleHoverTreeHide());
+  editor.onDidScrollChange(() => _hideHoverTree());
+}
+
+function _showHoverTree(editor, range, path, typeName, value) {
+  const key = `${range.startLineNumber}:${range.startColumn}:${path}`;
+  // Same token already shown → keep it (preserve the user's expand state).
+  if (_dbgHoverTreeKey === key && _dbgHoverTreeEl && _dbgHoverTreeEl.style.display === 'block') {
+    _cancelHoverTreeHide();
+    return;
+  }
+  const el = _ensureHoverTreeEl();
+  _wireHoverTreeDismiss(editor);
+  _dbgHoverTreeRange = range;
+  _dbgHoverTreeKey = key;
+  // Strip engine-internal (__) keys the same way the markdown path does.
+  const clean = _cleanHoverValue(value);
+  // Values are editable only while genuinely paused in a live engine session at the
+  // live edge (not while viewing recorded history, and not during a free run) — an
+  // override must land in the state the code is about to use next.
+  const editable = !!(debugState.engineMode && debugState.engineSession && debugState.paused
+    && !debugState.engineViewingHistory);
+  el.innerHTML =
+    `<div class="dbg-hover-tree-head">` +
+      `<span class="dbg-hover-tree-path">${_esc(path)}</span>` +
+      `<span class="dbg-hover-tree-type">${_esc(typeName || '')}</span>` +
+      (editable ? `<span class="dbg-hover-tree-edithint" title="Double-click any value to override it in the live object (in-memory only; the org is never modified).">✎ editable</span>` : '') +
+      `<button class="dbg-hover-tree-copy" title="Copy full JSON">📋</button>` +
+    `</div>` +
+    `<div class="dbg-hover-tree-body"></div>`;
+  _renderHoverBodyInto(el, clean, editable, path);
+  const copyBtn = el.querySelector('.dbg-hover-tree-copy');
+  if (copyBtn) copyBtn.onclick = () => {
+    let text; try { text = JSON.stringify(clean, null, 2); } catch { text = String(clean); }
+    navigator.clipboard.writeText(text).then(() => {
+      copyBtn.textContent = '✓';
+      setTimeout(() => { copyBtn.textContent = '📋'; }, 1200);
+    }).catch(() => {});
+  };
+  // Anchor to the token: editor-content coords → viewport coords for position:fixed.
+  el.style.display = 'block';
+  el.style.visibility = 'hidden';
+  try {
+    const vp = editor.getScrolledVisiblePosition({ lineNumber: range.startLineNumber, column: range.startColumn });
+    const dom = editor.getDomNode();
+    if (vp && dom) {
+      const rect = dom.getBoundingClientRect();
+      let left = rect.left + vp.left;
+      let top = rect.top + vp.top + vp.height + 2;
+      // Clamp inside the viewport; flip above the line if it would overflow the bottom.
+      const pr = el.getBoundingClientRect();
+      if (left + pr.width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - pr.width - 8);
+      if (top + pr.height > window.innerHeight - 8) top = Math.max(8, rect.top + vp.top - pr.height - 2);
+      el.style.left = Math.round(left) + 'px';
+      el.style.top = Math.round(top) + 'px';
+    }
+  } catch (_) { /* positioning is best-effort; the panel still shows top-left-anchored */ }
+  el.style.visibility = 'visible';
+  _cancelHoverTreeHide();
+}
+
+// Render the hover tree body + wire toggles and (when editable) the double-click
+// editors. Shared by the initial show and by the re-render after a committed edit,
+// so an override immediately re-materialises the panel from fresh live values.
+function _renderHoverBodyInto(el, clean, editable, rootPath) {
+  const body = el.querySelector('.dbg-hover-tree-body');
+  if (!body) return;
+  body.innerHTML = renderConsoleTreeValue(clean, 0, editable ? { editable: true, path: [] } : undefined);
+  _attachTreeToggles(body);
+  if (editable) _attachHoverEditors(el, body, rootPath);
+}
+
+// Wire double-click-to-edit on every tagged primitive leaf in the hover tree.
+function _attachHoverEditors(panel, body, rootPath) {
+  body.querySelectorAll('[data-ep]').forEach(span => {
+    span.addEventListener('dblclick', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (span._dbgEditing) return;
+      let path; try { path = JSON.parse(span.getAttribute('data-ep')); } catch { return; }
+      const etype = span.getAttribute('data-et') || 'string';
+      _beginHoverEdit(panel, span, path, etype, rootPath);
+    });
+  });
+}
+
+// True while an inline edit input is focused, so the dismiss timers keep the panel open.
+let _dbgHoverEditing = false;
+
+function _beginHoverEdit(panel, span, path, origType, rootPath) {
+  _cancelHoverTreeHide();
+  _dbgHoverEditing = true;
+  span._dbgEditing = true;
+  const originalHTML = span.innerHTML;
+  const originalCls = span.className;
+  // Prefill with the raw value (strings without their surrounding quotes).
+  let prefill = span.textContent;
+  if (origType === 'string') prefill = _stripQuotes(prefill);
+  else if (origType === 'null') prefill = '';
+  const input = document.createElement('input');
+  input.className = 'cv-edit-input';
+  input.type = 'text';
+  input.spellcheck = false;
+  input.value = prefill;
+  span.classList.remove('cv-editable');
+  span.textContent = '';
+  span.appendChild(input);
+  input.focus();
+  input.select();
+
+  let settled = false;
+  const restore = () => { span.className = originalCls; span.innerHTML = originalHTML; };
+  const finish = () => { _dbgHoverEditing = false; span._dbgEditing = false; };
+  const cancel = () => { if (settled) return; settled = true; finish(); restore(); };
+  const commit = async () => {
+    if (settled) return; settled = true; finish();
+    const parsed = _parseEditedValue(input.value, origType);
+    if (!parsed.ok) { window.showToast?.(parsed.error || 'Invalid value'); restore(); return; }
+    const ok = await _applyHoverEdit(panel, rootPath, path, parsed.value);
+    if (!ok) restore(); // failure already toasted; success re-renders the whole body
+  };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', () => { if (!settled) commit(); });
+  input.addEventListener('mousedown', e => e.stopPropagation());
+  input.addEventListener('click', e => e.stopPropagation());
+  input.addEventListener('dblclick', e => e.stopPropagation());
+}
+
+// Commit an override into the LIVE engine object graph, then reflect it everywhere.
+async function _applyHoverEdit(panel, rootPath, path, value) {
+  const E = (typeof window !== 'undefined') ? window.ApexEngine : null;
+  const eng = debugState.engineSession;
+  if (!eng || !debugState.paused || debugState.engineViewingHistory) {
+    window.showToast?.('Values can only be edited while paused in the live engine.');
+    return false;
+  }
+  const frame = eng.topFrame && eng.topFrame();
+  if (!frame) { window.showToast?.('No active engine frame to edit.'); return false; }
+  if (!Array.isArray(path) || path.length === 0) {
+    window.showToast?.('Edit a field inside the object.');
+    return false;
+  }
+  let root;
+  try { root = await eng.evalExpressionSandboxed(rootPath, frame, false); }
+  catch (_) { root = undefined; }
+  if (root == null) {
+    window.showToast?.(`Can only edit values in the current frame — “${rootPath}” isn’t resolvable here.`);
+    return false;
+  }
+  const target = _hoverResolveParent(root, path, E);
+  if (!target || target.parent == null) {
+    window.showToast?.('Could not locate that value in the live object.');
+    return false;
+  }
+  let ok = false;
+  try { ok = _hoverSetLeaf(target.parent, target.key, value, E); }
+  catch (_) { ok = false; }
+  if (!ok) { window.showToast?.('That value can’t be edited (unsupported container, e.g. a Set).'); return false; }
+
+  // Reflect into the mirrored stack + all panels, note it honestly, and re-render the
+  // hover body from the fresh live value so the change shows and further edits work.
+  try { mirrorEngineStack(eng.getCallStack()); } catch (_) {}
+  try { updateDebugPanels(); } catch (_) {}
+  addConsoleEntry('info', `✏ Debugger override: set ${rootPath}${_pathToText(path)} = ${_fmtEdit(value)} (in-memory only; the org is not modified).`);
+  window.showToast?.(`Set ${_pathToText(path).replace(/^\./, '') || rootPath} = ${_fmtEdit(value)}`);
+  try {
+    const fresh = _cleanHoverValue(engineValToPlain(root));
+    _renderHoverBodyInto(panel, fresh, true, rootPath);
+  } catch (_) { /* re-render is best-effort; the edit itself already applied */ }
+  return true;
+}
+
+/**
  * Register the hover provider that shows debug info during active sessions.
  * Shows Chrome DevTools-style value tooltips on variable hover.
  */
@@ -5117,7 +7800,18 @@ function registerDebugHoverProvider() {
 
   monaco.languages.registerHoverProvider('apex', {
     provideHover: (model, position) => {
-      if (!debugState.active || !debugState.paused) return null;
+      if (!debugState.active) return null;
+      // While the engine is FREE-RUNNING (active but not paused) we still let the
+      // user inspect values: snapshot the live engine stack so locals/fields
+      // resolve to their CURRENT value. This is READ-ONLY — the interactive
+      // org-eval / SOQL / engine-eval fallbacks below are gated to `!liveRun`, so
+      // hovering can never perturb a run that's in progress.
+      const liveRun = !debugState.paused;
+      if (liveRun) {
+        const eng = debugState.engineSession;
+        if (!eng || typeof eng.getCallStack !== 'function') return null;
+        try { mirrorEngineStack(eng.getCallStack()); } catch (_) { return null; }
+      }
 
       const word = model.getWordAtPosition(position);
       if (!word) return null;
@@ -5142,17 +7836,12 @@ function registerDebugHoverProvider() {
         }
       }
 
-      // Scan right from wordEnd for ".word" patterns
-      let exprEnd = wordEnd;
-      while (exprEnd < lineContent.length && lineContent[exprEnd] === '.') {
-        let j = exprEnd + 1;
-        while (j < lineContent.length && /[\w]/.test(lineContent[j])) j++;
-        if (j > exprEnd + 1) {
-          exprEnd = j;
-        } else {
-          break;
-        }
-      }
+      // Do NOT scan right past the hovered word. The tooltip must describe exactly
+      // the token under the cursor: hovering `request` shows the `request` object,
+      // NOT `request.applyInclusionFilterPriLines`. The left-scan above still keeps
+      // the receiver, so hovering the trailing `foo` in `request.foo` yields
+      // `request.foo` — the dotted path ends at the hovered token, never beyond it.
+      const exprEnd = wordEnd;
 
       const fullPath = lineContent.substring(exprStart, exprEnd);
       const rangeStart = exprStart + 1; // back to 1-based
@@ -5250,11 +7939,15 @@ function registerDebugHoverProvider() {
           const cleanValue = Array.isArray(val) ? val : (() => {
             const o = {}; for (const k of Object.keys(val).filter(k => !k.startsWith('__'))) o[k] = val[k]; return o;
           })();
-          const jsonStr = JSON.stringify(cleanValue, null, 2);
+          // Show only the FIRST LEVEL (nested objects/arrays collapse to a size
+          // summary) so a big object never floods the tooltip. Heap-address leaves
+          // still degrade to an honest note. The interactive expandable tree is
+          // shown separately (custom widget) while paused/in replay.
+          const compact = _compactFirstLevelJson(cleanValue);
           const typeLabel = Array.isArray(val) ? `List (${val.length} items)` : `Object (${Object.keys(cleanValue).length} fields)`;
-          contents.push({ value: `\`${typeLabel}\`\n\n` + '```json\n' + jsonStr + '\n```' });
+          contents.push({ value: `\`${typeLabel}\`\n\n` + '```json\n' + compact + '\n```' + '\n\n_First level only — expand nested values in the Variables panel._' });
         } else {
-          contents.push({ value: '```\n' + String(val) + '\n```' });
+          contents.push({ value: '```\n' + (_heapRefLabel(val) || String(val)) + '\n```' });
         }
         if (opts.realOrg) contents.push({ value: '_↳ also saved to the Console tab_' });
         const range = opts.range || (resolvedPath === word.word
@@ -5267,7 +7960,40 @@ function registerDebugHoverProvider() {
 
       // 1) Resolved locally to a concrete (non-null) value → show it immediately.
       if (value !== undefined && value !== null && !soqlLiteral) {
+        // For object/array values during ANY active debug session — paused, replay,
+        // OR while the engine is live-running — render the Chrome-style INTERACTIVE
+        // expandable tree (first level open, nested collapsed, click to drill in,
+        // copyable) as our own hover widget and suppress Monaco's static markdown
+        // hover (return null) so there's exactly one tooltip. The tree is read-only
+        // during a live run and becomes editable only when paused (gated inside
+        // _showHoverTree). Primitives and the split-editor case fall through to the
+        // compact markdown hover.
+        if (typeof value === 'object' && (debugState.active || debugState.replayMode)) {
+          const ed = window.state?.editor;
+          if (ed && ed.getModel() === model) {
+            try {
+              const hdrPath = resolvedPath || fullPath;
+              const typeName = getValueTypeName(value, lookupVarType(hdrPath));
+              const range = (resolvedPath === word.word)
+                ? wordRange
+                : new monaco.Range(position.lineNumber, rangeStart, position.lineNumber, rangeEnd);
+              _showHoverTree(ed, range, hdrPath, typeName, value);
+              return null;
+            } catch (_) {
+              // The interactive panel must NEVER break hovering — fall back to the
+              // compact markdown hover below if anything goes wrong.
+            }
+          }
+        }
         return makeHover(resolvedPath || fullPath, value);
+      }
+
+      // During a live run we only surface already-resolved values (read-only) and
+      // never fire the SOQL / org-eval / engine-eval round-trips below — those are
+      // interactive and could disturb the interpreter mid-execution. Show a local
+      // null if that's what we have; otherwise no hover until the user pauses.
+      if (liveRun) {
+        return value === null ? makeHover(resolvedPath || fullPath, null) : null;
       }
 
       // 2) SOQL literal under the cursor → run it against the org.
@@ -5286,7 +8012,7 @@ function registerDebugHoverProvider() {
           if (!debugState._soqlHoverLogged.has(r.soql)) {
             debugState._soqlHoverLogged.add(r.soql);
             addConsoleEntry('soql', `[SOQL] ${r.soql} → ${r.records.length} row(s)`);
-            if (r.records.length) addConsoleEntry('result-json', JSON.stringify(preview, null, 2));
+            if (r.records.length) addConsoleEntry('result-json', JSON.stringify(preview, null, 2), null, preview);
           }
           return { range: wordRange, contents: [{ value: body }] };
         }).catch(() => null);
@@ -5333,7 +8059,7 @@ function registerDebugHoverProvider() {
                   ? { ...(topFrame.classFields || {}), ...topFrame.variables }
                   : {};
                 if (badVar in frameScope) {
-                  const friendly = `Can't evaluate: \`${badVar}\` is a runtime object built inside the method, and anonymous Apex can't call methods on it or rebuild it (private helpers/state aren't reachable). Use ▶ Run in Org to replay the whole method, then hover the variable itself for its real value — or set a value in the Console (e.g. \`${badVar} = …\`).`;
+                  const friendly = `Can't evaluate: \`${badVar}\` is a runtime object built inside the method, and anonymous Apex can't call methods on it or rebuild it (private helpers/state aren't reachable). Turn on the ⚡ Live Org toggle to replay the whole method in the org, then hover the variable itself for its real value — or set a value in the Console (e.g. \`${badVar} = …\`).`;
                   addConsoleEntry('info', `${orgExpr} → (org eval) ${friendly}`);
                   return errHover(orgExpr, friendly);
                 }
@@ -5368,7 +8094,7 @@ function registerDebugHoverProvider() {
       //    Type.newInstance(), getSObjectType(), etc., so values come from actual
       //    execution state rather than a separate org round-trip. Fall back to org
       //    eval only when the engine can't resolve the expression.
-      if (debugState.engineMode && debugState.engineSession && (callExpr || fullPath.includes('.'))) {
+      if (debugState.engineMode && debugState.engineSession && !debugState.engineViewingHistory && (callExpr || fullPath.includes('.'))) {
         const engExpr = callExpr || fullPath;
         const cacheKey = engExpr + '\x00' + (debugState.currentLine || '');
         if (!debugState._hoverCache) debugState._hoverCache = new Map();
@@ -5502,32 +8228,118 @@ function defaultForApexType(varType) {
 function registerGutterClickHandler() {
   const editor = window.state?.editor;
   if (!editor) return;
+  const T = monaco.editor.MouseTargetType;
 
   editor.onMouseDown((e) => {
-    // Target type 2 = GUTTER_GLYPH_MARGIN
-    if (e.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) {
-      const line = e.target.position.lineNumber;
-      const model = editor.getModel();
-      if (!model) return;
-      const uri = model.uri;
-      const filePath = uri.fsPath || uri.path;
-      // Only allow breakpoints on .cls and .trigger files
-      if (!filePath.endsWith('.cls') && !filePath.endsWith('.trigger')) return;
+    const t = e.target?.type;
+    // Accept the glyph margin AND the line-number gutter — the glyph strip is
+    // only a few px wide, so many "nothing happened" right-clicks were actually
+    // landing on the line numbers. Both now open the breakpoint menu.
+    const inGlyph = t === T.GUTTER_GLYPH_MARGIN;
+    const inLineNum = t === T.GUTTER_LINE_NUMBERS;
+    if (!inGlyph && !inLineNum) return;
+    const line = e.target.position?.lineNumber;
+    if (!line) return;
+    const model = editor.getModel();
+    if (!model) return;
+    const uri = model.uri;
+    const filePath = uri.fsPath || uri.path;
+    // Only allow breakpoints on .cls and .trigger files
+    if (!filePath.endsWith('.cls') && !filePath.endsWith('.trigger')) return;
 
-      if (e.event.rightButton) {
-        // Right-click: add/edit conditional breakpoint
-        e.event.preventDefault();
-        const bps = debugState.breakpoints.get(filePath);
-        const current = bps?.get(line);
-        const condition = prompt('Enter breakpoint condition:', current?.condition || '');
-        if (condition !== null) {
-          toggleBreakpoint(filePath, line, condition || null);
-        }
-      } else {
-        toggleBreakpoint(filePath, line);
-      }
+    if (e.event.rightButton) {
+      // Right-click: Chrome-style menu — Breakpoint / Conditional / Logpoint.
+      e.event.preventDefault();
+      const be = e.event.browserEvent || e.event;
+      const px = be.clientX != null ? be.clientX : (e.event.posx || 0);
+      const py = be.clientY != null ? be.clientY : (e.event.posy || 0);
+      showGutterBreakpointMenu(filePath, line, px, py);
+    } else if (inGlyph) {
+      // Left-click the glyph margin toggles a plain breakpoint. Left-clicking the
+      // line number is left to Monaco (line selection).
+      toggleBreakpoint(filePath, line);
     }
   });
+
+  registerBreakpointEditorActions(editor);
+}
+
+/**
+ * Register right-click editor-context-menu actions (Monaco's own menu, which
+ * always works) so logpoints/conditional breakpoints are reachable even if the
+ * thin gutter is awkward to hit. These act on the line under the cursor.
+ */
+function registerBreakpointEditorActions(editor) {
+  if (editor.__ccBpActions) return;
+  editor.__ccBpActions = true;
+  const fileOf = () => {
+    const m = editor.getModel();
+    if (!m) return null;
+    const fp = m.uri.fsPath || m.uri.path;
+    return (fp.endsWith('.cls') || fp.endsWith('.trigger')) ? fp : null;
+  };
+  try {
+    editor.addAction({
+      id: 'congacode.toggleBreakpoint',
+      label: 'CongaCode: Toggle Breakpoint',
+      contextMenuGroupId: 'debug', contextMenuOrder: 1.0,
+      run: (ed) => { const fp = fileOf(); if (fp) toggleBreakpoint(fp, ed.getPosition().lineNumber); },
+    });
+    editor.addAction({
+      id: 'congacode.conditionalBreakpoint',
+      label: 'CongaCode: Add / Edit Conditional Breakpoint…',
+      contextMenuGroupId: 'debug', contextMenuOrder: 1.1,
+      run: (ed) => { const fp = fileOf(); if (fp) editConditionalBreakpoint(fp, ed.getPosition().lineNumber); },
+    });
+    editor.addAction({
+      id: 'congacode.logpoint',
+      label: 'CongaCode: Add / Edit Logpoint…',
+      contextMenuGroupId: 'debug', contextMenuOrder: 1.2,
+      run: (ed) => { const fp = fileOf(); if (fp) editLogpoint(fp, ed.getPosition().lineNumber); },
+    });
+  } catch (err) { console.error('addAction failed', err); }
+}
+
+/**
+ * A small DevTools-style context menu for a gutter line: toggle a plain
+ * breakpoint, add/edit a conditional breakpoint, add/edit a logpoint (prints
+ * without pausing), or remove. Entry uses the in-app modal (Electron blocks
+ * window.prompt(), which is why the old menu appeared to do nothing).
+ */
+function showGutterBreakpointMenu(filePath, line, x, y) {
+  document.querySelectorAll('.dbg-gutter-menu').forEach(m => m.remove());
+  const bps = debugState.breakpoints.get(filePath);
+  const current = bps?.get(line) || null;
+  const menu = document.createElement('div');
+  menu.className = 'dbg-gutter-menu';
+  menu.style.left = (x || 0) + 'px';
+  menu.style.top = (y || 0) + 'px';
+
+  const items = [];
+  if (current) items.push({ label: 'Remove breakpoint', act: () => removeBreakpoint(filePath, line) });
+  else items.push({ label: 'Add breakpoint', act: () => toggleBreakpoint(filePath, line) });
+  items.push({ label: current?.condition ? 'Edit condition…' : 'Add conditional breakpoint…', act: () => editConditionalBreakpoint(filePath, line) });
+  items.push({ label: current?.logMessage ? 'Edit logpoint…' : 'Add logpoint…', act: () => editLogpoint(filePath, line) });
+
+  let close;
+  for (const it of items) {
+    const el = document.createElement('div');
+    el.className = 'dbg-gutter-menu-item';
+    el.textContent = it.label;
+    el.onclick = () => {
+      menu.remove();
+      if (close) document.removeEventListener('mousedown', close, true);
+      Promise.resolve().then(it.act).catch(err => console.error(err));
+    };
+    menu.appendChild(el);
+  }
+  document.body.appendChild(menu);
+  // Keep the menu on-screen.
+  const r = menu.getBoundingClientRect();
+  if (r.right > window.innerWidth) menu.style.left = Math.max(0, window.innerWidth - r.width - 4) + 'px';
+  if (r.bottom > window.innerHeight) menu.style.top = Math.max(0, window.innerHeight - r.height - 4) + 'px';
+  close = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('mousedown', close, true); } };
+  setTimeout(() => document.addEventListener('mousedown', close, true), 0);
 }
 
 /* ================================================================
@@ -5537,7 +8349,12 @@ function registerGutterClickHandler() {
 function initDebugPanelTabs() {
   const tabs = _$$('#debug-panel .dbg-panel-tab');
   tabs.forEach(tab => {
-    tab.addEventListener('click', () => {
+    tab.addEventListener('click', (e) => {
+      // A REAL user click (isTrusted) means the developer is choosing where to look.
+      // From here on, stop auto-switching to the Org tab for the rest of this run so
+      // we never yank them off Console/Call Stack/etc. Programmatic .click() calls
+      // (the default auto-open at run start) are isTrusted=false and don't pin.
+      if (e.isTrusted && debugState.active) debugState._userPinnedTab = true;
       const target = tab.dataset.tab;
       // Update active tab
       tabs.forEach(t => t.classList.remove('active'));
@@ -5565,6 +8382,10 @@ function initApexDebugger() {
 
       // Enable glyphMargin for breakpoint gutter
       window.state.editor.updateOptions({ glyphMargin: true });
+
+      // Restore breakpoints saved in a previous session so they persist across
+      // app restarts (paints gutter glyphs for the open file + fills the panel).
+      loadBreakpoints();
 
       // Listen for model changes to re-apply breakpoint decorations
       window.state.editor.onDidChangeModel(() => {
@@ -5622,15 +8443,25 @@ function initApexDebugger() {
 
   // Wire up debug toolbar buttons
   _$('#dbg-btn-continue')?.addEventListener('click', debugContinue);
+  _$('#dbg-btn-step-back')?.addEventListener('click', debugStepBack);
   _$('#dbg-btn-step-over')?.addEventListener('click', debugStepOver);
   _$('#dbg-btn-step-into')?.addEventListener('click', debugStepInto);
   _$('#dbg-btn-step-out')?.addEventListener('click', debugStepOut);
   _$('#dbg-btn-stop')?.addEventListener('click', stopDebugSession);
   _$('#dbg-btn-restart')?.addEventListener('click', debugRestart);
+  // Clicking the exec-status pill opens the file when we paused elsewhere.
+  _$('#dbg-exec-status')?.addEventListener('click', () => {
+    const el = _$('#dbg-exec-status');
+    if (el && typeof el._onClick === 'function') el._onClick();
+  });
 
-  // Live Org toggle
+  // Clicking the yellow "querying / running" banner jumps to the executing line
+  // so the user can see where the run is and act there (stop, breakpoint, etc.).
+  _$('#dbg-query-banner')?.addEventListener('click', revealCurrentExecution);
+
+  // Live Org toggle — toggling ON runs the method in the org (there is no separate
+  // "Run in Org" button; toggle OFF→ON or press Restart ⟳ to re-run).
   _$('#dbg-liveorg-checkbox')?.addEventListener('change', toggleLiveOrgMode);
-  _$('#dbg-btn-run-org')?.addEventListener('click', runEntryMethodInOrg);
 
   // Wire up request modal
   _$('#dbg-modal-start')?.addEventListener('click', startDebugFromModal);
@@ -5654,6 +8485,12 @@ function initApexDebugger() {
   _$('#dbg-console-clear')?.addEventListener('click', () => {
     debugState.consoleLog = [];
     renderConsolePanel();
+  });
+
+  // Close the debug panel (hides Console / Org & Log). Available any time — the
+  // panel also stays visible after a session ends so output can be read first.
+  _$('#dbg-panel-close')?.addEventListener('click', () => {
+    hideDebugUI();
   });
 
   // Global keyboard handler for CodeLens command
@@ -5954,7 +8791,7 @@ async function evaluateInOrg(expr, frame) {
   const { resolvedExpr, unresolved } = rewriteExprForOrg(expr, frame);
   if (unresolved.length) {
     const names = [...new Set(unresolved)].join(', ');
-    return { error: `Can't evaluate: ${names} ${unresolved.length > 1 ? 'are' : 'is'} a runtime object built inside the method, and anonymous Apex can't call methods on it or rebuild it (private helpers/state aren't reachable). Use ▶ Run in Org to replay the whole method, then hover the variable itself for its real value — or set a value in the Console (e.g. \`${unresolved[0]} = …\`).`, resolvedExpr };
+    return { error: `Can't evaluate: ${names} ${unresolved.length > 1 ? 'are' : 'is'} a runtime object built inside the method, and anonymous Apex can't call methods on it or rebuild it (private helpers/state aren't reachable). Turn on the ⚡ Live Org toggle to replay the whole method in the org, then hover the variable itself for its real value — or set a value in the Console (e.g. \`${unresolved[0]} = …\`).`, resolvedExpr };
   }
 
   if (!debugState.orgEvalCache) debugState.orgEvalCache = new Map();
@@ -5989,7 +8826,7 @@ async function evaluateExpressionInOrg(expr) {
   } else {
     if (r.resolvedExpr && r.resolvedExpr !== expr) addConsoleEntry('info', `↳ ran: ${r.resolvedExpr}`);
     if (typeof r.value === 'object' && r.value !== null) {
-      addConsoleEntry('result-json', JSON.stringify(r.value, null, 2));
+      addConsoleEntry('result-json', JSON.stringify(r.value, null, 2), null, r.value);
     } else {
       addConsoleEntry('result', `${expr} → ${formatValue(r.value)}  (real org value)`);
     }
@@ -6061,8 +8898,35 @@ window._dbgFetchVarFromOrg = async function (scopeType, key, ev) {
 function evaluateConsoleExpression(expr) {
   addConsoleEntry('eval', `> ${expr}`);
 
-  if (!debugState.active || !debugState.paused) {
+  if (!debugState.active) {
     addConsoleEntry('error', 'No active debug session');
+    return;
+  }
+
+  // Free-running (active but not paused): refresh the live stack and do a
+  // READ-ONLY lookup of the expression against the current scope, so the user
+  // can inspect values mid-run without re-entering (and possibly corrupting) the
+  // running interpreter. Deep evaluation / method calls still require a pause.
+  if (!debugState.paused) {
+    const eng = debugState.engineSession;
+    if (eng && typeof eng.getCallStack === 'function') {
+      try { mirrorEngineStack(eng.getCallStack()); } catch (_) {}
+    }
+    if (!debugState.callStack.length) { addConsoleEntry('error', 'No active frame'); return; }
+    let v;
+    for (let fi = debugState.callStack.length - 1; fi >= 0; fi--) {
+      const f = debugState.callStack[fi];
+      const sc = { ...(f.classFields || {}), ...f.variables };
+      const r = resolveProperty(sc, expr);
+      if (r !== undefined) { v = r; break; }
+    }
+    if (v === undefined) {
+      addConsoleEntry('info', 'Running… only a plain variable name shows its live value right now. Pause (breakpoint / step) to evaluate expressions or call methods.');
+    } else if (v !== null && typeof v === 'object') {
+      addConsoleEntry('result-json', JSON.stringify(v, null, 2));
+    } else {
+      addConsoleEntry('result', formatValue(v));
+    }
     return;
   }
 
@@ -6168,8 +9032,18 @@ window.debugContinue = debugContinue;
 window.debugStepOver = debugStepOver;
 window.debugStepInto = debugStepInto;
 window.debugStepOut = debugStepOut;
+window.debugStepBack = debugStepBack;
 window.debugStop = stopDebugSession;
 window.debugRestart = debugRestart;
 window.showRequestModal = showRequestModal;
 window.startDebugFromModal = startDebugFromModal;
 window.debugState = debugState;
+// Proactive system-mode helper check — called by the Salesforce module when the
+// user connects/switches to an org (prompts to deploy the helper if missing).
+window.apexDebuggerCheckSystemHelper = onOrgConnectedCheckHelper;
+
+// Node-only test hook: expose the pure log/replay helpers for regression testing
+// (guarded so it is a no-op in the browser/renderer). Mirrors apexengine.js.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { buildReplayTimeline, getEntrySignature, parseApexLog, parseApexDebugValue, evalReplayLogTemplate, renderConsoleTreeValue, _compactFirstLevelJson, replayStepPauses, evalReplayCondition, replayLogpointText, replayLogpointPayload, replayStepScope, planReplayEmit, selectedFrameIndex, _execSig, _bpPauseDecision, _bpLogText, _bpLogPayload, _logExpressionPayload, _unreachedBreakpointNotes, _heapRefLabel, activeBreakpoint, saveBreakpoints, loadBreakpoints, debugState, applyNamespaceToSoql, stripColumnFromSoql, captureEngineHistory, planEngineForward, updateReplayPositionUI, _parseEditedValue, _hoverResolveParent, _hoverSetLeaf, _hoverChildVal, _cleanHoverValue, _pathToText, ensureFinestLogging, _ensureFinestLoggingUncached, warmUpLiveOrg };
+}

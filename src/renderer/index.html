@@ -266,6 +266,15 @@
 
         <!-- Editor area with split support -->
         <div id="editor-split-container" class="editor-split-container">
+          <!-- Live-Org query loader overlay (shown while the debugger fetches from the org) -->
+          <div id="dbg-query-banner" class="dbg-query-banner hidden" role="status" aria-live="polite" title="Go to the line currently executing">
+            <span class="dbg-query-banner-spinner"></span>
+            <span class="dbg-query-banner-text">
+              <span class="dbg-query-banner-title">Querying the org…</span>
+              <span id="dbg-query-banner-detail" class="dbg-query-banner-detail"></span>
+            </span>
+            <span class="dbg-query-banner-go" aria-hidden="true">↧ Go to line</span>
+          </div>
           <!-- Monaco editor (primary) -->
           <div id="editor-container"></div>
           <!-- Split editor (secondary) -->
@@ -354,10 +363,11 @@
             <button class="dbg-panel-tab" data-tab="dbg-callstack">Call Stack</button>
             <button class="dbg-panel-tab" data-tab="dbg-console">Console</button>
             <button class="dbg-panel-tab" data-tab="dbg-breakpoints">Breakpoints</button>
-            <button class="dbg-panel-tab" data-tab="dbg-orgactivity">⚡ Org</button>
+            <button class="dbg-panel-tab" data-tab="dbg-orgactivity">⚡ Org &amp; Log</button>
           </div>
           <div class="dbg-panel-actions">
             <button id="dbg-console-clear" class="tool-hdr-btn" title="Clear Console">⌫</button>
+            <button id="dbg-panel-close" class="tool-hdr-btn" title="Close panel">✕</button>
           </div>
         </div>
         <div class="dbg-panel-body">
@@ -382,7 +392,7 @@
           </div>
           <div id="dbg-console" class="dbg-tab-content">
             <div id="dbg-console-body" class="dbg-scroll-body">
-              <div class="dbg-empty">Debug console</div>
+              <div class="dbg-empty">Console — your System.debug() output appears here as the code runs.</div>
             </div>
             <div class="dbg-console-input-row">
               <span class="dbg-console-prompt">&gt;</span>
@@ -396,7 +406,7 @@
           </div>
           <div id="dbg-orgactivity" class="dbg-tab-content">
             <div id="dbg-orgactivity-body" class="dbg-scroll-body">
-              <div class="dbg-empty">Enable ⚡ Live Org and click "Run in Org" to execute the entry method against the connected org (read-only — changes are rolled back).</div>
+              <div class="dbg-empty">Turn on the ⚡ Live Org toggle to run the entry method against the connected org (read-only — changes are rolled back). Toggle it OFF then ON, or press Restart ⟳, to run again.</div>
             </div>
           </div>
         </div>
@@ -1299,10 +1309,13 @@
 
   <!-- Debug Toolbar (floating bar, shown during debug session) -->
   <div id="debug-toolbar" class="debug-toolbar hidden">
-    <span class="dbg-toolbar-label">DEBUGGING</span>
+    <span class="dbg-toolbar-label" id="dbg-drag-handle" title="Drag to move the debug bar">⠿ DEBUGGING</span>
     <div class="dbg-toolbar-buttons">
       <button id="dbg-btn-continue" class="dbg-toolbar-btn" title="Continue (F5)">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><polygon points="3,2 14,8 3,14"/></svg>
+      </button>
+      <button id="dbg-btn-step-back" class="dbg-toolbar-btn dbg-btn-back" title="Step Back (⇧F10) — replay: go to the previous statement with its real recorded values" disabled>
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="10" r="3"/><path d="M13 4H8a3 3 0 00-3 3"/><polyline points="8,2 5,4 8,6"/></svg>
       </button>
       <button id="dbg-btn-step-over" class="dbg-toolbar-btn" title="Step Over (F10)">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="10" r="3"/><path d="M3 4h5a3 3 0 013 3"/><polyline points="8,2 11,4 8,6"/></svg>
@@ -1327,7 +1340,6 @@
         <span class="dbg-liveorg-text">⚡ Live Org</span>
       </label>
       <span id="dbg-liveorg-status" class="dbg-liveorg-status disconnected">no org connected</span>
-      <button id="dbg-btn-run-org" class="dbg-runorg-btn" title="Execute the entry method against the connected org (read-only — any DML is rolled back) and capture real data + org activity">▶ Run in Org</button>
     </div>
     <span id="dbg-exec-status" class="dbg-exec-status" style="display:none"></span>
   </div>

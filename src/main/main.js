@@ -33,11 +33,35 @@ async function getMarked() {
 app.setName('CongaCode');
 
 // ---------------------------------------------------------------------------
+// Never let a broken stdout/stderr pipe crash the app.
+// process.stdout / process.stderr are used purely for diagnostics (mirroring the
+// renderer console, log echoing). When our output is piped into a consumer that
+// exits first — e.g. `npm start | grep`, a closed terminal, or a parent that goes
+// away — the NEXT write to that pipe completes ASYNCHRONOUSLY with EPIPE. Node
+// surfaces it as an 'error' event on the stream; with no listener it escalates to
+// an uncaught exception that pops Electron's "A JavaScript error occurred in the
+// main process" dialog and takes the whole app down (repeatedly, on every console
+// line). A vanished diagnostic reader must never be fatal, so swallow these write
+// errors. try/catch around the write() call does NOT help — the failure is async.
+// ---------------------------------------------------------------------------
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === 'function') {
+    stream.on('error', (err) => {
+      if (err && (err.code === 'EPIPE' || err.code === 'EOF' || err.code === 'ERR_STREAM_DESTROYED')) return;
+      // Any other error writing to a diagnostic stream is equally non-fatal here;
+      // there is nowhere safe to report it (writing would recurse), so ignore it.
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
 const CONGACODE_DIR = path.join(os.homedir(), 'CongaCode');
 const SESSION_FILE = path.join(CONGACODE_DIR, '.session.json');
 const RECENT_FILE = path.join(CONGACODE_DIR, '.recent.json');
+const LOG_DIR = path.join(CONGACODE_DIR, 'logs');
+const RENDERER_LOG = path.join(LOG_DIR, 'renderer-console.log');
 const SETTINGS_FILE = path.join(CONGACODE_DIR, 'settings.json');
 const AUTOSAVE_DIR = path.join(CONGACODE_DIR, 'AutoSave');
 
@@ -235,6 +259,38 @@ function getAllFiles(dirPath, maxFiles = 5000) {
 // ---------------------------------------------------------------------------
 let mainWindow = null;
 
+// ---------------------------------------------------------------------------
+// Renderer console capture
+// Mirror the renderer's DevTools console (which also carries the Apex debugger's
+// console-panel output — see addConsoleEntry, which echoes through console.*) to
+// a rotating-free log file plus this process's stdout. This lets an external
+// watcher tail debugger failures live, with no manual copy-paste.
+// Log file: ~/CongaCode/logs/renderer-console.log
+// ---------------------------------------------------------------------------
+const CONSOLE_LEVEL_NAMES = ['LOG', 'INFO', 'WARNING', 'ERROR'];
+function attachConsoleCapture(win) {
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (_) { /* best effort */ }
+  const writeLine = (line) => {
+    try { fs.appendFileSync(RENDERER_LOG, line); } catch (_) { /* best effort */ }
+    // Skip stdout once its downstream reader is gone; the global 'error' handler
+    // above is the real safety net (EPIPE surfaces asynchronously), this just
+    // avoids buffering into a dead pipe.
+    try {
+      if (!process.stdout.destroyed && process.stdout.writable !== false) {
+        process.stdout.write(`[renderer] ${line}`);
+      }
+    } catch (_) { /* best effort */ }
+  };
+  win.webContents.on('console-message', (_event, level, message, lineNo, sourceId) => {
+    const lvl = CONSOLE_LEVEL_NAMES[level] || `L${level}`;
+    const src = sourceId ? ` (${String(sourceId).split('/').pop()}:${lineNo})` : '';
+    writeLine(`${new Date().toISOString()} [${lvl}]${src} ${message}\n`);
+  });
+  win.webContents.on('render-process-gone', (_e, details) => {
+    writeLine(`${new Date().toISOString()} [CRASH] render-process-gone: ${JSON.stringify(details)}\n`);
+  });
+}
+
 function createNewWindow() {
   const win = new BrowserWindow({
     width: 1280, height: 800,
@@ -254,6 +310,7 @@ function createNewWindow() {
   // Load with ?new=1 so the renderer skips session restore
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'), { query: { new: '1' } });
   win.once('ready-to-show', () => win.show());
+  attachConsoleCapture(win);
 
   // Open external links in default browser for new windows too
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -294,6 +351,7 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  attachConsoleCapture(mainWindow);
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
     mainWindow.webContents.send('session:restore', session);

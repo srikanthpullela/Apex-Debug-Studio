@@ -302,6 +302,21 @@
     // Persist selection for this repo
     saveOrgForRepo(sel.value);
     updateStatusBarOrg();
+    // Offer to deploy the system-mode helper class if this connected org lacks it.
+    notifySystemHelperOnConnect(connected);
+  }
+
+  /**
+   * Ask the Apex debugger to verify (and, with consent, deploy) its system-mode
+   * helper class on the freshly connected org. Fire-and-forget; safe if the
+   * debugger module isn't loaded yet.
+   */
+  function notifySystemHelperOnConnect(connected) {
+    try {
+      if (connected && typeof window.apexDebuggerCheckSystemHelper === 'function' && typeof window.sfGetActiveOrg === 'function') {
+        window.apexDebuggerCheckSystemHelper(window.sfGetActiveOrg());
+      }
+    } catch (_) { /* non-fatal */ }
   }
 
   /** Authenticate a new org via browser OAuth flow */
@@ -334,6 +349,9 @@
       if (btn) { btn.disabled = false; btn.textContent = '+ Add Org'; }
       updateStatusBarOrg(); // reset status bar text
       await checkOrgConnection();
+      // A freshly authenticated org is auto-selected without firing the dropdown
+      // 'change' event, so trigger the system-mode helper check explicitly.
+      notifySystemHelperOnConnect(sfState.orgConnected);
     }
   }
 

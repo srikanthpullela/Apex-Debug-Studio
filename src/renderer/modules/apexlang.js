@@ -157,7 +157,7 @@
             raw += ch; k++;
           }
           i = k;
-          push('soql', raw.trim(), startLine, startCol);
+          push('soql', stripSoqlComments(raw).trim(), startLine, startCol);
           continue;
         }
       }
@@ -194,6 +194,71 @@
     e.apexParse = true;
     e.line = tok ? tok.line : 0;
     return e;
+  }
+
+  // Render a parsed type node back to its Apex source form, e.g.
+  // { name: 'Map', args: [{name:'String'}, {name:'List', args:[{name:'X'}]}] }
+  // -> "Map<String,List<X>>". Used for generic type-class literals (List<X>.class).
+  function typeToString(t) {
+    if (!t) return '';
+    let s = t.name;
+    if (t.args && t.args.length) s += '<' + t.args.map(typeToString).join(',') + '>';
+    return s;
+  }
+
+  // Flatten a parsed ident/prop chain (e.g. `RemoteCPQ.LineItemDO`) into a dotted
+  // type-name string. Used for the `<Type>.class` type-literal in postfix position.
+  // Returns null when the chain isn't a pure type reference (so we fall back to a
+  // normal property access). `class` is a reserved word in Apex and can never be a
+  // real member name, so intercepting `.class` here is always safe and general.
+  function chainToTypeName(expr) {
+    if (!expr) return null;
+    if (expr.kind === 'ident') return expr.name;
+    if (expr.kind === 'prop' && !expr.safe) {
+      const base = chainToTypeName(expr.target);
+      return base ? base + '.' + expr.name : null;
+    }
+    return null;
+  }
+
+  // Strip `//` line comments and `/* */` block comments from an inline SOQL/SOSL
+  // literal, honoring single-quoted string literals so a legitimate slash inside a
+  // string (e.g. 'http://x', or a LIKE pattern) is preserved. Apex removes these
+  // comments from bracketed queries at compile time; if they leak through to the
+  // org's query parser it rejects them with "unexpected token: '/'". Comments are
+  // replaced by a single space so adjacent tokens stay separated. General — applies
+  // to every inline query, not any specific one.
+  function stripSoqlComments(src) {
+    let out = '';
+    const n = src.length;
+    for (let i = 0; i < n; i++) {
+      const c = src[i];
+      if (c === '\'') {
+        out += c; i++;
+        while (i < n && src[i] !== '\'') {
+          if (src[i] === '\\') { out += src[i]; i++; if (i < n) { out += src[i]; i++; } continue; }
+          out += src[i]; i++;
+        }
+        if (i < n) out += src[i]; // closing quote
+        continue;
+      }
+      if (c === '/' && src[i + 1] === '/') {
+        i += 2;
+        while (i < n && src[i] !== '\n') i++;
+        out += ' ';
+        if (i < n) out += '\n'; // keep the newline that terminated the comment
+        continue;
+      }
+      if (c === '/' && src[i + 1] === '*') {
+        i += 2;
+        while (i < n && !(src[i] === '*' && src[i + 1] === '/')) i++;
+        i += 1; // sit on the closing '/', for-loop i++ steps past it
+        out += ' ';
+        continue;
+      }
+      out += c;
+    }
+    return out;
   }
 
   class Parser {
@@ -904,6 +969,17 @@
         if (this.isP('.') || this.isP('?.')) {
           const safe = this.isP('?.');
           this.next();
+          // `<Type>.class` type literal (e.g. Account.class, RemoteCPQ.LineItemDO.class).
+          // `class` is a reserved word and can never be a member name, so this is
+          // unambiguous and applies to any type-reference chain — no hardcoding.
+          if (!safe && this.isKw('class')) {
+            const typeName = chainToTypeName(expr);
+            if (typeName) {
+              this.next(); // consume 'class'
+              expr = { kind: 'classlit', typeName, line: expr.line };
+              continue;
+            }
+          }
           const name = this.expectName();
           if (this.isP('(')) {
             const args = this.parseArgs();
@@ -971,6 +1047,23 @@
       }
 
       if (this.isName()) {
+        // Generic type-class literal: List<Foo>.class, Set<X>.class, Map<K,V>.class.
+        // In expression position a bare '<' is normally the comparison operator, so
+        // we speculatively parse a generic type and only accept it when it is
+        // immediately followed by '.class'. Otherwise we restore and fall through,
+        // leaving ordinary comparisons (a < b) completely untouched.
+        if (this.isP('<', 1)) {
+          const save = this.save();
+          try {
+            const gtype = this.parseType();
+            if (gtype.args && gtype.args.length && this.isP('.') && this.isKw('class', 1)) {
+              this.next(); // '.'
+              this.next(); // 'class'
+              return { kind: 'classlit', typeName: typeToString(gtype), line };
+            }
+          } catch (_) { /* not a generic type-class literal */ }
+          this.restore(save);
+        }
         const name = this.expectName();
         if (this.isP('(')) {
           const args = this.parseArgs();

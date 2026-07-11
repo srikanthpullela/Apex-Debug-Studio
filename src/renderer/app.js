@@ -641,6 +641,7 @@ function createTab(title, filePath, content = '', lang = null) {
   state.tabs.push(tab);
   renderTabs();
   activateTab(id);
+  saveSessionDebounced();
   return tab;
 }
 
@@ -657,6 +658,7 @@ function activateTab(id) {
 
 window.activateTab = activateTab;
   state.activeTabId = id;
+  saveSessionDebounced();
 
   // Handle special tabs (settings, image)
   hideSettingsUI();
@@ -773,6 +775,7 @@ function closeTab(id) {
       showWelcome();
     }
     renderTabs();
+    saveSessionDebounced();
     return;
   }
   if (state.activeTabId === id) {
@@ -781,6 +784,7 @@ function closeTab(id) {
   } else {
     renderTabs();
   }
+  saveSessionDebounced();
 }
 
 function renderTabs() {
@@ -1000,15 +1004,25 @@ function clearAutoSave(tabId) {
    5. SESSION MANAGEMENT
    ================================================================ */
 async function saveSession() {
+  // Never overwrite the saved session while we're in the middle of restoring it —
+  // a partial state (folder open, tabs not yet reopened) would clobber the good copy.
+  if (state._restoringSession) return;
   try {
-    const tabs = state.tabs.map((t) => ({
+    // Only persist REAL editor tabs. Settings / diff / commit-diff tabs are transient
+    // views with no file on disk — restoring them as untitled buffers would be noise.
+    const restorable = state.tabs.filter((t) => !t._isSettings && !t._isDiff && !t._isCommitDiff);
+    const tabs = restorable.map((t) => ({
       title: t.title,
-      filePath: t.filePath,
-      content: t.filePath ? null : t.model.getValue(),
+      filePath: t.filePath || null,
+      // File-backed tabs are re-read from disk on restore (never store stale/huge
+      // bodies); only unsaved/untitled buffers keep their content inline.
+      content: t.filePath ? null : (t.model ? t.model.getValue() : ''),
     }));
+    const activeTab = state.tabs.find((t) => t.id === state.activeTabId);
     await window.congacode.saveSession({
       tabs,
-      activeIndex: state.tabs.findIndex((t) => t.id === state.activeTabId),
+      activeIndex: restorable.findIndex((t) => t.id === state.activeTabId),
+      activeFilePath: activeTab && activeTab.filePath ? activeTab.filePath : null,
       folderPath: state.folderPath,
       theme: state.theme,
       sidebarVisible: state.sidebarVisible,
@@ -1021,35 +1035,96 @@ async function saveSession() {
 
 const saveSessionDebounced = debounce(saveSession, 1000);
 
+// A reload/close fires beforeunload — flush the latest workspace shape (best-effort;
+// the 1s debounced saves already keep the file fresh for the common case).
+window.addEventListener('beforeunload', () => { try { saveSession(); } catch {} });
+
 async function restoreSession() {
-  // Skip session restore for new windows (opened via New Window)
   const params = new URLSearchParams(window.location.search);
-  if (params.get('new') === '1') {
-    // Still restore theme preference
+  const isNewWindow = params.get('new') === '1';
+
+  // Tell a WINDOW RELOAD (Cmd/Ctrl+R · "Reload Window") apart from a cold app launch.
+  // sessionStorage survives a renderer reload but is empty in a brand-new process /
+  // window — so finding the flag means "this document was reloaded". We fully restore
+  // the workspace only on reload; a cold start keeps the deliberate welcome screen.
+  let isReload = false;
+  try {
+    isReload = sessionStorage.getItem('congacode-window-live') === '1';
+    sessionStorage.setItem('congacode-window-live', '1');
+  } catch {}
+
+  // New windows are always a clean slate (but keep the theme preference).
+  if (isNewWindow) {
     try {
       const session = await window.congacode.loadSession();
       if (session?.theme) { state.theme = session.theme; applyTheme(state.theme); }
     } catch {}
-    // Sidebar stays hidden until a folder is opened
     state.sidebarVisible = false;
     applySidebarState();
     return;
   }
+
   try {
     const session = await window.congacode.loadSession();
     if (!session) return;
-    // Restore user preferences only — theme, sidebar
+    // User preferences always come back.
     if (session.theme) { state.theme = session.theme; applyTheme(state.theme); }
-    // Sidebar only shows when a folder is opened (handled by openFolder)
-    // Start hidden; openFolder will set it visible
-    state.sidebarVisible = false;
-    if (session.sidebarWidth) {
-      state.sidebarWidth = session.sidebarWidth;
+    if (session.sidebarWidth) state.sidebarWidth = session.sidebarWidth;
+
+    if (isReload) {
+      // Reload → bring the workspace back exactly: folder, open files, active tab.
+      await restoreWorkspace(session);
+    } else {
+      // Cold start → sidebar stays hidden until a folder is opened (welcome screen).
+      state.sidebarVisible = false;
+      applySidebarState();
     }
-    applySidebarState();
-    // Do NOT restore folderPath or tabs — always start fresh with welcome screen
   } catch (err) {
     console.error('restoreSession error:', err);
+  }
+}
+
+// Reopen the folder + file tabs saved in the last session. Used on a window reload so
+// the developer lands back exactly where they were instead of the welcome screen. Every
+// step is best-effort: a folder or file that has since moved/deleted is skipped, never
+// blocking the rest of the restore.
+async function restoreWorkspace(session) {
+  state._restoringSession = true;
+  try {
+    if (session.folderPath) {
+      try { await openFolder(session.folderPath); }
+      catch (e) { console.error('restore folder failed:', e); }
+    } else {
+      state.sidebarVisible = false;
+      applySidebarState();
+    }
+
+    const savedTabs = Array.isArray(session.tabs) ? session.tabs : [];
+    for (const t of savedTabs) {
+      if (!t) continue;
+      try {
+        if (t.filePath) {
+          const content = await window.congacode.readFile(t.filePath);
+          if (content != null) await openFile(t.filePath, content); // skip files that vanished
+        } else if (t.content != null) {
+          createTab(t.title || null, null, t.content); // unsaved/untitled buffer
+        }
+      } catch (e) { /* skip a tab that can't be reopened; keep restoring the rest */ }
+    }
+
+    // Re-activate the tab the user was last on — match by path first (robust to
+    // skipped tabs), then fall back to the saved index.
+    let target = null;
+    if (session.activeFilePath) target = state.tabs.find((t) => t.filePath === session.activeFilePath);
+    if (!target && Number.isInteger(session.activeIndex) && session.activeIndex >= 0) {
+      target = state.tabs[session.activeIndex];
+    }
+    if (target) activateTab(target.id);
+  } catch (err) {
+    console.error('restoreWorkspace error:', err);
+  } finally {
+    state._restoringSession = false;
+    saveSession(); // persist the freshly-restored shape right away
   }
 }
 
@@ -1961,6 +2036,7 @@ const COMMANDS = [
   { id: 'debug-step-over',     label: 'Debug: Step Over',         shortcut: 'F10', action: () => window.debugStepOver?.() },
   { id: 'debug-step-into',     label: 'Debug: Step Into',         shortcut: 'F11', action: () => window.debugStepInto?.() },
   { id: 'debug-step-out',      label: 'Debug: Step Out',          shortcut: '⇧F11', action: () => window.debugStepOut?.() },
+  { id: 'debug-step-back',     label: 'Debug: Step Back (replay)', shortcut: '⇧F10', action: () => window.debugStepBack?.() },
   { id: 'debug-toggle-bp',     label: 'Debug: Toggle Breakpoint', shortcut: 'F9', action: () => {
     const editor = state.editor;
     if (!editor) return;
@@ -3599,6 +3675,8 @@ function initKeyboard() {
     if (!cmd && !shift && !alt && !e.ctrlKey && e.key === 'F11') { e.preventDefault(); window.debugStepInto?.(); return; }
     // Shift+F11 → Step Out
     if (!cmd && shift && !alt && !e.ctrlKey && e.key === 'F11') { e.preventDefault(); window.debugStepOut?.(); return; }
+    // Shift+F10 → Step Back (reverse through the recorded replay timeline)
+    if (!cmd && shift && !alt && !e.ctrlKey && e.key === 'F10') { e.preventDefault(); window.debugStepBack?.(); return; }
     // F9 → Toggle Breakpoint
     if (!cmd && !shift && !alt && !e.ctrlKey && e.key === 'F9') {
       e.preventDefault();

@@ -53,6 +53,35 @@
   }
   function npe(line, msg) { return new ApexError('System.NullPointerException', msg || 'Attempt to de-reference a null object', line); }
 
+  /* ================= user-defined enum constants =================
+   * Apex enum constants are first-class values exposing name()/ordinal(); a bare
+   * string cannot carry the ordinal or the owning enum identity, so we box them.
+   * Every value choke point below (keyOf, apexEquals, toApexString, jsonify,
+   * instance dispatch) unwraps to the canonical constant name, so a boxed enum
+   * still compares, hashes, serialises and concatenates exactly like its name —
+   * preserving switch/==/Map-key/SOQL-bind behaviour — while name()/ordinal()
+   * now return real values. Builtin enums (JSONToken, DisplayType…) stay strings. */
+  class ApexEnumValue {
+    constructor(enumClass, enumName, enumOrdinal) {
+      this.enumClass = enumClass;     // owning enum's class name
+      this.enumName = enumName;       // canonical constant name (declared case)
+      this.enumOrdinal = enumOrdinal; // 0-based declaration position
+    }
+    toString() { return this.enumName; }
+  }
+  // Box a user enum constant by name. Returns null when the name isn't a member
+  // so casts/valueOf degrade honestly instead of inventing a constant.
+  function makeEnumValue(ci, rawName) {
+    const vals = (ci && ci.ast && ci.ast.enumValues) || [];
+    const idx = vals.findIndex(v => v.toLowerCase() === String(rawName).toLowerCase());
+    if (idx < 0) return null;
+    return new ApexEnumValue(ci.name, vals[idx], idx);
+  }
+  function enumValuesOf(ci) {
+    const vals = (ci && ci.ast && ci.ast.enumValues) || [];
+    return vals.map((v, i) => new ApexEnumValue(ci.name, v, i));
+  }
+
   /* ================= identity for hashing keys ================= */
   let __idCounter = 1;
   const __idMap = new WeakMap();
@@ -66,6 +95,7 @@
     if (t === 'string') return 's:' + v;
     if (t === 'number') return 'n:' + v;
     if (t === 'boolean') return 'b:' + v;
+    if (v instanceof ApexEnumValue) return 'en:' + v.enumClass + ':' + v.enumName;
     if (v instanceof ApexDate) return 'd:' + v.iso();
     if (v instanceof ApexDatetime) return 'dt:' + v.d.getTime();
     return 'o:' + identityId(v);
@@ -97,6 +127,120 @@
     clear() { this.m.clear(); }
   }
 
+  /* ================= JSON streaming (System.JSONGenerator / System.JSONParser) =================
+   * Faithful models of Apex's pull-generator and pull-parser. The generator builds an
+   * ordered value tree and serialises it exactly like JSON.serialize (so getAsString()
+   * equals JSON.serialize of the same shape). The parser tokenises the raw string into a
+   * flat stream, preserving key order and the int-vs-float distinction Apex exposes via
+   * VALUE_NUMBER_INT / VALUE_NUMBER_FLOAT. Neither fabricates data — they only reshape
+   * values the caller already holds. */
+  class ApexJsonGenerator {
+    constructor(pretty) {
+      this.pretty = !!pretty;
+      this.root = undefined;      // top-level value once written
+      this.stack = [];            // open containers ({} or []) innermost last
+      this.pendingField = null;   // field name awaiting its value in object context
+    }
+    _place(value) {
+      if (this.stack.length === 0) { this.root = value; return; }
+      const top = this.stack[this.stack.length - 1];
+      if (Array.isArray(top)) { top.push(value); return; }
+      if (this.pendingField !== null) { top[this.pendingField] = value; this.pendingField = null; }
+      // A value in object context without a field name is invalid Apex (JSONException);
+      // a debugger stays lenient and drops it rather than aborting the step.
+    }
+    _open(container) { this._place(container); this.stack.push(container); }
+    getAsString() {
+      const v = this.root === undefined ? null : this.root;
+      return JSON.stringify(v, null, this.pretty ? 2 : 0);
+    }
+  }
+
+  // Tokenise a JSON string into a flat stream. Field names are distinguished from string
+  // values by structural context; integers and floats are tagged separately to mirror
+  // Apex's JSONToken.VALUE_NUMBER_INT vs VALUE_NUMBER_FLOAT.
+  function tokenizeJson(src) {
+    const s = String(src == null ? '' : src);
+    const n = s.length;
+    const out = [];
+    const ctx = [];               // 'obj' | 'arr'
+    let expectField = false;
+    let i = 0;
+    const isWs = c => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+    function readString() {
+      let j = i + 1, str = '';
+      while (j < n) {
+        const c = s[j];
+        if (c === '\\') {
+          const e = s[j + 1];
+          if (e === 'n') str += '\n';
+          else if (e === 't') str += '\t';
+          else if (e === 'r') str += '\r';
+          else if (e === 'b') str += '\b';
+          else if (e === 'f') str += '\f';
+          else if (e === 'u') { str += String.fromCharCode(parseInt(s.substr(j + 2, 4), 16)); j += 4; }
+          else str += e;               // \" \\ \/ and any other escaped char
+          j += 2;
+        } else if (c === '"') { j++; break; }
+        else { str += c; j++; }
+      }
+      i = j;
+      return str;
+    }
+    while (i < n) {
+      const c = s[i];
+      if (isWs(c)) { i++; continue; }
+      if (c === '{') { out.push({ token: 'START_OBJECT', text: '{' }); ctx.push('obj'); expectField = true; i++; continue; }
+      if (c === '}') { out.push({ token: 'END_OBJECT', text: '}' }); ctx.pop(); expectField = false; i++; continue; }
+      if (c === '[') { out.push({ token: 'START_ARRAY', text: '[' }); ctx.push('arr'); expectField = false; i++; continue; }
+      if (c === ']') { out.push({ token: 'END_ARRAY', text: ']' }); ctx.pop(); expectField = false; i++; continue; }
+      if (c === ',') { expectField = ctx[ctx.length - 1] === 'obj'; i++; continue; }
+      if (c === ':') { expectField = false; i++; continue; }
+      if (c === '"') {
+        const str = readString();
+        if (expectField && ctx[ctx.length - 1] === 'obj') { out.push({ token: 'FIELD_NAME', text: str }); expectField = false; }
+        else out.push({ token: 'VALUE_STRING', text: str, value: str });
+        continue;
+      }
+      if (s.startsWith('true', i)) { out.push({ token: 'VALUE_TRUE', text: 'true', value: true }); i += 4; continue; }
+      if (s.startsWith('false', i)) { out.push({ token: 'VALUE_FALSE', text: 'false', value: false }); i += 5; continue; }
+      if (s.startsWith('null', i)) { out.push({ token: 'VALUE_NULL', text: 'null', value: null }); i += 4; continue; }
+      const m = /^-?\d+(\.\d+)?([eE][+-]?\d+)?/.exec(s.slice(i));
+      if (m) {
+        const raw = m[0];
+        const isFloat = /[.eE]/.test(raw);
+        out.push({ token: isFloat ? 'VALUE_NUMBER_FLOAT' : 'VALUE_NUMBER_INT', text: raw, value: Number(raw) });
+        i += raw.length;
+        continue;
+      }
+      i++;                          // skip anything unexpected
+    }
+    return out;
+  }
+
+  // Index of the END token that closes the container the parser is currently positioned on
+  // (or the same index when the current token is a scalar / has no children).
+  function jsonSkipChildren(tokens, idx) {
+    const t = tokens[idx];
+    if (!t || (t.token !== 'START_OBJECT' && t.token !== 'START_ARRAY')) return idx;
+    let depth = 0;
+    for (let k = idx; k < tokens.length; k++) {
+      const tk = tokens[k].token;
+      if (tk === 'START_OBJECT' || tk === 'START_ARRAY') depth++;
+      else if (tk === 'END_OBJECT' || tk === 'END_ARRAY') { depth--; if (depth === 0) return k; }
+    }
+    return tokens.length - 1;
+  }
+
+  class ApexJsonParser {
+    constructor(jsonString) {
+      this.tokens = tokenizeJson(jsonString);
+      this.idx = -1;                // positioned before the first token, like a fresh Apex parser
+      this.lastCleared = null;
+    }
+    cur() { return (this.idx >= 0 && this.idx < this.tokens.length) ? this.tokens[this.idx] : null; }
+  }
+
   /* ================= dates ================= */
   class ApexDate {
     constructor(y, m, d) { this.y = y; this.mo = m; this.day = d; }
@@ -126,6 +270,31 @@
       return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     }
   }
+  // Apex `Time` — a wall-clock time of day with no date/timezone. Modelled as h/m/s/ms
+  // so Datetime.newInstance(Date, Time) / newInstanceGmt(Date, Time) can combine them.
+  class ApexTime {
+    constructor(h, m, s, ms) { this.h = h | 0; this.mi = m | 0; this.s = s | 0; this.ms = ms | 0; }
+    _ms() { return ((this.h * 60 + this.mi) * 60 + this.s) * 1000 + this.ms; }
+    static _fromMs(t) { t = ((t % 86400000) + 86400000) % 86400000; const ms = t % 1000; t = (t - ms) / 1000; const s = t % 60; t = (t - s) / 60; const mi = t % 60; const h = (t - mi) / 60; return new ApexTime(h, mi, s, ms); }
+    addHours(n) { return ApexTime._fromMs(this._ms() + n * 3600000); }
+    addMinutes(n) { return ApexTime._fromMs(this._ms() + n * 60000); }
+    addSeconds(n) { return ApexTime._fromMs(this._ms() + n * 1000); }
+    addMilliseconds(n) { return ApexTime._fromMs(this._ms() + n); }
+    toString() { const p = (n, w = 2) => String(n).padStart(w, '0'); return `${p(this.h)}:${p(this.mi)}:${p(this.s)}.${p(this.ms, 3)}Z`; }
+  }
+  // Apex `Blob` — opaque binary. CPQ builds them from strings for REST response bodies
+  // (Blob.valueOf(jsonStr)) and reads size()/toString(). Modelled over the UTF-8 string.
+  class ApexBlob {
+    constructor(s) { this.s = s == null ? '' : String(s); }
+    size() { return (typeof Buffer !== 'undefined') ? Buffer.byteLength(this.s, 'utf8') : new TextEncoder().encode(this.s).length; }
+    toString() { return this.s; }
+  }
+  // base64 / hex that work in both Node (tests) and the Electron renderer (Buffer present
+  // via node integration; btoa/atob fallback otherwise). UTF-8 safe.
+  function b64encode(str) { return (typeof Buffer !== 'undefined') ? Buffer.from(String(str), 'utf8').toString('base64') : btoa(unescape(encodeURIComponent(String(str)))); }
+  function b64decode(b64) { return (typeof Buffer !== 'undefined') ? Buffer.from(String(b64), 'base64').toString('utf8') : decodeURIComponent(escape(atob(String(b64)))); }
+  function hexencode(str) { if (typeof Buffer !== 'undefined') return Buffer.from(String(str), 'utf8').toString('hex'); return Array.from(new TextEncoder().encode(String(str))).map(b => b.toString(16).padStart(2, '0')).join(''); }
+  function hexdecode(hex) { if (typeof Buffer !== 'undefined') return Buffer.from(String(hex), 'hex').toString('utf8'); const bytes = String(hex).match(/.{1,2}/g) || []; return new TextDecoder().decode(new Uint8Array(bytes.map(h => parseInt(h, 16)))); }
 
   /* ================= user-class instance ================= */
   class ApexObject {
@@ -313,6 +482,12 @@
   function sobjType(rec) {
     return (rec && rec.attributes && rec.attributes.type) ? rec.attributes.type : 'SObject';
   }
+  // Apex primitive/value parameter types. An SObject value can never legally bind
+  // to one of these, so overload scoring must reject such pairings outright.
+  const PRIMITIVE_PARAM_TYPES = new Set([
+    'id', 'string', 'integer', 'long', 'double', 'decimal',
+    'boolean', 'date', 'datetime', 'time', 'blob'
+  ]);
 
   /* ================= environment (scope chain) ================= */
   class Environment {
@@ -365,6 +540,9 @@
     if (v instanceof ApexMap) return '{' + Array.from(v.m.values()).map(e => toApexString(e.k) + '=' + toApexString(e.v)).join(', ') + '}';
     if (v instanceof ApexSet) return '{' + v.items().map(toApexString).join(', ') + '}';
     if (v instanceof ApexDate || v instanceof ApexDatetime) return v.toString();
+    if (v instanceof ApexTime) return v.toString();
+    if (v instanceof ApexBlob) return v.s;
+    if (v instanceof ApexEnumValue) return v.enumName;
     if (v instanceof ApexError) return v.toString();
     if (v instanceof ApexObject) {
       const parts = [];
@@ -372,6 +550,10 @@
       return `${v.classInfo.name}:[${parts.join(', ')}]`;
     }
     if (isSObject(v)) {
+      // A System.URL wrapper stringifies to its external form when known locally
+      // (a literal URL); an org-context factory can't be resolved synchronously,
+      // so it degrades to an empty string rather than a fabricated domain.
+      if (v.__url) return v.__url.spec != null ? String(v.__url.spec) : '';
       // Schema describe-chain handles stringify to their API name (matches Apex,
       // e.g. `'' + ProductConfiguration__c.getSObjectType()` → 'ProductConfiguration__c').
       if (v.__sobjectType) return v.__sobjectType;
@@ -379,7 +561,10 @@
       if (v.__fieldsHandle) return v.__fieldsHandle;
       if (v.__sobjectField) return v.__sobjectField.field;
       if (v.__describeFieldResult) return v.__describeFieldResult.field;
+      if (v.__displayType) return v.__displayType;
       if (v.__typeToken) return v.__typeToken;
+      if (v.__pattern) return v.__pattern.original;
+      if (v.__matcher) return 'java.util.regex.Matcher';
       const parts = [];
       for (const k of Object.keys(v)) { if (k === 'attributes') continue; parts.push(`${k}=${toApexString(v[k])}`); }
       return `${sobjType(v)}:{${parts.join(', ')}}`;
@@ -389,6 +574,13 @@
   function apexEquals(a, b) {
     if (a === null || a === undefined) return b === null || b === undefined;
     if (b === null || b === undefined) return false;
+    // Boxed user enum constant compares by canonical name (case-insensitive, like
+    // Apex ==), also accepting the bare name string used in `switch when` labels.
+    if (a instanceof ApexEnumValue || b instanceof ApexEnumValue) {
+      const an = a instanceof ApexEnumValue ? a.enumName : (typeof a === 'string' ? a : null);
+      const bn = b instanceof ApexEnumValue ? b.enumName : (typeof b === 'string' ? b : null);
+      return an != null && bn != null && an.toLowerCase() === bn.toLowerCase();
+    }
     // Apex '==' on Strings is case-insensitive
     if (typeof a === 'string' && typeof b === 'string') return a.toLowerCase() === b.toLowerCase();
     if (typeof a === 'number' && typeof b === 'number') return a === b;
@@ -409,6 +601,8 @@
     if (b instanceof ApexDate) bv = b.js().getTime();
     if (a instanceof ApexDatetime) av = a.d.getTime();
     if (b instanceof ApexDatetime) bv = b.d.getTime();
+    if (a instanceof ApexTime) av = a._ms();
+    if (b instanceof ApexTime) bv = b._ms();
     switch (op) {
       case '<': return av < bv;
       case '<=': return av <= bv;
@@ -425,6 +619,9 @@
     if (v instanceof ApexSet) return v.items().map(jsonify);
     if (v instanceof ApexDate) return v.iso();
     if (v instanceof ApexDatetime) return v.d.toISOString();
+    if (v instanceof ApexTime) return v.toString();
+    if (v instanceof ApexBlob) return b64encode(v.s);
+    if (v instanceof ApexEnumValue) return v.enumName;
     if (v instanceof ApexObject) { const o = {}; for (const e of v.fields.values()) o[e.name] = jsonify(e.value); return o; }
     if (isSObject(v)) { const o = {}; for (const k of Object.keys(v)) o[k] = jsonify(v[k]); return o; }
     return String(v);
@@ -441,6 +638,62 @@
     let s = (prefix || '001') + '000000';
     while (s.length < 18) s += chars[Math.floor(Math.random() * chars.length)];
     return s.substring(0, 18);
+  }
+
+  /* ---------- java.util.regex ↔ JS RegExp (native, deterministic) ----------
+   * Apex's Pattern/Matcher are backed by java.util.regex. For the constructs CPQ
+   * uses (character classes, quantifiers, groups, anchors, case-insensitivity)
+   * Java and JS regex are semantically equivalent, so we run them locally instead
+   * of org-evaling (which would return a useless stringified Pattern object). */
+  function javaRegexToJs(src) {
+    let flags = '';
+    let s = String(src == null ? '' : src);
+    const original = s;
+    // Leading inline flag group, e.g. (?i) / (?is) / (?im), maps to JS flags.
+    const lead = s.match(/^\(\?([a-zA-Z]+)\)/);
+    if (lead && /^[imsuxU]+$/.test(lead[1])) {
+      for (const f of lead[1]) {
+        if (f === 'i' && !flags.includes('i')) flags += 'i';
+        else if (f === 's' && !flags.includes('s')) flags += 's';
+        else if (f === 'm' && !flags.includes('m')) flags += 'm';
+        else if (f === 'u' && !flags.includes('u')) flags += 'u';
+        // x (comments) / U / d have no direct JS equivalent — ignored.
+      }
+      s = s.slice(lead[0].length);
+    }
+    return { original, source: s, flags };
+  }
+  function reGroupCount(source) {
+    // Count capturing groups by forcing an empty-alternative match.
+    try { return new RegExp(source + '|').exec('').length - 1; } catch (_) { return 0; }
+  }
+  function javaReplToJs(repl) {
+    // Convert a java.util.regex replacement string to JS String.replace syntax.
+    // Java: $0/$1.. group refs, ${name} named refs, \ escapes $ and \.
+    // JS:   $&=whole match, $1.. groups, $<name> named, $$=literal $.
+    const s = String(repl == null ? '' : repl);
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '\\') {
+        const nx = s[i + 1];
+        if (nx === '$') { out += '$$'; i++; }
+        else if (nx === '\\') { out += '\\'; i++; }
+        else if (nx != null) { out += nx; i++; }
+      } else if (c === '$') {
+        const nx = s[i + 1];
+        if (nx === '0') { out += '$&'; i++; }
+        else if (nx === '{') {
+          const close = s.indexOf('}', i + 2);
+          if (close > 0) { out += '$<' + s.substring(i + 2, close) + '>'; i = close; }
+          else { out += '$$'; }
+        } else if (nx >= '1' && nx <= '9') { out += '$' + nx; i++; }
+        else { out += '$$'; }
+      } else {
+        out += c;
+      }
+    }
+    return out;
   }
 
   /* ================= class registry ================= */
@@ -495,16 +748,24 @@
   }
 
   /* ================= interpreter ================= */
-  const BUILTIN_TYPES = new Set(['string', 'integer', 'long', 'double', 'decimal', 'boolean', 'id', 'object', 'date', 'datetime', 'time', 'blob', 'list', 'map', 'set', 'math', 'json', 'system', 'database', 'limits', 'userinfo', 'test', 'schema', 'sobject', 'exception', 'type', 'url', 'void', 'string.format', 'logginglevel', 'apexpages', 'dom']);
+  const BUILTIN_TYPES = new Set(['string', 'integer', 'long', 'double', 'decimal', 'boolean', 'id', 'object', 'date', 'datetime', 'time', 'blob', 'list', 'map', 'set', 'math', 'json', 'system', 'database', 'limits', 'userinfo', 'test', 'schema', 'sobject', 'exception', 'type', 'url', 'void', 'string.format', 'logginglevel', 'apexpages', 'dom', 'pattern', 'matcher', 'encodingutil', 'crypto']);
   const BUILTIN_ENUMS = {
     'logginglevel': ['NONE', 'INTERNAL', 'FINEST', 'FINER', 'FINE', 'DEBUG', 'INFO', 'WARN', 'ERROR'],
     'apexpages.severity': ['CONFIRM', 'ERROR', 'FATAL', 'INFO', 'WARNING'],
     'triggeroperation': ['BEFORE_INSERT', 'BEFORE_UPDATE', 'BEFORE_DELETE', 'AFTER_INSERT', 'AFTER_UPDATE', 'AFTER_DELETE', 'AFTER_UNDELETE'],
     'quiddity': ['ANONYMOUS', 'AURA', 'BATCH_APEX', 'FUTURE', 'INVOCABLE_ACTION', 'QUEUEABLE', 'REST', 'RUNTEST_SYNC', 'SCHEDULED', 'SOAP', 'SYNCHRONOUS', 'VF'],
     'dom.xmlnodetype': ['ELEMENT', 'COMMENT', 'TEXT', 'CDATA', 'PROCESSING_INSTRUCTION'],
+    'jsontoken': ['NOT_AVAILABLE', 'START_OBJECT', 'END_OBJECT', 'START_ARRAY', 'END_ARRAY', 'FIELD_NAME', 'VALUE_STRING', 'VALUE_NUMBER_INT', 'VALUE_NUMBER_FLOAT', 'VALUE_TRUE', 'VALUE_FALSE', 'VALUE_NULL', 'VALUE_EMBEDDED_OBJECT'],
   };
   // Sentinel returned by org-eval helpers when a value could not be resolved from the org.
   const ENGINE_UNRESOLVED = Symbol('engine-unresolved');
+  // Sentinel returned when a queried field genuinely does NOT exist on the object in
+  // the connected org (the installed managed-package version differs from the source
+  // being debugged). Distinct from ENGINE_UNRESOLVED (a transient org/CLI miss):
+  // retrying will never help, so the field is honestly recorded as absent and read as
+  // null — and any later NullPointerException from that null is attributed to missing
+  // org DATA rather than to the Apex code or an engine limitation.
+  const ENGINE_FIELD_ABSENT = Symbol('engine-field-absent');
 
   class ApexEngine {
     constructor(host) {
@@ -515,6 +776,13 @@
       this.stepDepth = 0;
       this.paused = false;
       this.stopped = false;
+      // Never halt execution on a CAUGHT exception. Managed-package code routinely
+      // throws-and-catches (e.g. UserInfo.isCurrentUserLicensed for an unlicensed
+      // namespace), so pausing there would stop the debugger on lines the user never
+      // set a breakpoint on. Caught exceptions are still surfaced via reportCaught()
+      // (console) + inline markers — we just don't STOP. Only breakpoints, explicit
+      // steps, and truly UNCAUGHT/fatal exceptions pause execution.
+      this.pauseOnCaught = false;
       this.pauseRequested = false;
       this._resume = null;
       this.pendingBackend = null;          // label while awaiting org data
@@ -523,11 +791,20 @@
       this.dmlLog = [];
       this.pageMessages = [];
       this._unresolvedVarWarned = new Set();
+      // Resilience: every engine limitation / internal crash we degrade past
+      // (instead of killing the debug session) is recorded here so the UI can
+      // show a "what actually happened" summary. Deduped via _gapKeys.
+      this.diagnostics = [];
+      this._gapKeys = new Set();
     }
 
     loadSource(fileName, source) {
       const unit = Lang.parse(source);
-      return this.registry.register(unit, fileName);
+      const registered = this.registry.register(unit, fileName);
+      // A newly loaded class may satisfy a type name we previously judged non-user,
+      // so invalidate the negative cache used by the DO/wrapper dispatch.
+      if (this._nonUserTypeCache) this._nonUserTypeCache.clear();
+      return registered;
     }
 
     /* ---------- stepping controls (called by the UI) ---------- */
@@ -562,7 +839,11 @@
       this.currentLine = node.line; this.currentFile = frame.file;
       if (this.host.onExecLine && (this._lastExecLine !== node.line || this._lastExecFile !== frame.file)) {
         this._lastExecLine = node.line; this._lastExecFile = frame.file;
-        try { this.host.onExecLine({ line: node.line, file: frame.file }); } catch (_) { /* UI errors never kill execution */ }
+        // Cheap stack snapshot (file+line per frame, bottom-first) so the UI can
+        // keep the PARENT call-site line highlighted when execution descends into
+        // another file — instead of leaving a stale highlight on screen.
+        const stack = this.callStack.map(f => ({ file: f.file, line: f.line }));
+        try { this.host.onExecLine({ line: node.line, file: frame.file, stack }); } catch (_) { /* UI errors never kill execution */ }
       }
       if (++this._steps > this.maxSteps) throw new ApexError('System.LimitException', 'Maximum interpreter steps exceeded (possible infinite loop)', node.line);
       const depth = this.callStack.length;
@@ -575,16 +856,29 @@
       if (!pauseReason && this.host.getBreakpoint) {
         const bp = this.host.getBreakpoint(frame.file, node.line);
         if (bp) {
+          // A condition (if present) gates BOTH logpoints and plain breakpoints.
+          let condOk = true;
           if (bp.condition) {
+            condOk = false;
             try {
-              const v = await this.evalExpressionInFrame(bp.condition, frame);
-              if (v === true) pauseReason = 'breakpoint';
-            } catch (err) { /* errored conditions never pause (Chrome behavior) */ }
-          } else pauseReason = 'breakpoint';
+              condOk = (await this.evalExpressionInFrame(bp.condition, frame)) === true;
+            } catch (err) { condOk = false; /* errored conditions never fire (Chrome behavior) */ }
+          }
+          const firstHitOnLine = this._lastBpKey !== gateKey;
+          if (bp.logMessage != null && bp.logMessage !== '') {
+            // Logpoint: evaluate the template + print, but NEVER pause. Fire once
+            // per arrival at the line (nested gates share a line).
+            if (condOk && firstHitOnLine) {
+              try { await this._emitLogpoint(bp.logMessage, frame, node.line); } catch (_) {}
+            }
+            if (firstHitOnLine) this._lastBpKey = gateKey;
+          } else if (condOk) {
+            pauseReason = 'breakpoint';
+            // A breakpoint pauses once per arrival at the line, not for every
+            // nested gate on the same line (for-init / body-block share lines).
+            if (this._lastBpKey === gateKey) pauseReason = null;
+          }
         }
-        // A breakpoint pauses once per arrival at the line, not for every
-        // nested gate on the same line (for-init / body-block share lines).
-        if (pauseReason === 'breakpoint' && this._lastBpKey === gateKey) pauseReason = null;
       }
       if (this._lastBpKey && this._lastBpKey !== gateKey && !pauseReason) this._lastBpKey = null;
       if (!pauseReason) return;
@@ -690,6 +984,233 @@
      *  during sandbox evals (hover tooltips etc.) by setting this._quiet = true. */
     log(msg, level) { if (!this._quiet && this.host.log) this.host.log(msg, level); }
 
+    /* ======================================================================
+     * Resilience layer — "the debug session must never die silently."
+     *
+     * We separate three kinds of failure so live debugging behaves like V8:
+     *   1. Control-flow signals (Stop/Return/Break/Continue) → always propagate.
+     *   2. Faithful Apex exceptions (NPE, QueryException, DmlException, user
+     *      exceptions, …) → propagate so the DEBUGGED CODE's own try/catch runs,
+     *      exactly as it would in a real org.
+     *   3. Engine limitations / internal crashes (a builtin method we haven't
+     *      simulated, an unsupported syntax node, or a raw JS error inside the
+     *      interpreter) → these are NOT real Apex behavior, so instead of killing
+     *      the session we log precisely what/where, substitute null, and keep
+     *      stepping.
+     * ==================================================================== */
+
+    _isControlSignal(e) {
+      return e instanceof StopSignal || e instanceof ReturnSignal ||
+             e instanceof BreakSignal || e instanceof ContinueSignal;
+    }
+
+    // True when an error is an ENGINE gap rather than a faithful Apex exception.
+    // Key insight: real Apex never throws NoSuchMethodException at RUNTIME (a
+    // missing method is a compile error), so whenever OUR interpreter emits one it
+    // is definitively an engine limitation and safe to degrade.
+    _isEngineGap(e) {
+      if (!(e instanceof ApexError)) return false;
+      const t = String(e.apexType || '');
+      if (t === 'System.NoSuchMethodException') return true;
+      if (t === 'System.UnexpectedException') {
+        const m = String(e.apexMessage || '');
+        return /^Unsupported (statement|expression) kind|^Unknown (unary|operator)|^Invalid assignment target/.test(m);
+      }
+      return false;
+    }
+
+    // Should this thrown value be degraded-and-continued (true) or propagated as a
+    // faithful Apex exception / control signal (false)?
+    _shouldDegrade(e) {
+      if (this._isControlSignal(e)) return false;
+      if (e instanceof ApexError) return this._isEngineGap(e); // only engine gaps
+      return true; // raw JS error = internal interpreter crash → degrade
+    }
+
+    // Infrastructure/connection failure signatures: an org round-trip that failed
+    // for reasons UNRELATED to the code's logic (CLI bug, auth, network, timeout).
+    // Distinctive tokens only, so a user exception whose message merely mentions a
+    // word like "timeout" is not misclassified.
+    _isOrgInfraError(e) {
+      const s = String((e && (e.apexMessage || e.message)) || '');
+      return /maximum call stack size exceeded|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ECONNRESET|EPIPE|socket hang up|getaddrinfo|command not found|INVALID_LOGIN|invalid_grant|expired access token|refresh token is invalid|not authenticated|No authorization information|Unable to (reach|connect|locate|find)|Salesforce CLI|sfdx-cli|could not be resolved in org.*ENOENT/i.test(s);
+    }
+
+    // A failure that is characteristically the result of dereferencing a value the
+    // debugger read as null because the connected org lacked a field the code queried.
+    // Only null-dereference / not-queried-field exceptions qualify. Combined with the
+    // presence of recorded org-absent reads (this._orgAbsentReads), this lets us
+    // attribute such a failure to MISSING ORG DATA rather than to the Apex code or the
+    // engine — the same code against a properly-provisioned org would not fail here.
+    _isOrgDataDeref(e) {
+      if (!(e instanceof ApexError)) return false;
+      const t = String(e.apexType || '');
+      return t === 'System.NullPointerException' || t === 'System.SObjectException';
+    }
+
+    /**
+     * Honest three-way attribution of ANY failure the user can see, so an engine
+     * gap is never mistaken for a code bug, and an org/CLI problem is never blamed
+     * on the engine or the code logic. Returns {category, icon, label, advice}.
+     *   ENGINE — the debugger itself couldn't handle a construct or crashed. My bug.
+     *   ORG    — the Salesforce CLI / org round-trip failed (infra). Not logic.
+     *   APEX   — a faithful Apex exception the code/data produced (incl. org-rejected
+     *            SOQL/DML) — would happen the same way running directly in the org.
+     */
+    classifyFailure(e) {
+      if (!(e instanceof ApexError)) {
+        return { category: 'ENGINE', icon: '🧩', label: 'Debugger engine error',
+          advice: 'an internal limitation of the debugger — NOT your Apex code; nothing in your org was affected' };
+      }
+      if (this._isEngineGap(e)) {
+        return { category: 'ENGINE', icon: '⚠', label: 'Debugger limitation',
+          advice: 'a construct the debugger has not implemented yet — NOT a problem with your code' };
+      }
+      if (this._isOrgInfraError(e)) {
+        return { category: 'ORG', icon: '🌐', label: 'Org / Salesforce CLI issue',
+          advice: 'the org connection or Salesforce CLI failed (auth, network, timeout, or a CLI bug) — NOT the engine or your code logic; retry, re-authorize, or update the CLI' };
+      }
+      // A null-dereference (or "field not queried" SObjectException) in a run where the
+      // connected org was missing one or more of the fields the code read is, in
+      // practice, a consequence of that MISSING ORG DATA — not an engine limitation and
+      // not a bug in the Apex logic. The debugger honestly read each absent field as
+      // null (every such degrade is noted above via _noteOrgFieldAbsent), and the code
+      // then dereferenced that null. The identical code against a correctly-provisioned
+      // org would not fail here, so attribute it to the org's data/schema, never blame
+      // the user's code. Session-level correlation, phrased as the likely cause.
+      if (this._orgAbsentReads && this._orgAbsentReads.length && this._isOrgDataDeref(e)) {
+        const uniq = [...new Set(this._orgAbsentReads.map(r => `${r.type}.${r.field}`))];
+        const shown = uniq.slice(0, 3).join(', ') + (uniq.length > 3 ? `, +${uniq.length - 3} more` : '');
+        const plural = uniq.length > 1;
+        return { category: 'ORGDATA', icon: '🌐',
+          label: 'Missing org data (not your code, not the engine)',
+          advice: `this most likely dereferences a value that was read as null because the connected org is missing ${shown} — its installed managed-package version doesn't expose ${plural ? 'those fields' : 'that field'}, so ${plural ? 'they were' : 'it was'} substituted with null (noted above). The Apex logic and the debugger are both correct; connect an org that has ${plural ? 'these fields' : 'this field'} (or provision the data) and this will not occur — it is NOT a code bug and would NOT happen in a properly-provisioned org` };
+      }
+      const orgSeen = !!(e && e.__origin === 'org');
+      return { category: 'APEX', icon: '❗',
+        label: 'Real Apex error' + (orgSeen ? ' (reported by the org)' : ''),
+        advice: (orgSeen
+          ? 'the org rejected this — it reflects your Apex code or data and would happen the same way running directly in your org'
+          : 'a genuine error in the Apex code or data — it would also occur when this runs in your org') + ', NOT an engine limitation' };
+    }
+
+    // Track a surfaced (non-degraded) failure for the end-of-run verdict.
+    _trackFailure(e, caught) {
+      if (!this._failures) this._failures = [];
+      const c = this.classifyFailure(e);
+      this._failures.push({ category: c.category, caught: !!caught });
+      return c;
+    }
+
+    // Record a degraded failure and tell the user precisely what happened. Deduped
+    // so the same gap inside a loop doesn't flood the console. Returns the record.
+    _recordGap(e, ctx) {
+      const isCrash = !(e instanceof ApexError);
+      const detail = isCrash
+        ? (e && e.message ? String(e.message) : String(e))
+        : `${e.apexType}: ${e.apexMessage}`;
+      return this._noteGap(detail, isCrash ? 'engine-crash' : 'engine-gap', ctx);
+    }
+
+    // Core degradation recorder, usable both from the resilience wrappers (which
+    // pass an Error via _recordGap) and from inline "not simulated → return null"
+    // sites that already know they're degrading. Pushes to diagnostics, dedupes,
+    // and logs one precise, human line.
+    _noteGap(detail, kind, ctx) {
+      const isCrash = kind === 'engine-crash';
+      const line = ctx && ctx.line;
+      const file = ctx && ctx.file ? String(ctx.file).split('/').pop() : null;
+      const rec = { kind: kind || 'engine-gap', detail: String(detail), line, file, at: ctx && ctx.what };
+      this.diagnostics.push(rec);
+      // Hover/console sandbox evals must stay silent — they probe expressions and
+      // are expected to hit gaps; we degrade them without spamming the console.
+      if (this._sandboxEval) return rec;
+      const key = `${rec.kind}|${rec.detail}|${line}`;
+      if (this._gapKeys.has(key)) return rec;
+      this._gapKeys.add(key);
+      const where = line ? ` (line ${line}${file ? ' in ' + file : ''})` : '';
+      const icon = isCrash ? '🧩' : '⚠';
+      const why = isCrash
+        ? 'the interpreter hit an internal error on this step (a debugger-engine limitation, NOT your Apex code)'
+        : 'this construct is not simulated yet (a debugger-engine limitation, NOT your Apex code)';
+      this.log(`${icon} ${rec.detail}${where} — ${why}. Substituted null and kept stepping (the debug session did NOT stop; nothing was skipped silently).`, 'system');
+      return rec;
+    }
+
+    // Record an "org value could not be fetched" degradation — DISTINCT from an
+    // engine gap. Here the construct IS fully supported; the real org round-trip just
+    // came back unresolved (CLI crash, transient auth/network), so a truthful,
+    // Apex-semantics-correct substitute was used (null / empty map / empty record).
+    // Deduped + logged honestly, and fed into the end-of-run verdict, so the user
+    // knows a value is a placeholder rather than real org data — and never blames the
+    // engine or their code for a transient infrastructure hiccup.
+    _noteOrgUnresolved(what, substitute, line) {
+      if (!this.diagnostics) this.diagnostics = [];
+      if (!this._gapKeys) this._gapKeys = new Set();
+      const rec = { kind: 'org-unresolved', detail: String(what), substitute: String(substitute), line: line || null };
+      this.diagnostics.push(rec);
+      if (this._sandboxEval) return rec;
+      const key = `org-unresolved|${rec.detail}|${line}`;
+      if (this._gapKeys.has(key)) return rec;
+      this._gapKeys.add(key);
+      const where = line ? ` (line ${line})` : '';
+      this.log(`🌐 ${what}${where}: the real value couldn't be fetched from the org right now — substituted ${substitute} so stepping continues. This is an org/CLI availability issue, NOT your Apex code and NOT an engine limitation; if a later result looks off, an unfetched org value may be why.`, 'system');
+      return rec;
+    }
+
+    // Record that a field the code READ genuinely does not exist on this SObject in the
+    // CONNECTED org (the installed managed-package version differs from the source being
+    // debugged). Distinct from _noteOrgUnresolved (a transient fetch miss): retrying
+    // will NOT help. We degrade the read to null (Apex-correct), tell the user honestly,
+    // feed the end-of-run verdict, and remember the field in this._orgAbsentReads so a
+    // later NullPointerException caused by that null is attributed to missing org DATA
+    // — never to the code or the engine. Deduped so a read in a loop doesn't flood.
+    _noteOrgFieldAbsent(type, field, line) {
+      if (!this.diagnostics) this.diagnostics = [];
+      if (!this._gapKeys) this._gapKeys = new Set();
+      if (!this._orgAbsentReads) this._orgAbsentReads = [];
+      const objType = type || 'SObject';
+      if (!this._orgAbsentReads.some(r => r.type === objType && r.field === field)) {
+        this._orgAbsentReads.push({ type: objType, field, line: line || null });
+      }
+      const rec = { kind: 'org-field-absent', detail: `${objType}.${field}`, substitute: 'null', line: line || null };
+      this.diagnostics.push(rec);
+      if (this._sandboxEval) return rec;
+      const key = `org-field-absent|${rec.detail}`;
+      if (this._gapKeys.has(key)) return rec;
+      this._gapKeys.add(key);
+      const where = line ? ` (line ${line})` : '';
+      this.log(`🌐 ${objType}.${field} doesn't exist on this object in the connected org${where} — the installed managed-package version differs from the source, so it was read as null (Apex-correct) and stepping continues. This is org DATA/schema, NOT your Apex code and NOT an engine limitation; retrying won't help — connect an org that has this field or provision the data. If a later NullPointerException follows, this missing value is the likely cause.`, 'system');
+      return rec;
+    }
+
+    // went wrong AND whose responsibility each item is" — engine vs code vs org —
+    // instead of a mysterious early stop or an error they might blame on the engine.
+    _reportDiagnosticsSummary() {
+      const gaps = (this.diagnostics || []).filter(d => d.kind === 'engine-gap').length;
+      const crashes = (this.diagnostics || []).filter(d => d.kind === 'engine-crash').length;
+      const orgUnresolved = (this.diagnostics || []).filter(d => d.kind === 'org-unresolved').length;
+      const orgFieldAbsent = (this.diagnostics || []).filter(d => d.kind === 'org-field-absent').length;
+      const fails = this._failures || [];
+      const apex = fails.filter(f => f.category === 'APEX').length;
+      const org = fails.filter(f => f.category === 'ORG').length;
+      const orgData = fails.filter(f => f.category === 'ORGDATA').length;
+      const engineFails = fails.filter(f => f.category === 'ENGINE').length;
+      const engineTotal = gaps + crashes + engineFails;
+      if (!engineTotal && !apex && !org && !orgData && !orgUnresolved && !orgFieldAbsent) return;
+      const lines = ['ℹ Debug session verdict — what happened and whose responsibility each item is:'];
+      if (engineTotal) lines.push(`   🧩 Debugger engine: ${engineTotal} limitation${engineTotal > 1 ? 's' : ''} (unsimulated construct or internal error) — the DEBUGGER's responsibility to fix, NOT your code. Each was reported above with its line; all degraded to null so stepping could continue.`);
+      if (apex) lines.push(`   ❗ Apex code/data: ${apex} real error${apex > 1 ? 's' : ''} that would ALSO occur running this in your org — these live in the code or data, not the engine.`);
+      if (orgData) lines.push(`   🌐 Missing org data: ${orgData} failure${orgData > 1 ? 's' : ''} caused by field(s) absent from the connected org — the debugger read the missing field(s) as null (noted above) and the code then dereferenced that null. NOT an engine limitation and NOT an Apex code bug; the same code would run against an org that has these fields.`);
+      if (org) lines.push(`   🌐 Org / CLI: ${org} connection or Salesforce CLI issue${org > 1 ? 's' : ''} — infrastructure, not the engine or your code logic.`);
+      if (orgUnresolved) lines.push(`   🌐 Org values unavailable: ${orgUnresolved} value${orgUnresolved > 1 ? 's' : ''} couldn't be fetched from the org and ${orgUnresolved > 1 ? 'were' : 'was'} substituted with an Apex-correct default (null / empty). NOT an engine or code bug — a transient org/CLI availability issue. If a result looks off, an unfetched value may be why; retrying or updating the Salesforce CLI usually resolves it.`);
+      if (orgFieldAbsent && !orgData) lines.push(`   🌐 Org fields absent: ${orgFieldAbsent} field${orgFieldAbsent > 1 ? 's' : ''} the code read ${orgFieldAbsent > 1 ? "don't" : "doesn't"} exist on the object in the connected org (installed package version differs from the source) — read as null. Provision the field(s) or connect an org that has them; retrying won't help. NOT an engine or code bug.`);
+      this.log(lines.join('\n'), 'system');
+    }
+
+    // Read-only snapshot of degraded failures (for the UI / diagnostics panel).
+    getDiagnostics() { return (this.diagnostics || []).slice(); }
+
     /* ---------- entry points ---------- */
     async run(className, methodName, argValues) {
       this.stopped = false; this._steps = 0;
@@ -704,6 +1225,10 @@
       this._unresolvedVarWarned = new Set();
       this.pageMessages = [];
       this.dmlLog = [];
+      this.diagnostics = [];
+      this._gapKeys = new Set();
+      this._failures = [];
+      this._orgAbsentReads = [];
       const cls = this.registry.get(className) || await this.lazyLoadClass(className);
       if (!cls) throw new ApexError('System.TypeException', `Class not found: ${className}`, 0);
       const methods = cls.findMethods(methodName);
@@ -713,10 +1238,20 @@
         let thisRef = null;
         if (!method.static) thisRef = await this.instantiate(cls, [], null, 0);
         const result = await this.invokeMethod(cls, method, thisRef, argValues || [], null);
+        this._reportDiagnosticsSummary();
         if (this.host.onDone) this.host.onDone(result);
         return result;
       } catch (e) {
         if (e instanceof StopSignal) { if (this.host.onDone) this.host.onDone(undefined); return undefined; }
+        // Uncaught faithful exception reached the top: attribute it honestly so the
+        // user knows whether the method failed because of their code/data, an org/CLI
+        // problem, or an engine limitation — before it surfaces as a bare error.
+        if ((e instanceof ApexError) || (e instanceof Error && !this._isControlSignal(e))) {
+          const c = this._trackFailure(e, false);
+          const msg = (e instanceof ApexError) ? `${e.apexType}: ${e.apexMessage || ''}` : (e.message || String(e));
+          this.log(`${c.icon} Uncaught ${msg} — ${c.label}: ${c.advice}.`, 'error');
+        }
+        this._reportDiagnosticsSummary();
         if (this.host.onError) this.host.onError(e);
         throw e;
       }
@@ -852,6 +1387,12 @@
       if (arg instanceof ApexSet) return bl === 'set' ? 3 : -3;
       if (arg instanceof ApexDate) return bl === 'date' ? 3 : (bl === 'datetime' ? 1 : -2);
       if (arg instanceof ApexDatetime) return bl === 'datetime' ? 3 : (bl === 'date' ? 1 : -2);
+      if (arg instanceof ApexTime) return bl === 'time' ? 3 : -2;
+      if (arg instanceof ApexBlob) return bl === 'blob' ? 3 : -2;
+      if (arg instanceof ApexEnumValue) {
+        const ec = String(arg.enumClass).toLowerCase();
+        return (bl === ec || stripNs(bl) === stripNs(ec)) ? 3 : 0;
+      }
       if (arg instanceof ApexObject) {
         if (this.apexObjIsA(arg.classInfo, bl)) return 3;
         return -2;
@@ -860,7 +1401,13 @@
         if (bl === 'sobject') return 2;
         const t = String(sobjType(arg)).toLowerCase();
         if (t === bl || stripNs(t) === stripNs(bl)) return 3;
-        // unknown/stub SObject vs a concrete object type -> weak compatible
+        // An SObject can never bind to a primitive parameter (Id, String, …).
+        // Without this, a type-less query row (attributes stripped) would tie an
+        // `Id` overload against an SObject overload and mis-dispatch (e.g. the
+        // createManagedObject(Id)/(SObject) infinite-recursion bug).
+        if (PRIMITIVE_PARAM_TYPES.has(bl)) return -3;
+        // Custom/standard object param, or an unknown-typed SObject vs some class
+        // type -> weakly compatible (covers records whose type token is absent).
         if (/__(c|mdt|e|x|share|history)$/.test(bl) || t === 'sobject') return 1;
         return -1;
       }
@@ -910,6 +1457,12 @@
       if (cls.staticsReady) return;
       cls.staticsReady = true;
       cls.staticEnv = new Environment(null, 'static:' + cls.name);
+      // An inner class can reference its enclosing class's static members by simple
+      // name (e.g. `LINE_ACTION_NONE` inside RemoteCPQ.LineItemDO resolves to the
+      // outer RemoteCPQ.LINE_ACTION_NONE). Initialize the enclosing chain first so
+      // those statics are actually present when the inner class runs — otherwise the
+      // engine wrongly throws VariableDoesNotExistException for a real constant.
+      if (cls.outer) await this.ensureStatics(cls.outer);
       const frame = { className: cls.name, methodName: '<static-init>', file: cls.fileName, line: cls.ast.line, env: cls.staticEnv, thisRef: null, classInfo: cls };
       for (const f of cls.ast.fields || []) {
         if (!f.static) continue;
@@ -1099,7 +1652,17 @@
       // Blocks/empties aren't pause points (Chrome doesn't pause on '{');
       // their inner statements gate themselves.
       if (stmt.kind !== 'block' && stmt.kind !== 'empty') await this.gate(stmt, frame);
-      return this.execStmtInner(stmt, frame);
+      try {
+        return await this.execStmtInner(stmt, frame);
+      } catch (err) {
+        // Last-resort safety net: an engine gap or internal interpreter crash on
+        // this statement is logged and skipped so the session keeps stepping the
+        // rest of the method. Control signals and faithful Apex exceptions (which
+        // the debugged code's own try/catch is meant to handle) always propagate.
+        if (!this._shouldDegrade(err)) throw err;
+        this._recordGap(err, { line: stmt.line, file: frame && frame.file, what: `statement '${stmt.kind}'` });
+        return;
+      }
     }
 
     // Statement body without the pause gate — used when the gate for this
@@ -1310,7 +1873,10 @@
         ? ` at ${err.apexStack[0].className}.${err.apexStack[0].methodName} (line ${err.apexStack[0].line})`
         : (err.apexLine ? ` (line ${err.apexLine})` : '');
       const caughtAs = catchClause && catchClause.type ? catchClause.type.name : 'Exception';
+      const cls = this._trackFailure(err, true);
       this.log(`⚠ Caught ${err.apexType || 'Exception'}: ${err.apexMessage || err.message || ''}${where} → handled by catch (${caughtAs}${catchClause && catchClause.name ? ' ' + catchClause.name : ''}). Execution continues in the catch block.`, 'system');
+      // Honest attribution so a caught error is never mistaken for an engine bug.
+      this.log(`    ${cls.icon} Cause: ${cls.label} — ${cls.advice}.`, 'system');
       if (err.apexStack && err.apexStack.length > 1) {
         this.log(err.apexStack.map(f => `      at ${f.className}.${f.methodName} (line ${f.line})`).join('\n'), 'system');
       }
@@ -1349,6 +1915,7 @@
       if (!e) return null;
       switch (e.kind) {
         case 'lit': return e.value;
+        case 'classlit': return { __typeToken: e.typeName };
         case 'this': {
           if (!frame.thisRef) throw new ApexError('System.UnexpectedException', "'this' is not available in a static context", e.line);
           return frame.thisRef;
@@ -1455,7 +2022,13 @@
       if (en) return en.value;
       if (frame.thisRef && frame.thisRef.hasField && frame.thisRef.hasField(e.name)) return frame.thisRef.getField(e.name);
       if (frame.classInfo && frame.classInfo.staticEnv && frame.classInfo.staticEnv.has(e.name)) return frame.classInfo.staticEnv.get(e.name);
-      // maybe a class reference (for static access) — return a marker
+      // Inner class referencing an ENCLOSING class's static by simple name. Walk the
+      // outer chain (statics were initialized up-front by ensureStatics). This is how
+      // Apex scopes unqualified names — a real constant like RemoteCPQ.LINE_ACTION_NONE
+      // used inside RemoteCPQ.LineItemDO must resolve, not throw.
+      for (let oc = frame.classInfo && frame.classInfo.outer; oc; oc = oc.outer) {
+        if (oc.staticEnv && oc.staticEnv.has(e.name)) return oc.staticEnv.get(e.name);
+      }
       const ci = this.registry.get(e.name) || (frame.classInfo ? this.registry.getInner(frame.classInfo, e.name) : null);
       if (ci) return { __classRef: ci };
       const bn = e.name.toLowerCase();
@@ -1476,12 +2049,24 @@
         await this.ensureStatics(ci);
         // enum value?
         if (ci.ast.isEnum) {
-          const ev = (ci.ast.enumValues || []).find(v => v.toLowerCase() === e.name.toLowerCase());
-          if (ev) return ev;
+          const boxed = makeEnumValue(ci, e.name);
+          if (boxed) return boxed;
+        }
+        // Static PROPERTY with an explicit getter — invoke it (mirrors the instance
+        // getter path in memberGet). Without this the engine returns the raw backing
+        // field (often null), so a null-guarding getter like
+        //   static Boolean turbo_pricing { get { return x != null ? x : false; } }
+        // wrongly yields null and `!Class.prop` throws a bogus NPE.
+        const sowner = this.findPropOwner(ci, e.name);
+        if (sowner && sowner.prop.static && sowner.prop.getter && sowner.prop.getter !== 'auto') {
+          return await this.invokeStaticGetter(sowner.owner, sowner.prop, e.name);
         }
         if (ci.staticEnv.has(e.name)) return ci.staticEnv.get(e.name);
         const inner = this.registry.getInner(ci, e.name);
         if (inner) return { __classRef: inner };
+        // `<Class>.class` type literal reaching here (e.g. produced dynamically): a
+        // class reference's `.class` is its System.Type token, never a static member.
+        if (String(e.name).toLowerCase() === 'class') return { __typeToken: ci.qualifiedName || ci.name };
         throw new ApexError('System.VariableDoesNotExistException', `Static ${ci.name}.${e.name} does not exist`, e.line);
       }
       if (target.__builtinRef) return await this.staticProp(target.__builtinRef, e.name, e.line);
@@ -1492,8 +2077,17 @@
       // Schema describe chain: `.fields` is accessed as a property on a
       // DescribeSObjectResult; the other handles expose no plain fields.
       if (target && typeof target === 'object' && !(target instanceof ApexObject)) {
+        if (target.__labelRef) return await this.resolveLabel(name, line);
+        // Schema.sObjectType.<Name> → a DescribeSObjectResult for that object. The
+        // token reuses __describeResult so isAccessible()/isCreateable()/etc. resolve
+        // truthfully from the org's describe. Namespaced objects resolve via retry.
+        if (target.__globalDescribe) { await this.ensureDescribe(name); return { __describeResult: name }; }
         if (target.__describeResult && name.toLowerCase() === 'fields') return { __fieldsHandle: target.__describeResult };
         if (target.__sobjectType || target.__fieldsHandle || target.__sobjectField || target.__describeFieldResult || target.__typeToken) {
+          // `<Type>.class` on a type/sObjectType token → its System.Type token.
+          if (String(name).toLowerCase() === 'class') {
+            return { __typeToken: target.__sobjectType || target.__typeToken || typeNameOf(target) };
+          }
           throw new ApexError('System.VariableDoesNotExistException', `Property ${name} does not exist on ${typeNameOf(target)}`, line);
         }
       }
@@ -1526,6 +2120,15 @@
         // general "any step that needs backend data fetches it" rule; it is gated
         // (falls back to null when Live is off/unavailable) and never fabricates.
         const hydrated = await this.hydrateSObjectField(target, name);
+        if (hydrated === ENGINE_FIELD_ABSENT) {
+          // The field genuinely does not exist on this object in the connected org
+          // (installed managed-package version differs from the source). Degrade to
+          // null (Apex-correct for an absent/unqueried field), record the absence
+          // honestly, and remember it so a later NullPointerException from this null is
+          // attributed to missing org DATA rather than to the code or the engine.
+          this._noteOrgFieldAbsent(sobjType(target), name, line);
+          return null;
+        }
         if (hydrated !== ENGINE_UNRESOLVED) return hydrated;
         return null;
       }
@@ -1543,6 +2146,43 @@
         c = this.superOf(c);
       }
       return null;
+    }
+
+    /** Like findPropInHierarchy but also returns the class that DECLARES the property
+     *  (needed so a static getter/setter runs against the right static backing env). */
+    findPropOwner(ci, name) {
+      let c = ci;
+      while (c) {
+        const p = c.findProp(name);
+        if (p) return { owner: c, prop: p };
+        c = this.superOf(c);
+      }
+      return null;
+    }
+
+    /** Invoke an explicit STATIC property getter (thisRef=null, static context). The
+     *  getter's backing field is read via the static env, so a self-referencing
+     *  null-guard getter resolves the backing value without re-entering the getter. */
+    async invokeStaticGetter(owner, prop, name) {
+      await this.ensureStatics(owner);
+      const env = new Environment(owner.staticEnv, 'getter');
+      const f2 = { className: owner.name, methodName: 'get ' + name, file: owner.fileName, line: prop.line, env, thisRef: null, classInfo: owner };
+      this.callStack.push(f2);
+      try { await this.execBlock(prop.getter, f2, new Environment(env, 'body')); return null; }
+      catch (ret) { if (ret instanceof ReturnSignal) return ret.value; throw ret; }
+      finally { this.callStack.pop(); }
+    }
+
+    /** Invoke an explicit STATIC property setter (thisRef=null, `value` in scope). */
+    async invokeStaticSetter(owner, prop, name, value) {
+      await this.ensureStatics(owner);
+      const env = new Environment(owner.staticEnv, 'setter');
+      env.define('value', value, null);
+      const f2 = { className: owner.name, methodName: 'set ' + name, file: owner.fileName, line: prop.line, env, thisRef: null, classInfo: owner };
+      this.callStack.push(f2);
+      try { await this.execBlock(prop.setter, f2, new Environment(env, 'body')); }
+      catch (ret) { if (!(ret instanceof ReturnSignal)) throw ret; }
+      finally { this.callStack.pop(); }
     }
 
     async evalTargetMaybeType(t, frame) {
@@ -1579,6 +2219,10 @@
         if (frame.env && frame.env.set(target.name, value)) return;
         if (frame.thisRef && frame.thisRef.hasField && frame.thisRef.hasField(target.name)) { frame.thisRef.setField(target.name, value); return; }
         if (frame.classInfo && frame.classInfo.staticEnv && frame.classInfo.staticEnv.has(target.name)) { frame.classInfo.staticEnv.set(target.name, value); return; }
+        // Assignment to an ENCLOSING class's static from an inner class (simple name).
+        for (let oc = frame.classInfo && frame.classInfo.outer; oc; oc = oc.outer) {
+          if (oc.staticEnv && oc.staticEnv.has(target.name)) { oc.staticEnv.set(target.name, value); return; }
+        }
         // implicit define (shouldn't happen in valid Apex, but be forgiving)
         frame.env.define(target.name, value, null);
         return;
@@ -1589,6 +2233,13 @@
         if (obj.__classRef) {
           const ci = obj.__classRef;
           await this.ensureStatics(ci);
+          // Static PROPERTY with an explicit setter — invoke it (mirrors the instance
+          // setter path below) so setters with side effects / validation actually run.
+          const sowner = this.findPropOwner(ci, target.name);
+          if (sowner && sowner.prop.static && sowner.prop.setter && sowner.prop.setter !== 'auto') {
+            await this.invokeStaticSetter(sowner.owner, sowner.prop, target.name, value);
+            return;
+          }
           if (!ci.staticEnv.set(target.name, value)) ci.staticEnv.define(target.name, value, null);
           return;
         }
@@ -1681,6 +2332,13 @@
           if (!decHint && Number.isInteger(l) && Number.isInteger(r)) return Math.trunc(res);
           return res;
         }
+        case '%': {
+          // Apex modulo (Integer/Long). Real Apex only allows % on integral types and
+          // throws on a null operand — mirror both so results are truthful.
+          if (l === null || r === null) throw npe(line, 'Argument cannot be null');
+          if (r === 0) throw new ApexError('System.MathException', 'Divide by 0', line);
+          return l % r;
+        }
         case '&': return l & r;
         case '|': return l | r;
         case '^': return l ^ r;
@@ -1693,12 +2351,21 @@
     }
 
     /* ---------- SOQL (real org fetch, pauses execution) ---------- */
+    // Bind values reach the host as plain JS so it can render SOQL literals. The
+    // engine's own collection types (ApexSet, ApexMap) are flattened to arrays
+    // here; SObjects, primitives and dates pass through for the host to format.
+    normalizeBindValue(v) {
+      if (v instanceof ApexSet) return v.items().map(x => this.normalizeBindValue(x));
+      if (v instanceof ApexMap) return v.vals().map(x => this.normalizeBindValue(x));
+      if (Array.isArray(v)) return v.map(x => this.normalizeBindValue(x));
+      return v;
+    }
     async runSoql(e, frame) {
       const binds = {};
       for (const b of e.binds || []) {
         try {
           const ast = Lang.parseExpression(b.expr);
-          binds[b.expr] = await this.evalExpr(ast, frame);
+          binds[b.expr] = this.normalizeBindValue(await this.evalExpr(ast, frame));
         } catch (err) { binds[b.expr] = null; }
       }      this.pendingBackend = 'SOQL query against org…';
       this.log(`SOQL → org: ${e.raw.replace(/\s+/g, ' ').slice(0, 200)}`, 'soql');
@@ -1726,14 +2393,27 @@
         seen.add(expr);
         try {
           const ast = Lang.parseExpression(expr);
-          binds[expr] = await this.evalExpr(ast, frame);
+          binds[expr] = this.normalizeBindValue(await this.evalExpr(ast, frame));
         } catch (_) { binds[expr] = null; }
       }
       return binds;
     }
 
     /* ---------- calls ---------- */
+    // Resilient wrapper: an engine gap or internal crash on a single call must not
+    // kill the session — degrade to null so the surrounding statement keeps
+    // computing, while faithful Apex exceptions still propagate to user try/catch.
     async evalCall(e, frame) {
+      try {
+        return await this._evalCallRaw(e, frame);
+      } catch (err) {
+        if (!this._shouldDegrade(err)) throw err;
+        this._recordGap(err, { line: e.line, file: frame && frame.file, what: `call ${e.name}()` });
+        return null;
+      }
+    }
+
+    async _evalCallRaw(e, frame) {
       // Unqualified call: method on this / current class statics
       if (!e.target) {
         const argHints = this._argHints(e.args, frame);
@@ -1741,6 +2421,17 @@
         if (frame.classInfo) {
           const { ci, m } = this.findMethodInHierarchy(frame.classInfo, e.name, args, false, argHints);
           if (m) return this.invokeMethod(ci, m, m.static ? null : frame.thisRef, args, frame);
+          // An inner class can call its ENCLOSING class's STATIC methods by simple
+          // name — a nested Apex class has no implicit outer instance, so only
+          // statics are in scope. Walk the enclosing chain, mirroring the same
+          // outer-static resolution already done for identifier reads (resolveIdent)
+          // and assignments (assignTo). Without this, e.g. `createCartInfo(cfg)`
+          // inside PriceSupport.PricingContext throws NoSuchMethodException, degrades
+          // to null, and the caller then NPEs on `cartInfo.cartItems`.
+          for (let oc = frame.classInfo.outer; oc; oc = oc.outer) {
+            const { ci: oci, m: om } = this.findMethodInHierarchy(oc, e.name, args, true, argHints);
+            if (om && om.static) { await this.ensureStatics(oci); return this.invokeMethod(oci, om, null, args, frame); }
+          }
         }
         throw new ApexError('System.NoSuchMethodException', `Method ${e.name}(${args.length} args) not found`, e.line);
       }
@@ -1759,7 +2450,7 @@
           throw new ApexError('System.TypeException', `Non-static method ${e.name} called statically on ${ci.name}`, e.line);
         }
         // enum helpers
-        if (ci.ast.isEnum && e.name.toLowerCase() === 'values') return (ci.ast.enumValues || []).slice();
+        if (ci.ast.isEnum && e.name.toLowerCase() === 'values') return enumValuesOf(ci);
         throw new ApexError('System.NoSuchMethodException', `Static method ${ci.name}.${e.name} not found`, e.line);
       }
       if (target.__builtinRef) return this.callStaticBuiltin(target.__builtinRef, e.name, args, e.line, frame);
@@ -1770,7 +2461,331 @@
           if (m) return this.invokeMethod(fci, m, frame.thisRef, args, frame);
         }
       }
+      // Truthful type-aware dispatch for values the engine carries as PLAIN objects
+      // (DO/wrapper instances and collections deserialized from org/request data).
+      // Runtime shape alone can't tell a Map from an SObject — both look like {} — so
+      // we recover the receiver's DECLARED type from the source and dispatch correctly,
+      // instead of treating everything as a bare SObject (which fabricates a null for
+      // any unrecognized method and causes a MISLEADING downstream error, e.g.
+      // `chargeLine.extensionAttributes.values()` → "iterate over null", or
+      // `lineItemDO.primaryLineItemSO()` → NPE). We only run real Apex over the real
+      // field data the object already holds; nothing is invented.
+      if (isSObject(target) && !(target && target.__typeToken)) {
+        const stype = (target && target.__apexClass) || this._staticTypeOfExpr(e.target, frame);
+        // (a) A collection field held as a plain object/array → coerce to the REAL
+        //     Apex collection so Map/Set/List methods (values/keySet/get/…) work.
+        const coerced = this._coercePlainToApexCollection(target, stype);
+        if (coerced instanceof ApexMap) return this.callMapMethod(coerced, e.name, args, e.line);
+        if (coerced instanceof ApexSet) return this.callSetMethod(coerced, e.name, args, e.line);
+        if (Array.isArray(coerced)) return this.callListMethod(coerced, e.name, args, e.line);
+        // (b) A user-class DO/wrapper held as a plain object → run its REAL method.
+        const uci = await this._userClassFromTypeName(stype, frame);
+        if (uci) {
+          const { ci: fci, m } = this.findMethodInHierarchy(uci, e.name, args, false, argHints);
+          if (m && !m.static) {
+            return this.invokeMethod(fci, m, this._boxPlainAsApexObject(target, uci), args, frame);
+          }
+        }
+      }
       return this.callInstanceMethod(target, e.name, args, e.line, frame, argHints);
+    }
+
+    /**
+     * Best-effort STATIC type label of an expression, read from declared types in the
+     * source — never guessed from runtime shape. Powers truthful dispatch of values
+     * the engine holds as plain objects. Handles identifiers (local/param/loop vars,
+     * this-fields, static fields), member access (a.b → declared type of field b on
+     * a's class), casts, `new`, `this`, and index (list element / map value). Returns
+     * a label like "Map<String, SObject>" or "RemoteCPQ.LineItemDO", or null.
+     */
+    _staticTypeOfExpr(expr, frame) {
+      if (!expr || !frame) return null;
+      switch (expr.kind) {
+        case 'ident': {
+          const en = frame.env && frame.env.lookupEntry ? frame.env.lookupEntry(expr.name) : null;
+          if (en && en.type) return en.type;
+          if (frame.classInfo && frame.classInfo.findField) {
+            const f = frame.classInfo.findField(expr.name);
+            if (f && f.type) return this.typeLabel(f.type);
+          }
+          return null;
+        }
+        case 'this':
+          return frame.classInfo ? frame.classInfo.qualifiedName : null;
+        case 'cast':
+          return expr.type ? this.typeLabel(expr.type) : null;
+        case 'new':
+          return expr.type ? this.typeLabel(expr.type) : null;
+        case 'prop': {
+          const ownerType = this._staticTypeOfExpr(expr.target, frame);
+          if (!ownerType) return null;
+          const ci = this.registry.get(ownerType)
+            || (frame.classInfo ? this.registry.getInner(frame.classInfo, ownerType) : null);
+          if (!ci) return null;
+          const f = ci.findField && ci.findField(expr.name);
+          if (f && f.type) return this.typeLabel(f.type);
+          const p = ci.findProp && ci.findProp(expr.name);
+          if (p && p.type) return this.typeLabel(p.type);
+          return null;
+        }
+        case 'index': {
+          const ct = this._staticTypeOfExpr(expr.target, frame);
+          if (!ct) return null;
+          let mm = /^List\s*<\s*(.+)\s*>$/i.exec(ct) || /^(.+)\[\]$/.exec(ct);
+          if (mm) return mm[1].trim();
+          mm = /^Map\s*<\s*[^,]+,\s*(.+)\s*>$/i.exec(ct);
+          if (mm) return mm[1].trim();
+          return null;
+        }
+        default:
+          return null;
+      }
+    }
+
+    /**
+     * Coerce a plain object/array that is really an Apex collection (per its declared
+     * type) into the proper ApexMap/ApexSet/array, so real collection methods run. The
+     * coerced collection is cached on the value for stable identity + mutation across
+     * calls. Returns null when the type isn't a collection or the shape doesn't match.
+     * Only the data the value already carries is exposed — nothing is fabricated.
+     */
+    _coercePlainToApexCollection(value, typeStr) {
+      if (!typeStr || value == null || typeof value !== 'object') return null;
+      // Engine marker objects (describe chain, URL, global describe, type tokens…)
+      // are NOT collections even when their declared type is Map/List/Set — coercing
+      // them would turn the marker into a junk collection keyed by its internal
+      // fields. Leave them for the marker-aware dispatch in callInstanceMethod.
+      if (value.__globalDescribeMap || value.__url || value.__sobjectType || value.__describeResult
+        || value.__fieldsHandle || value.__sobjectField || value.__describeFieldResult
+        || value.__picklistEntry || value.__displayType || value.__pattern || value.__matcher
+        || value.__typeToken || value.__labelRef || value.__globalDescribe) return null;
+      const t = String(typeStr).trim();
+      if (/^Map\s*</i.test(t)) {
+        if (value instanceof ApexMap) return value;
+        if (Array.isArray(value)) return null;
+        if (value.__apexColl instanceof ApexMap) return value.__apexColl;
+        const m = new ApexMap();
+        for (const k of Object.keys(value)) {
+          if (k === 'attributes' || k === '__apexBox' || k === '__apexClass' || k === '__apexColl') continue;
+          m.put(k, value[k]);
+        }
+        this._cacheColl(value, m);
+        return m;
+      }
+      if (/^Set\s*</i.test(t)) {
+        if (value instanceof ApexSet) return value;
+        if (!Array.isArray(value)) return null;
+        if (value.__apexColl instanceof ApexSet) return value.__apexColl;
+        const s = ApexSet.from(value);
+        this._cacheColl(value, s);
+        return s;
+      }
+      if (/^List\s*</i.test(t) || /\[\]$/.test(t)) {
+        return Array.isArray(value) ? value : null;
+      }
+      return null;
+    }
+
+    _cacheColl(value, coll) {
+      try { Object.defineProperty(value, '__apexColl', { value: coll, enumerable: false, configurable: true, writable: true }); }
+      catch (_) { /* frozen — coercion still works, just recomputed next time */ }
+    }
+
+    /**
+     * Resolve a type-name string to a loaded user-class ClassInfo, or null. Negative-
+     * cached (cleared on loadSource) so ordinary SObject/primitive receivers don't pay
+     * a repeated async lazy-load. Lets the engine run a DO/wrapper's REAL method body
+     * instead of the fabricated-null SObject fallback.
+     */
+    async _userClassFromTypeName(typeName, frame) {
+      if (!typeName) return null;
+      const t = String(typeName).trim();
+      if (!this._nonUserTypeCache) this._nonUserTypeCache = new Set();
+      const key = t.toLowerCase();
+      if (this._nonUserTypeCache.has(key)) return null;
+      let ci = this.registry.get(t)
+        || (frame && frame.classInfo ? this.registry.getInner(frame.classInfo, t) : null);
+      if (!ci) ci = await this.lazyLoadClass(t);
+      if (!ci) { this._nonUserTypeCache.add(key); return null; }
+      return ci;
+    }
+
+    /**
+     * Box a plain object as an ApexObject of class `ci` so its REAL user-class
+     * methods can run (they read/write fields via this.<field>). Field values are
+     * shared by reference; the box is cached on the plain object so mutations
+     * persist across calls within the session. No data is fabricated — only the
+     * fields the object already carries are exposed.
+     */
+    _boxPlainAsApexObject(plain, ci) {
+      if (plain.__apexBox && plain.__apexBox.classInfo === ci) return plain.__apexBox;
+      const obj = new ApexObject(ci);
+      for (const k of Object.keys(plain)) {
+        if (k === 'attributes' || k === '__apexBox' || k === '__apexClass') continue;
+        obj.setField(k, plain[k]);
+      }
+      obj.__backing = plain;
+      try {
+        Object.defineProperty(plain, '__apexBox', { value: obj, enumerable: false, configurable: true, writable: true });
+      } catch (_) { /* frozen object — box still works, just not cached */ }
+      return obj;
+    }
+
+    /**
+     * Type-directed JSON deserialization — the truthful equivalent of Apex
+     * `JSON.deserialize(jsonString, ApexType.class)` (and `deserializeStrict`).
+     * Reconstructs a fully TYPED value from already-parsed JSON, driven entirely by
+     * the declared type metadata the engine already holds (class fields/props + their
+     * AST types). It is fully general — nothing is hardcoded to any class:
+     *   - user classes (including inner / namespaced) → a real ApexObject with each
+     *     member recursively deserialized to its DECLARED field/property type;
+     *   - List<E> / E[] → array of E; Set<E> → ApexSet; Map<K,V> → ApexMap (keys
+     *     coerced to K, values to V);
+     *   - enums → the matching enum constant;
+     *   - primitives (String/Id/Integer/Long/Decimal/Double/Boolean/Date/Datetime/Blob);
+     *   - SObjects / unknown object types → an SObject-shaped record.
+     * Absent members default to null (exactly as Apex does). No data is fabricated —
+     * only what the JSON actually carries is materialised.
+     */
+    async deserializeTyped(plain, typeStr, frame) {
+      if (!typeStr) return unjsonify(plain);
+      const t = String(typeStr).trim();
+      const low = t.toLowerCase();
+
+      // `Object` / untyped → leave as an untyped map/list (Apex behaviour).
+      if (low === 'object' || low === 'sobject') {
+        if (plain === null || plain === undefined) return null;
+        return low === 'sobject' && plain && typeof plain === 'object' && !Array.isArray(plain)
+          ? this._jsonToRecord(plain, t) : unjsonify(plain);
+      }
+      if (plain === null || plain === undefined) return null;
+
+      // ---- primitives / scalars ----
+      switch (low) {
+        case 'string': case 'id':
+          return typeof plain === 'string' ? plain : toApexString(plain);
+        case 'integer': case 'long':
+          return typeof plain === 'number' ? Math.trunc(plain) : (plain === '' ? null : Math.trunc(Number(plain)));
+        case 'decimal': case 'double':
+          return typeof plain === 'number' ? plain : (plain === '' ? null : Number(plain));
+        case 'boolean':
+          return typeof plain === 'boolean' ? plain : (plain === 'true' ? true : plain === 'false' ? false : !!plain);
+        case 'blob':
+          return plain;
+        case 'date': {
+          if (typeof plain === 'string') { const mm = /^(\d{4})-(\d{2})-(\d{2})/.exec(plain); if (mm) return new ApexDate(+mm[1], +mm[2], +mm[3]); }
+          return plain;
+        }
+        case 'datetime': case 'time': {
+          if (typeof plain === 'string') { const d = new Date(plain); if (!isNaN(d.getTime())) return new ApexDatetime(d); }
+          return plain;
+        }
+      }
+
+      // ---- generic collections ----
+      let m = /^list\s*<\s*([\s\S]+)\s*>$/i.exec(t) || /^([\s\S]+)\[\]$/.exec(t);
+      if (m) {
+        const elemType = m[1].trim();
+        const arr = Array.isArray(plain) ? plain
+          : (plain && typeof plain === 'object' && Array.isArray(plain.records) ? plain.records : null);
+        if (!arr) return unjsonify(plain);
+        const out = [];
+        for (const el of arr) out.push(await this.deserializeTyped(el, elemType, frame));
+        return out;
+      }
+      m = /^set\s*<\s*([\s\S]+)\s*>$/i.exec(t);
+      if (m) {
+        const elemType = m[1].trim();
+        const arr = Array.isArray(plain) ? plain : [];
+        const s = new ApexSet();
+        for (const el of arr) s.add(await this.deserializeTyped(el, elemType, frame));
+        return s;
+      }
+      m = /^map\s*<\s*([^,]+),\s*([\s\S]+)\s*>$/i.exec(t);
+      if (m) {
+        const keyType = m[1].trim(), valType = m[2].trim();
+        const map = new ApexMap();
+        if (plain && typeof plain === 'object' && !Array.isArray(plain)) {
+          for (const k of Object.keys(plain)) {
+            map.put(this._coerceMapKey(k, keyType), await this.deserializeTyped(plain[k], valType, frame));
+          }
+        }
+        return map;
+      }
+
+      // ---- user class / enum ----
+      const ci = await this._userClassFromTypeName(t, frame);
+      if (ci) {
+        if (ci.ast && ci.ast.isEnum) {
+          const sv = plain instanceof ApexEnumValue ? plain.enumName
+                   : (typeof plain === 'string' ? plain : String(plain));
+          return makeEnumValue(ci, sv) || sv;
+        }
+        const obj = new ApexObject(ci);
+        // Apex reflectively instantiates without a constructor; absent members = null.
+        for (const [nm] of this._instanceMembersOf(ci)) obj.setField(nm, null);
+        if (plain && typeof plain === 'object' && !Array.isArray(plain)) {
+          for (const k of Object.keys(plain)) {
+            if (k === 'attributes') continue;
+            const decl = this._declaredMember(ci, k);
+            const ft = decl && decl.type ? this.typeLabel(decl.type) : null;
+            const nm = decl ? decl.name : k;
+            obj.setField(nm, await this.deserializeTyped(plain[k], ft, frame));
+          }
+        }
+        return obj;
+      }
+
+      // ---- SObject / unknown object type → SObject-shaped record ----
+      if (plain && typeof plain === 'object' && !Array.isArray(plain)) return this._jsonToRecord(plain, t);
+      if (Array.isArray(plain)) return plain.map(x => unjsonify(x));
+      return plain;
+    }
+
+    /** Recursively materialise plain JSON as an SObject-shaped record (plain objects
+     *  stay plain objects — never ApexMap — so isSObject()/field access work). */
+    _jsonToRecord(v, typeName) {
+      if (v === null || typeof v !== 'object') return v;
+      if (Array.isArray(v)) return v.map(x => this._jsonToRecord(x, null));
+      const o = {};
+      for (const k of Object.keys(v)) o[k] = this._jsonToRecord(v[k], null);
+      if (typeName && !o.attributes) o.attributes = { type: typeName };
+      return o;
+    }
+
+    /** Coerce a JSON string key to the declared Map key type. */
+    _coerceMapKey(k, keyType) {
+      const kt = String(keyType || '').trim().toLowerCase();
+      if (kt === 'integer' || kt === 'long') { const n = Number(k); return Number.isNaN(n) ? k : Math.trunc(n); }
+      if (kt === 'decimal' || kt === 'double') { const n = Number(k); return Number.isNaN(n) ? k : n; }
+      if (kt === 'boolean') return k === 'true' ? true : (k === 'false' ? false : k);
+      return k; // String / Id / enum / SObjectType key etc.
+    }
+
+    /** Find a declared instance field or property (walking the superclass chain). */
+    _declaredMember(ci, name) {
+      const lk = String(name).toLowerCase();
+      let c = ci;
+      while (c && c.ast) {
+        const f = (c.ast.fields || []).find(x => !x.static && x.name.toLowerCase() === lk);
+        if (f) return f;
+        const p = (c.ast.props || []).find(x => !x.static && x.name.toLowerCase() === lk);
+        if (p) return p;
+        c = this.superOf(c);
+      }
+      return null;
+    }
+
+    /** All declared instance members (fields + props) across the hierarchy. */
+    _instanceMembersOf(ci) {
+      const out = [];
+      let c = ci;
+      while (c && c.ast) {
+        for (const f of c.ast.fields || []) if (!f.static) out.push([f.name, f.type]);
+        for (const p of c.ast.props || []) if (!p.static) out.push([p.name, p.type]);
+        c = this.superOf(c);
+      }
+      return out;
     }
 
     findMethodInHierarchy(ci, name, args, staticsOnly, argHints) {
@@ -1806,6 +2821,12 @@
         if (target.__fieldsHandle) return await this.callFieldsHandleMethod(target, name, args, line, frame);
         if (target.__sobjectField) return this.callSObjectFieldMethod(target, name, args, line, frame);
         if (target.__describeFieldResult) return this.callDescribeFieldResultMethod(target, name, args, line, frame);
+        if (target.__picklistEntry) return this.callPicklistEntryMethod(target, name, args, line);
+        if (target.__displayType) return this.callDisplayTypeMethod(target, name, args, line);
+        if (target.__pattern) return this.callPatternMethod(target, name, args, line);
+        if (target.__matcher) return this.callMatcherMethod(target, name, args, line);
+        if (target.__url) return await this.callUrlMethod(target, name, args, line, frame);
+        if (target.__globalDescribeMap) return await this.callGlobalDescribeMethod(target, name, args, line);
       }
       if (target instanceof ApexObject) {
         const { ci, m } = this.findMethodInHierarchy(target.classInfo, name, args, false, argHints);
@@ -1827,8 +2848,23 @@
       if (Array.isArray(target)) return this.callListMethod(target, name, args, line);
       if (target instanceof ApexMap) return this.callMapMethod(target, name, args, line);
       if (target instanceof ApexSet) return this.callSetMethod(target, name, args, line);
+      if (target instanceof ApexJsonGenerator) return this.callJsonGeneratorMethod(target, name, args, line);
+      if (target instanceof ApexJsonParser) return await this.callJsonParserMethod(target, name, args, line, frame);
       if (target instanceof ApexDate) return this.callDateMethod(target, name, args, line);
       if (target instanceof ApexDatetime) return this.callDatetimeMethod(target, name, args, line);
+      if (target instanceof ApexTime) return this.callTimeMethod(target, name, args, line);
+      if (target instanceof ApexBlob) return this.callBlobMethod(target, name, args, line);
+      if (target instanceof ApexEnumValue) {
+        switch (name.toLowerCase()) {
+          case 'name': return target.enumName;
+          case 'ordinal': return target.enumOrdinal;
+          case 'tostring': return target.enumName;
+          case 'equals': return apexEquals(target, args[0]);
+          case 'hashcode': return target.enumOrdinal;
+        }
+        this._noteGap(`Enum ${target.enumClass}.${name}() is not a standard enum method (only name/ordinal/equals/hashCode exist)`, 'engine-gap', { line, what: 'instance call' });
+        return null;
+      }
       if (target instanceof ApexError) return this.callErrorMethod(target, name, args, line);
       if (target instanceof ApexDomDocument) return this.callDomDocumentMethod(target, name, args, line);
       if (target instanceof ApexXmlnode) return this.callXmlnodeMethod(target, name, args, line);
@@ -1867,13 +2903,18 @@
       if (!this._descCache) this._descCache = new Map();
       const key = String(name).toLowerCase();
       if (this._descCache.has(key)) return this._descCache.get(key);
-      let info = { name, names: [], label: name, prefix: '', plural: name, error: null, resolved: false };
+      let info = { name, names: [], fieldMeta: new Map(), objMeta: null, label: name, prefix: '', plural: name, error: null, resolved: false };
       if (this.host.describeSObject) {
         this.pendingBackend = `describe ${name} from org…`;
         try {
           const r = await this.host.describeSObject(name);
-          if (r && Array.isArray(r.names) && r.names.length) {
-            info = { name, names: r.names, label: r.label || name, prefix: r.prefix || '', plural: r.plural || name, error: null, resolved: true };
+          const fields = r && Array.isArray(r.fields) ? r.fields : null;
+          const names = fields ? fields.map(f => f && f.name).filter(Boolean)
+                               : (r && Array.isArray(r.names) ? r.names : []);
+          if (names.length) {
+            const fieldMeta = new Map();
+            if (fields) for (const f of fields) { if (f && f.name) fieldMeta.set(String(f.name).toLowerCase(), f); }
+            info = { name, names, fieldMeta, objMeta: (r && r.obj) || null, label: (r && r.label) || name, prefix: (r && r.prefix) || '', plural: (r && r.plural) || name, error: null, resolved: true };
           } else if (r && r.error) { info.error = r.error; }
         } catch (e) { info.error = e && e.message; }
         finally { this.pendingBackend = null; }
@@ -1898,17 +2939,27 @@
       if (lk === 'getlabel') return info.label;
       if (lk === 'getlabelplural') return info.plural;
       if (lk === 'getkeyprefix') return info.prefix || null;
-      if (lk === 'getsobjecttype') return nm;
+      if (lk === 'getsobjecttype') return { __sobjectType: nm };
       if (lk === 'fields' || lk === 'getfields') return { __fieldsHandle: nm };
       if (lk === 'tostring') return nm;
-      if (lk === 'iscustom') return /__c$/i.test(nm);
-      if (lk === 'iscustomsetting' || lk === 'isfeedenabled' || lk === 'ismergeenabled' ||
-          lk === 'isdeprecatedandhidden') return false;
-      // Permission/FLS flags: stepping runs in system context, so default these
-      // to true (returning null would wrongly skip guarded code paths). No warning.
-      if (lk === 'isaccessible' || lk === 'iscreateable' || lk === 'isupdateable' ||
-          lk === 'isdeletable' || lk === 'isundeletable' || lk === 'isqueryable' ||
-          lk === 'issearchable') return true;
+      const om = info.objMeta || null;
+      if (lk === 'iscustom') return om ? !!om.custom : /__c$/i.test(nm);
+      if (lk === 'iscustomsetting') return om ? !!om.customSetting : false;
+      if (lk === 'isfeedenabled') return om ? !!om.feedEnabled : false;
+      if (lk === 'ismergeenabled' || lk === 'ismergeable') return om ? !!om.mergeable : false;
+      if (lk === 'isdeprecatedandhidden') return false;
+      // Object-level CRUD/accessibility. Truthful: reflects the connected user's
+      // REAL permissions from the org describe, so genuine permission gates fire
+      // (surfacing "you lack access to X" the way the user actually hits it). Only
+      // when describe data is unavailable do we fall back to true (never wrongly
+      // block a guarded path on missing data).
+      if (lk === 'isaccessible') return om ? !!om.accessible : true;
+      if (lk === 'iscreateable') return om ? !!om.createable : true;
+      if (lk === 'isupdateable') return om ? !!om.updateable : true;
+      if (lk === 'isdeletable') return om ? !!om.deletable : true;
+      if (lk === 'isundeletable') return om ? !!om.undeletable : true;
+      if (lk === 'isqueryable') return om ? !!om.queryable : true;
+      if (lk === 'issearchable') return om ? !!om.searchable : true;
       this.log(`⚠ DescribeSObjectResult.${name}() not simulated — returning null`, 'system');
       return null;
     }
@@ -1932,17 +2983,153 @@
       this.log(`⚠ Schema.SObjectField.${name}() not simulated — returning null`, 'system');
       return null;
     }
-    callDescribeFieldResultMethod(tok, name, args, line) {
+    async callDescribeFieldResultMethod(tok, name, args, line) {
       const f = tok.__describeFieldResult; const lk = name.toLowerCase();
-      if (lk === 'getname' || lk === 'tostring') return f.field;
-      if (lk === 'getlocalname') return stripNs(f.field);
-      if (lk === 'getlabel') return f.field;
+      // Real field metadata from the connected org (populated when fields.getMap()
+      // ran). Never fabricated: unknown → fall through to the warning + null.
+      const info = await this.ensureDescribe(f.sobject);
+      const meta = (info.fieldMeta && info.fieldMeta.get(String(f.field).toLowerCase())) || null;
+      const num = (v) => (typeof v === 'number' && Number.isFinite(v)) ? v : 0;
+      if (lk === 'getname' || lk === 'tostring') return (meta && meta.name) || f.field;
+      if (lk === 'getlocalname') return stripNs((meta && meta.name) || f.field);
+      if (lk === 'getlabel') return (meta && meta.label != null) ? meta.label : f.field;
       if (lk === 'getsobjecttype') return f.sobject;
-      if (lk === 'isaccessible' || lk === 'iscreateable' || lk === 'isupdateable' ||
-          lk === 'isnillable' || lk === 'issortable' || lk === 'isfilterable') return true;
-      if (lk === 'iscustom') return /__c$/i.test(f.field);
+      // getType() → Schema.DisplayType enum token; `.name()` yields e.g. STRING/
+      // CURRENCY/REFERENCE. meta.type is the real DisplayType name from the org.
+      if (lk === 'gettype') return (meta && meta.type) ? { __displayType: String(meta.type).toUpperCase() } : null;
+      if (lk === 'getprecision') return meta ? num(meta.precision) : 0;
+      if (lk === 'getscale') return meta ? num(meta.scale) : 0;
+      if (lk === 'getlength' || lk === 'getbytelength' || lk === 'getdigits') return meta ? num(meta.length) : 0;
+      if (lk === 'ishtmlformatted') return !!(meta && meta.html);
+      if (lk === 'iscalculated') return !!(meta && meta.calc);
+      if (lk === 'getdefaultvalue') return (meta && meta.defaultValue !== undefined) ? meta.defaultValue : null;
+      if (lk === 'getreferenceto') return (meta && Array.isArray(meta.referenceTo)) ? meta.referenceTo.map(t => ({ __sobjectType: t })) : [];
+      if (lk === 'getrelationshipname') return (meta && meta.relationshipName != null) ? meta.relationshipName : null;
+      if (lk === 'getpicklistvalues') return (meta && Array.isArray(meta.picklist)) ? meta.picklist.map(p => ({ __picklistEntry: p })) : [];
+      if (lk === 'isnamefield') return !!(meta && meta.nameField);
+      if (lk === 'isunique') return !!(meta && meta.unique);
+      if (lk === 'isexternalid') return !!(meta && meta.externalId);
+      if (lk === 'isnillable') return meta ? !!meta.nillable : true;
+      if (lk === 'isupdateable') return meta ? !!meta.updateable : true;
+      if (lk === 'iscreateable') return meta ? !!meta.createable : true;
+      if (lk === 'issortable') return meta ? !!meta.sortable : true;
+      if (lk === 'isfilterable') return meta ? !!meta.filterable : true;
+      if (lk === 'isaccessible') return true;
+      if (lk === 'iscustom') return meta ? !!meta.custom : /__c$/i.test(f.field);
       this.log(`⚠ DescribeFieldResult.${name}() not simulated — returning null`, 'system');
       return null;
+    }
+    // Schema.PicklistEntry (from DescribeFieldResult.getPicklistValues()). Backed by
+    // the real picklist metadata reported by the org.
+    callPicklistEntryMethod(tok, name, args, line) {
+      const p = tok.__picklistEntry || {}; const lk = name.toLowerCase();
+      if (lk === 'getlabel') return p.label != null ? p.label : null;
+      if (lk === 'getvalue' || lk === 'tostring') return p.value != null ? p.value : null;
+      if (lk === 'isactive') return !!p.active;
+      if (lk === 'isdefaultvalue') return !!p.default;
+      this.log(`⚠ Schema.PicklistEntry.${name}() not simulated — returning null`, 'system');
+      return null;
+    }
+    // Schema.DisplayType enum value (from DescribeFieldResult.getType()). Backed by
+    // the real type name reported by the org; `.name()` matches Apex semantics.
+    callDisplayTypeMethod(tok, name, args, line) {
+      const dt = String(tok.__displayType); const lk = name.toLowerCase();
+      if (lk === 'name' || lk === 'tostring') return dt;
+      if (lk === 'ordinal') return 0;
+      if (lk === 'equals') { const o = args[0]; return !!(o && o.__displayType && String(o.__displayType).toUpperCase() === dt.toUpperCase()); }
+      if (lk === 'hashcode') return dt.length;
+      this.log(`⚠ Schema.DisplayType.${name}() not simulated — returning null`, 'system');
+      return null;
+    }
+
+    /* ---------- java.util.regex Pattern / Matcher (native) ---------- */
+    callPatternMethod(target, name, a, line) {
+      const p = target.__pattern;
+      const n = String(name).toLowerCase();
+      switch (n) {
+        case 'split': return this.patternSplit(p, a[0] == null ? '' : a[0], a.length > 1 ? a[1] : 0);
+        case 'matcher': return { __matcher: { p, input: String(a[0] == null ? '' : a[0]), re: new RegExp(p.source, p.flags.replace('g', '') + 'gd'), last: null } };
+        case 'pattern': case 'tostring': return p.original;
+      }
+      throw new ApexError('System.NoSuchMethodException', `Pattern.${name} not supported`, line);
+    }
+
+    /** Java Pattern.split — split by regex; with limit 0 (default) trailing empty
+     *  strings are removed, exactly like java.util.regex.Pattern.split. */
+    patternSplit(p, input, limit) {
+      const s = String(input);
+      const re = new RegExp(p.source, p.flags.replace('g', '') + 'g');
+      const lim = (limit == null) ? 0 : (limit | 0);
+      const out = [];
+      let last = 0, m;
+      re.lastIndex = 0;
+      while ((m = re.exec(s)) !== null) {
+        if (lim > 0 && out.length === lim - 1) break;
+        // A zero-width match at position 0 would yield a spurious leading empty.
+        if (m.index === 0 && m[0].length === 0) { re.lastIndex++; continue; }
+        out.push(s.substring(last, m.index));
+        last = m.index + m[0].length;
+        if (m[0].length === 0) re.lastIndex++; // avoid stalling on zero-width matches
+      }
+      out.push(s.substring(last));
+      if (lim === 0) { while (out.length && out[out.length - 1] === '') out.pop(); }
+      return out;
+    }
+
+    callMatcherMethod(target, name, a, line) {
+      const M = target.__matcher;
+      const n = String(name).toLowerCase();
+      const noMatch = () => { throw new ApexError('System.StringException', 'No match available. Call find(), matches(), or lookingAt() first.', line); };
+      switch (n) {
+        case 'find': {
+          if (a.length && a[0] != null) M.re.lastIndex = a[0] | 0;
+          const m = M.re.exec(M.input);
+          if (m && m[0].length === 0) M.re.lastIndex++; // progress past zero-width match
+          M.last = m || null;
+          return m !== null;
+        }
+        case 'matches': {
+          const re = new RegExp('^(?:' + M.p.source + ')$', M.p.flags.replace('g', '') + 'd');
+          M.last = re.exec(M.input) || null;
+          return M.last !== null;
+        }
+        case 'lookingat': {
+          const re = new RegExp('^(?:' + M.p.source + ')', M.p.flags.replace('g', '') + 'd');
+          M.last = re.exec(M.input) || null;
+          return M.last !== null;
+        }
+        case 'group': {
+          if (!M.last) noMatch();
+          const idx = a.length ? (a[0] | 0) : 0;
+          const v = M.last[idx];
+          return v == null ? null : v;
+        }
+        case 'groupcount': return reGroupCount(M.p.source);
+        case 'start': {
+          if (!M.last) noMatch();
+          const idx = a.length ? (a[0] | 0) : 0;
+          if (idx === 0) return M.last.index;
+          return (M.last.indices && M.last.indices[idx]) ? M.last.indices[idx][0] : -1;
+        }
+        case 'end': {
+          if (!M.last) noMatch();
+          const idx = a.length ? (a[0] | 0) : 0;
+          if (idx === 0) return M.last.index + M.last[0].length;
+          return (M.last.indices && M.last.indices[idx]) ? M.last.indices[idx][1] : -1;
+        }
+        case 'replaceall': return this.matcherReplace(M, a[0], true);
+        case 'replacefirst': return this.matcherReplace(M, a[0], false);
+        case 'reset': { M.re.lastIndex = 0; M.last = null; if (a.length && a[0] != null) M.input = String(a[0]); return target; }
+        case 'region': case 'usepattern': return target;
+        case 'hitend': return M.re.lastIndex >= M.input.length;
+      }
+      throw new ApexError('System.NoSuchMethodException', `Matcher.${name} not supported`, line);
+    }
+
+    matcherReplace(M, repl, all) {
+      const jsRepl = javaReplToJs(repl);
+      const re = new RegExp(M.p.source, M.p.flags.replace('g', '') + (all ? 'g' : ''));
+      return String(M.input).replace(re, jsRepl);
     }
 
     /* ---------- new ---------- */
@@ -2001,6 +3188,23 @@
       }
       if (tn === 'datetime') { const args = await this.evalArgs(e.args, frame); return args.length ? new ApexDatetime(new Date(args[0], (args[1] || 1) - 1, args[2] || 1, args[3] || 0, args[4] || 0, args[5] || 0)) : ApexDatetime.now(); }
       if (tn === 'date') { const args = await this.evalArgs(e.args, frame); return args.length >= 3 ? new ApexDate(args[0], args[1], args[2]) : ApexDate.today(); }
+      if (tn === 'url' || tn === 'system.url') {
+        const args = await this.evalArgs(e.args, frame);
+        if (args.length >= 2) {
+          const ctx = args[0], spec = toApexString(args[1]);
+          if (ctx && ctx.__url && ctx.__url.spec != null) {
+            let combined; try { combined = new URL(spec, String(ctx.__url.spec)).href; } catch (_) { combined = spec; }
+            return { __url: { expr: null, spec: combined } };
+          }
+          if (ctx && ctx.__url && ctx.__url.expr) {
+            return { __url: { expr: `new URL(${ctx.__url.expr}, '${spec.replace(/'/g, "\\'")}')`, spec: null } };
+          }
+          return { __url: { expr: null, spec } };
+        }
+        const a0 = args[0];
+        if (a0 && a0.__url) return a0;
+        return { __url: { expr: null, spec: a0 == null ? '' : toApexString(a0) } };
+      }
       // DOM.Document — real XML document
       if (tn === 'dom.document') { await this.evalArgs(e.args, frame); return new ApexDomDocument(); }
       // ApexPages.Message — simulate locally
@@ -2161,6 +3365,105 @@
         default: throw new ApexError('System.NoSuchMethodException', `Set.${name} not supported`, line);
       }
     }
+    /* ---------- System.JSONGenerator ---------- */
+    callJsonGeneratorMethod(g, name, a, line) {
+      const num = v => (v === null || v === undefined) ? null : (v instanceof ApexDate || v instanceof ApexDatetime ? jsonify(v) : Number(v));
+      switch (name.toLowerCase()) {
+        case 'writestartobject': g._open({}); return null;
+        case 'writeendobject': if (g.stack.length) g.stack.pop(); return null;
+        case 'writestartarray': g._open([]); return null;
+        case 'writeendarray': if (g.stack.length) g.stack.pop(); return null;
+        case 'writefieldname': g.pendingField = toApexString(a[0]); return null;
+        // ---- scalar values (current array element / pending field) ----
+        case 'writestring': g._place(a[0] == null ? null : toApexString(a[0])); return null;
+        case 'writeid': g._place(a[0] == null ? null : toApexString(a[0])); return null;
+        case 'writeblob': g._place(a[0] == null ? null : toApexString(a[0])); return null;
+        case 'writenumber': g._place(num(a[0])); return null;
+        case 'writeboolean': g._place(a[0] == null ? null : !!a[0]); return null;
+        case 'writedate': case 'writedatetime': case 'writetime': g._place(a[0] == null ? null : jsonify(a[0])); return null;
+        case 'writenull': g._place(null); return null;
+        case 'writeobject': g._place(jsonify(a[0])); return null;
+        // ---- fieldName + value convenience variants ----
+        case 'writestringfield': g.pendingField = toApexString(a[0]); g._place(a[1] == null ? null : toApexString(a[1])); return null;
+        case 'writeidfield': g.pendingField = toApexString(a[0]); g._place(a[1] == null ? null : toApexString(a[1])); return null;
+        case 'writeblobfield': g.pendingField = toApexString(a[0]); g._place(a[1] == null ? null : toApexString(a[1])); return null;
+        case 'writenumberfield': g.pendingField = toApexString(a[0]); g._place(num(a[1])); return null;
+        case 'writebooleanfield': g.pendingField = toApexString(a[0]); g._place(a[1] == null ? null : !!a[1]); return null;
+        case 'writedatefield': case 'writedatetimefield': case 'writetimefield': g.pendingField = toApexString(a[0]); g._place(a[1] == null ? null : jsonify(a[1])); return null;
+        case 'writenullfield': g.pendingField = toApexString(a[0]); g._place(null); return null;
+        case 'writeobjectfield': g.pendingField = toApexString(a[0]); g._place(jsonify(a[1])); return null;
+        case 'getasstring': return g.getAsString();
+        default: throw new ApexError('System.NoSuchMethodException', `JSONGenerator.${name} not supported`, line);
+      }
+    }
+    /* ---------- System.JSONParser ---------- */
+    // Reconstruct the plain JS value the parser is currently positioned on, leaving idx on
+    // that value's final token (matching Apex readValueAs / skipChildren positioning).
+    _jsonParserReadValue(p) {
+      const t = p.cur();
+      if (!t) return null;
+      if (t.token === 'START_OBJECT') {
+        const obj = {};
+        p.idx++;
+        while (p.cur() && p.cur().token !== 'END_OBJECT') {
+          if (p.cur().token === 'FIELD_NAME') {
+            const key = p.cur().text;
+            p.idx++;                                   // advance onto the value
+            obj[key] = this._jsonParserReadValue(p);
+            p.idx++;                                   // step past the value's final token
+          } else { p.idx++; }
+        }
+        return obj;                                    // idx now on END_OBJECT
+      }
+      if (t.token === 'START_ARRAY') {
+        const arr = [];
+        p.idx++;
+        while (p.cur() && p.cur().token !== 'END_ARRAY') {
+          arr.push(this._jsonParserReadValue(p));
+          p.idx++;
+        }
+        return arr;                                    // idx now on END_ARRAY
+      }
+      return t.value !== undefined ? t.value : (t.text != null ? t.text : null);
+    }
+    async callJsonParserMethod(p, name, a, line, frame) {
+      const t = () => p.cur();
+      switch (name.toLowerCase()) {
+        case 'nexttoken': { p.idx++; const c = t(); return c ? c.token : null; }
+        case 'nextvalue': { do { p.idx++; } while (t() && t().token === 'FIELD_NAME'); const c = t(); return c ? c.token : null; }
+        case 'getcurrenttoken': { const c = t(); return c ? c.token : null; }
+        case 'hascurrenttoken': return t() != null;
+        case 'clearcurrenttoken': { const c = t(); p.lastCleared = c ? c.token : null; return null; }
+        case 'getlastclearedtoken': return p.lastCleared;
+        case 'getcurrentname': {
+          let depth = 0;
+          for (let k = p.idx; k >= 0; k--) {
+            const tk = p.tokens[k].token;
+            if (tk === 'END_OBJECT' || tk === 'END_ARRAY') depth++;
+            else if (tk === 'START_OBJECT') { if (depth === 0) return null; depth--; }
+            else if (tk === 'START_ARRAY') { if (depth > 0) depth--; }
+            else if (tk === 'FIELD_NAME' && depth === 0) return p.tokens[k].text;
+          }
+          return null;
+        }
+        case 'gettext': { const c = t(); return c ? (c.text != null ? c.text : null) : null; }
+        case 'getstringvalue': { const c = t(); return c ? (c.value != null ? toApexString(c.value) : c.text) : null; }
+        case 'getidvalue': { const c = t(); return c && c.value != null ? toApexString(c.value) : null; }
+        case 'getblobvalue': { const c = t(); return c && c.value != null ? toApexString(c.value) : null; }
+        case 'getintegervalue': case 'getlongvalue': { const c = t(); return c && c.value != null ? Math.trunc(Number(c.value)) : null; }
+        case 'getdoublevalue': case 'getdecimalvalue': { const c = t(); return c && c.value != null ? Number(c.value) : null; }
+        case 'getbooleanvalue': { const c = t(); return c && c.value != null ? !!c.value : null; }
+        case 'getdatetimevalue': { const c = t(); return c && c.value != null ? new ApexDatetime(new Date(c.value)) : null; }
+        case 'getdatevalue': { const c = t(); return c && c.value != null ? ApexDate.fromJs(new Date(c.value)) : null; }
+        case 'skipchildren': { p.idx = jsonSkipChildren(p.tokens, p.idx); return null; }
+        case 'readvalueas': case 'readvalueasstrict': {
+          const plain = this._jsonParserReadValue(p);
+          const typeTok = (a[0] && typeof a[0] === 'object' && a[0].__typeToken) ? a[0].__typeToken : (typeof a[0] === 'string' ? a[0] : null);
+          return typeTok ? await this.deserializeTyped(plain, typeTok, frame) : unjsonify(plain);
+        }
+        default: throw new ApexError('System.NoSuchMethodException', `JSONParser.${name} not supported`, line);
+      }
+    }
     callDateMethod(d, name, a, line) {
       switch (name.toLowerCase()) {
         case 'adddays': return d.addDays(a[0]);
@@ -2183,17 +3486,116 @@
         case 'addminutes': return dt.addMinutes(a[0]);
         case 'addseconds': return dt.addSeconds(a[0]);
         case 'date': return dt.dateOnly();
+        case 'dategmt': return new ApexDate(dt.d.getUTCFullYear(), dt.d.getUTCMonth() + 1, dt.d.getUTCDate());
+        case 'time': return new ApexTime(dt.d.getHours(), dt.d.getMinutes(), dt.d.getSeconds(), dt.d.getMilliseconds());
+        case 'timegmt': return new ApexTime(dt.d.getUTCHours(), dt.d.getUTCMinutes(), dt.d.getUTCSeconds(), dt.d.getUTCMilliseconds());
         case 'gettime': return dt.getTime();
         case 'format': return dt.format(a[0]);
+        case 'formatgmt': return dt.d.toISOString();
         case 'year': return dt.d.getFullYear();
         case 'month': return dt.d.getMonth() + 1;
         case 'day': return dt.d.getDate();
         case 'hour': return dt.d.getHours();
         case 'minute': return dt.d.getMinutes();
         case 'second': return dt.d.getSeconds();
+        case 'millisecond': return dt.d.getMilliseconds();
         case 'tostring': return dt.toString();
         default: throw new ApexError('System.NoSuchMethodException', `Datetime.${name} not supported`, line);
       }
+    }
+    callTimeMethod(tm, name, a, line) {
+      switch (name.toLowerCase()) {
+        case 'hour': return tm.h;
+        case 'minute': return tm.mi;
+        case 'second': return tm.s;
+        case 'millisecond': return tm.ms;
+        case 'addhours': return tm.addHours(a[0]);
+        case 'addminutes': return tm.addMinutes(a[0]);
+        case 'addseconds': return tm.addSeconds(a[0]);
+        case 'addmilliseconds': return tm.addMilliseconds(a[0]);
+        case 'tostring': return tm.toString();
+        default: throw new ApexError('System.NoSuchMethodException', `Time.${name} not supported`, line);
+      }
+    }
+    callBlobMethod(b, name, a, line) {
+      switch (name.toLowerCase()) {
+        case 'size': return b.size();
+        case 'tostring': return b.toString();
+        default: throw new ApexError('System.NoSuchMethodException', `Blob.${name} not supported`, line);
+      }
+    }
+    /* System.URL — org-context URLs. A literal `new URL('https://…')` is parsed
+     * locally (deterministic); an org factory (getOrgDomainUrl/getSalesforceBaseUrl/
+     * getCurrentRequestUrl) is resolved from the connected org so the REAL domain
+     * comes back. When Live data is unavailable the string degrades to null with a
+     * gap note — never a fabricated domain. */
+    async callUrlMethod(u, name, args, line, frame) {
+      const info = u.__url || {};
+      const lk = name.toLowerCase();
+      const APEX = { toexternalform: 'toExternalForm', gethost: 'getHost', getprotocol: 'getProtocol',
+        getpath: 'getPath', getfile: 'getFile', getquery: 'getQuery', getauthority: 'getAuthority',
+        getport: 'getPort', getdefaultport: 'getDefaultPort', getuserinfo: 'getUserInfo', getref: 'getRef' };
+      // Locally-parseable literal URL.
+      if (info.spec != null) {
+        let parsed = null;
+        try { parsed = new URL(String(info.spec)); } catch (_) { parsed = null; }
+        if (parsed) {
+          switch (lk) {
+            case 'toexternalform': case 'tostring': return parsed.href;
+            case 'gethost': return parsed.hostname;
+            case 'getprotocol': return parsed.protocol.replace(/:$/, '');
+            case 'getpath': return parsed.pathname;
+            case 'getfile': return parsed.pathname + (parsed.search || '');
+            case 'getquery': return parsed.search ? parsed.search.slice(1) : null;
+            case 'getref': return parsed.hash ? parsed.hash.slice(1) : null;
+            case 'getauthority': return parsed.host;
+            case 'getport': return parsed.port ? Number(parsed.port) : -1;
+            case 'getuserinfo': return parsed.username ? (parsed.username + (parsed.password ? ':' + parsed.password : '')) : null;
+          }
+        }
+        if (lk === 'toexternalform' || lk === 'tostring') return String(info.spec);
+      }
+      // Org-context factory URL: resolve the whole terminal expression from the org.
+      if (info.expr && (APEX[lk] || lk === 'tostring')) {
+        const m = APEX[lk] || 'toExternalForm';
+        const v = await this.resolveViaOrg(`${info.expr}.${m}()`, {});
+        if (v !== ENGINE_UNRESOLVED) return v;
+        this._noteGap(`URL.${m}() is org-context-dependent and Live data is unavailable`, 'engine-gap', { line, what: 'instance call' });
+        return null;
+      }
+      this._noteGap(`URL.${name}() could not be resolved`, 'engine-gap', { line, what: 'instance call' });
+      return null;
+    }
+    /* Schema.getGlobalDescribe() → lazy Map<String, Schema.SObjectType>. get()/
+     * containsKey() consult the org's describe so existence is answered truthfully;
+     * a Schema.SObjectType is represented as the API-name string, so the describe
+     * chain (<name>.getDescribe()…) keeps working. Enumeration (keySet/values/size)
+     * would require listing every org SObject, which the debugger can't fetch, so it
+     * degrades honestly with a gap note rather than fabricating a set. */
+    async callGlobalDescribeMethod(map, name, args, line) {
+      const lk = name.toLowerCase();
+      if (lk === 'get' || lk === 'containskey') {
+        const key = args[0] == null ? '' : toApexString(args[0]);
+        if (!key) return lk === 'containskey' ? false : null;
+        const info = await this.ensureDescribe(key);
+        if (this.host.describeSObject) {
+          // Live describe available: answer from real org metadata.
+          if (lk === 'containskey') return !!info.resolved;
+          return info.resolved ? key : null;
+        }
+        // Live off: existence is unknowable. Return the token so the describe chain
+        // degrades downstream instead of NPE-ing here; containsKey can't be trusted.
+        return lk === 'containskey' ? false : key;
+      }
+      if (lk === 'keyset' || lk === 'values' || lk === 'size' || lk === 'isempty') {
+        this._noteGap(`Schema.getGlobalDescribe().${name}() enumerates every org SObject, which the debugger can't retrieve`, 'engine-gap', { line, what: 'instance call' });
+        if (lk === 'size') return 0;
+        if (lk === 'isempty') return true;
+        if (lk === 'values') return [];
+        return ApexSet.from([]);
+      }
+      this._noteGap(`Schema.getGlobalDescribe().${name}() is not simulated`, 'engine-gap', { line, what: 'instance call' });
+      return null;
     }
     callErrorMethod(err, name, a, line) {
       switch (name.toLowerCase()) {
@@ -2219,7 +3621,12 @@
         case 'getdetail': return rec.detail ?? null;
         case 'getseverity': return rec.severity ?? null;
         default:
-          this.log(`⚠ SObject.${name}() is not simulated — returning null and continuing.`, 'system');
+          // Reached only when the receiver is NOT a resolvable user-class instance
+          // (the DO/wrapper dispatch in evalMethodCall already runs the REAL method
+          // when the declared type is a loaded Apex class). Be honest that this is an
+          // engine limitation: a substituted null here can surface downstream as a
+          // NullPointerException that is NOT a real bug in the code being debugged.
+          this._noteGap(`Method ${name}() could not be evaluated on a ${sobjType(rec) || 'record'}-shaped value — no loaded Apex class backs it, so the real method body is unavailable`, 'engine-gap', { line, what: 'instance call' });
           return null;
       }
     }
@@ -2282,6 +3689,38 @@
       if (t === 'apexpages' && p === 'severity') return { __builtinRef: 'ApexPages.Severity' };
       // DOM sub-namespace (DOM.Xmlnodetype.ELEMENT, etc.)
       if (t === 'dom' && p === 'xmlnodetype') return { __builtinRef: 'DOM.Xmlnodetype' };
+      // System.JSONToken.* → the JSON pull-parser token enum (bare `JSONToken.X` is
+      // handled directly via BUILTIN_ENUMS['jsontoken']).
+      if (t === 'system' && p === 'jsontoken') return { __builtinRef: 'JSONToken' };
+      // Schema.sObjectType → the global describe namespace. Accessing a member
+      // (Schema.sObjectType.Account) yields that object's DescribeSObjectResult.
+      if (t === 'schema' && p === 'sobjecttype') return { __globalDescribe: true };
+      // <SObjectName>.SObjectType static access → a Schema.SObjectType token. Only
+      // valid Apex when the base is an SObject type, so any non-builtin base that
+      // reaches here is one. getDescribe() on the token resolves REAL metadata from
+      // the org (ensureDescribe) — nothing is fabricated.
+      if (p === 'sobjecttype' && !BUILTIN_TYPES.has(t)) return { __sobjectType: typeName };
+      // System.Label.<name> → a custom-label namespace token; reading a name off it
+      // resolves the REAL label text from the org. Labels are compile-checked in
+      // Apex, so a referenced label always exists in the connected org.
+      if (t === 'system' && p === 'label') return { __labelRef: true };
+      // Bare `Label.<name>` arrives here as builtinRef 'Label'.
+      if (t === 'label') return await this.resolveLabel(propName, line);
+      // <SObjectType>.<FieldName> static access → a Schema.SObjectField token. When
+      // the base describes as a real SObject in the connected org, any member other
+      // than sObjectType is a field reference; resolve the REAL (namespaced) field
+      // name so getDescribe().getPicklistValues()/getType()/getLabel()/... read true
+      // org metadata instead of org-evaling the field handle (which can't rebuild it).
+      if (!BUILTIN_TYPES.has(t) && !this.registry.get(typeName)) {
+        const dinfo = await this.ensureDescribe(typeName);
+        if (dinfo && dinfo.resolved && Array.isArray(dinfo.names) && dinfo.names.length) {
+          const want = String(propName).toLowerCase();
+          const real = dinfo.names.find(fn => String(fn).toLowerCase() === want)
+                    || dinfo.names.find(fn => stripNs(String(fn).toLowerCase()) === stripNs(want))
+                    || propName;
+          return { __sobjectField: { sobject: typeName, field: real } };
+        }
+      }
       // Unknown static prop/constant. Before degrading to null, try to resolve the
       // real value from the org (a class constant we couldn't load locally, a
       // global static, etc.). Gated by Live data — a no-op when Live is off.
@@ -2294,14 +3733,100 @@
       return null;
     }
 
+    /**
+     * Structural, plain-JS form of a value for the Chrome-style console tree.
+     * Objects/collections → nested plain JS (via jsonify); primitives → null so
+     * the console renders them inline from the text. Never throws.
+     */
+    _debugTree(v) {
+      try {
+        if (v === null || v === undefined) return null;
+        if (Array.isArray(v) || v instanceof ApexMap || v instanceof ApexSet ||
+            v instanceof ApexObject || isSObject(v)) {
+          return jsonify(v);
+        }
+        return null;
+      } catch (_) { return null; }
+    }
+
+    /**
+     * Fire a logpoint (Chrome DevTools semantics) — print, never pause.
+     * The message is treated as an EXPRESSION, not a literal `{}`-template:
+     *  - a bare message (`logger`) or a sole `{logger}` → evaluate it and print the
+     *    VALUE (an object/collection/SObject becomes an expandable tree; a scalar
+     *    prints as `expr = <value>`);
+     *  - a simple variable/path that can't be resolved in this scope → an honest
+     *    "unavailable" note (never the bare word, which looks like it wasn't run);
+     *  - a mixed template (`count={count} of {total}`) → interpolate placeholders.
+     */
+    async _emitLogpoint(template, frame, line) {
+      const raw = String(template == null ? '' : template);
+      const emit = (text, tree) => {
+        if (this.host && this.host.debug) this.host.debug({ text, tree: tree || null, category: 'logpoint', line });
+        else this.log(text, 'debug');
+      };
+      const soleBrace = raw.match(/^\s*\{([^{}]+)\}\s*$/);
+      const expr = soleBrace ? soleBrace[1].trim() : (raw.indexOf('{') === -1 ? raw.trim() : null);
+      if (expr) {
+        let val, ok = true;
+        try { val = await this.evalExpressionSandboxed(expr, frame, true); }
+        catch (_) { ok = false; }
+        if (ok && val !== undefined) {
+          const tree = this._debugTree(val);
+          emit(tree ? `${expr} =` : `${expr} = ${toApexString(val)}`, tree);
+          return;
+        }
+        // Couldn't evaluate: if it's clearly meant as a variable/path, be honest
+        // rather than printing the bare word (which reads like it never ran).
+        if (/^[A-Za-z_]\w*(\s*\.\s*[A-Za-z_]\w*|\s*\[[^\]]*\])*$/.test(expr)) {
+          emit(`${expr} — ‹unavailable in this scope›`, null);
+          return;
+        }
+        // Otherwise treat it as prose and fall through to template handling.
+      }
+      let text;
+      try { text = await this._formatLogTemplate(raw, frame); }
+      catch (_) { text = raw; }
+      emit(text, null);
+    }
+
+    /**
+     * Replace {expr} placeholders in a logpoint message with their evaluated
+     * values in the current frame. Literal text is preserved; an expression that
+     * fails to evaluate is left as-is so the user can see what broke.
+     */
+    async _formatLogTemplate(template, frame) {
+      const re = /\{([^{}]+)\}/g;
+      let out = '', last = 0, m;
+      while ((m = re.exec(template)) !== null) {
+        out += template.slice(last, m.index);
+        try {
+          const v = await this.evalExpressionInFrame(m[1].trim(), frame);
+          out += toApexString(v);
+        } catch (_) { out += m[0]; }
+        last = re.lastIndex;
+      }
+      out += template.slice(last);
+      return out;
+    }
+
     async callStaticBuiltin(typeName, name, a, line, frame) {
       const t = typeName.toLowerCase();
       const n = name.toLowerCase();
       if (t === 'system') {
         switch (n) {
           case 'debug': {
-            const msg = a.length > 1 ? `[${toApexString(a[0])}] ${toApexString(a[1])}` : toApexString(a[0]);
-            this.log(msg, 'debug');
+            // System.debug(msg) or System.debug(LoggingLevel, msg). The value we
+            // want to render as an expandable tree is the last argument.
+            const twoArg = a.length > 1;
+            const val = twoArg ? a[1] : a[0];
+            const cat = twoArg ? toApexString(a[0]) : null;
+            const text = twoArg ? `[${cat}] ${toApexString(val)}` : toApexString(val);
+            if (this.host && this.host.debug) {
+              this.host.debug({ text, tree: this._debugTree(val), category: cat, line });
+            } else {
+              this.log(text, 'debug');
+            }
             return null;
           }
           case 'now': return ApexDatetime.now();
@@ -2334,6 +3859,19 @@
           case 'log': return Math.log(a[0]);
           case 'log10': return Math.log10(a[0]);
           case 'signum': return Math.sign(a[0]);
+          case 'roundtolong': return Math.round(a[0]);
+          case 'cbrt': return Math.cbrt(a[0]);
+          case 'hypot': return Math.hypot(a[0], a[1]);
+          case 'sin': return Math.sin(a[0]);
+          case 'cos': return Math.cos(a[0]);
+          case 'tan': return Math.tan(a[0]);
+          case 'asin': return Math.asin(a[0]);
+          case 'acos': return Math.acos(a[0]);
+          case 'atan': return Math.atan(a[0]);
+          case 'atan2': return Math.atan2(a[0], a[1]);
+          case 'sinh': return Math.sinh(a[0]);
+          case 'cosh': return Math.cosh(a[0]);
+          case 'tanh': return Math.tanh(a[0]);
         }
         throw new ApexError('System.NoSuchMethodException', `Math.${name} not supported`, line);
       }
@@ -2342,7 +3880,15 @@
           case 'serialize': return JSON.stringify(jsonify(a[0]));
           case 'serializepretty': return JSON.stringify(jsonify(a[0]), null, 2);
           case 'deserializeuntyped': return unjsonify(JSON.parse(a[0]));
-          case 'deserialize': case 'deserializestrict': return unjsonify(JSON.parse(a[0]));
+          case 'deserialize': case 'deserializestrict': {
+            const parsed = JSON.parse(a[0]);
+            const typeTok = (a[1] && typeof a[1] === 'object' && a[1].__typeToken)
+              ? a[1].__typeToken
+              : (typeof a[1] === 'string' ? a[1] : null);
+            return typeTok ? await this.deserializeTyped(parsed, typeTok, frame) : unjsonify(parsed);
+          }
+          case 'creategenerator': return new ApexJsonGenerator(a[0] === true);
+          case 'createparser': return new ApexJsonParser(a[0] == null ? '' : toApexString(a[0]));
         }
         throw new ApexError('System.NoSuchMethodException', `JSON.${name} not supported`, line);
       }
@@ -2383,16 +3929,98 @@
           case 'today': return ApexDate.today();
           case 'newinstance': return new ApexDate(a[0], a[1], a[2]);
           case 'valueof': { const d = new Date(a[0]); return ApexDate.fromJs(d); }
+          // Date.parse(String) parses a locale date ("M/d/yyyy"); JS Date handles that form.
+          case 'parse': { const d = new Date(String(a[0])); if (isNaN(d.getTime())) throw new ApexError('System.TypeException', `Invalid date: ${a[0]}`, line); return ApexDate.fromJs(d); }
+          case 'daysinmonth': return new Date(a[0], a[1], 0).getDate();
+          case 'isleapyear': { const y = a[0]; return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0; }
         }
         throw new ApexError('System.NoSuchMethodException', `Date.${name} not supported`, line);
+      }
+      if (t === 'blob') {
+        switch (n) {
+          case 'valueof': return new ApexBlob(a[0] == null ? '' : toApexString(a[0]));
+        }
+        throw new ApexError('System.NoSuchMethodException', `Blob.${name} not supported`, line);
+      }
+      if (t === 'encodingutil') {
+        const asStr = x => x instanceof ApexBlob ? x.s : (x == null ? '' : toApexString(x));
+        switch (n) {
+          case 'base64encode': return b64encode(asStr(a[0]));
+          case 'base64decode': return new ApexBlob(b64decode(String(a[0])));
+          // Apex urlEncode uses application/x-www-form-urlencoded (space → '+').
+          case 'urlencode': return encodeURIComponent(String(a[0])).replace(/%20/g, '+').replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+          case 'urldecode': return decodeURIComponent(String(a[0]).replace(/\+/g, ' '));
+          case 'converttohex': return hexencode(asStr(a[0]));
+          case 'convertfromhex': return new ApexBlob(hexdecode(String(a[0])));
+        }
+        throw new ApexError('System.NoSuchMethodException', `EncodingUtil.${name} not supported`, line);
+      }
+      if (t === 'crypto') {
+        switch (n) {
+          case 'getrandominteger': return (Math.floor(Math.random() * 4294967296)) | 0;
+          case 'getrandomlong': return Math.floor((Math.random() - 0.5) * Number.MAX_SAFE_INTEGER);
+        }
+        // Digest/MAC/signing need real crypto keys and are org/config-dependent — degrade
+        // honestly rather than fabricate a bogus hash.
+        this._noteGap(`Crypto.${name}() needs real key/cert material and cannot be simulated truthfully`, 'engine-gap', { line, what: 'static call' });
+        return null;
+      }
+      if (t === 'time') {
+        switch (n) {
+          case 'newinstance': return new ApexTime(a[0], a[1], a[2], a[3]);
+        }
+        throw new ApexError('System.NoSuchMethodException', `Time.${name} not supported`, line);
+      }
+      if (t === 'url') {
+        // Org-context factory URLs. The wrapper stores the originating Apex
+        // expression; the real domain is resolved from the connected org when a
+        // terminal string method (toExternalForm/getHost/…) is called.
+        switch (n) {
+          case 'getorgdomainurl': return { __url: { expr: 'URL.getOrgDomainUrl()', spec: null } };
+          case 'getsalesforcebaseurl': return { __url: { expr: 'URL.getSalesforceBaseUrl()', spec: null } };
+          case 'getorgurl': return { __url: { expr: 'URL.getOrgURL()', spec: null } };
+          case 'getcurrentrequesturl': return { __url: { expr: 'URL.getCurrentRequestUrl()', spec: null } };
+        }
+        throw new ApexError('System.NoSuchMethodException', `URL.${name} not supported`, line);
       }
       if (t === 'datetime') {
         switch (n) {
           case 'now': return ApexDatetime.now();
-          case 'newinstance': return new ApexDatetime(new Date(a[0], (a[1] || 1) - 1, a[2] || 1, a[3] || 0, a[4] || 0, a[5] || 0));
+          // newInstance(Date[, Time]) | newInstance(Long millis) | newInstance(y,mo,d[,h,mi,s]) — local time.
+          case 'newinstance': {
+            if (a[0] instanceof ApexDate) {
+              const dt = a[0], tm = a[1] instanceof ApexTime ? a[1] : new ApexTime(0, 0, 0, 0);
+              return new ApexDatetime(new Date(dt.y, dt.mo - 1, dt.day, tm.h, tm.mi, tm.s, tm.ms));
+            }
+            if (a.length === 1) return new ApexDatetime(new Date(Number(a[0])));
+            return new ApexDatetime(new Date(a[0], (a[1] || 1) - 1, a[2] || 1, a[3] || 0, a[4] || 0, a[5] || 0));
+          }
+          // newInstanceGmt(Date, Time) | newInstanceGmt(y,mo,d[,h,mi,s]) — the given
+          // wall-clock components are interpreted as GMT (Date.UTC), matching Apex.
+          case 'newinstancegmt': {
+            if (a[0] instanceof ApexDate) {
+              const dt = a[0], tm = a[1] instanceof ApexTime ? a[1] : new ApexTime(0, 0, 0, 0);
+              return new ApexDatetime(new Date(Date.UTC(dt.y, dt.mo - 1, dt.day, tm.h, tm.mi, tm.s, tm.ms)));
+            }
+            return new ApexDatetime(new Date(Date.UTC(a[0], (a[1] || 1) - 1, a[2] || 1, a[3] || 0, a[4] || 0, a[5] || 0)));
+          }
           case 'valueof': return new ApexDatetime(new Date(a[0]));
+          case 'valueofgmt': return new ApexDatetime(new Date(String(a[0]).trim().replace(' ', 'T') + 'Z'));
         }
         throw new ApexError('System.NoSuchMethodException', `Datetime.${name} not supported`, line);
+      }
+      if (t === 'pattern') {
+        switch (n) {
+          case 'compile': return { __pattern: javaRegexToJs(a[0]) };
+          case 'matches': {
+            // Pattern.matches(regex, input): whole-input (anchored) match.
+            const p = javaRegexToJs(a[0]);
+            const re = new RegExp('^(?:' + p.source + ')$', p.flags.replace('g', ''));
+            return re.test(String(a[1] == null ? '' : a[1]));
+          }
+          case 'quote': return String(a[0] == null ? '' : a[0]).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+        throw new ApexError('System.NoSuchMethodException', `Pattern.${name} not supported`, line);
       }
       if (t === 'database') {
         switch (n) {
@@ -2405,7 +4033,7 @@
             let binds;
             if (n === 'querywithbinds' && a[1] instanceof ApexMap) {
               binds = {};
-              for (const en of a[1].m.values()) binds[toApexString(en.k)] = en.v;
+              for (const en of a[1].m.values()) binds[toApexString(en.k)] = this.normalizeBindValue(en.v);
             } else {
               binds = await this.resolveScopeBinds(raw, frame);
             }
@@ -2447,7 +4075,14 @@
           case 'getprofileid': return ui.profileId || fakeId('00e');
           case 'getsessionid': return 'SESSION_ID_REMOVED';
         }
-        return null;
+        // Everything else (isCurrentUserLicensed, getLocale, getLanguage,
+        // isMultiCurrencyOrganization, getDefaultCurrency, getUserType, …) is a
+        // real user/org-specific value. Resolve it truthfully from the connected
+        // org and faithfully reproduce a thrown Apex exception so caller
+        // try/catch behaves exactly as in production — e.g.
+        // isCurrentUserLicensed('Apttus') THROWS System.TypeException when that
+        // managed package isn't installed, which CPQ catches and turns into false.
+        return await this.callUserInfoViaOrg(name, n, a, line);
       }
       if (t === 'test') {
         switch (n) {
@@ -2488,6 +4123,18 @@
         }
       }
       if (t === 'schema') {
+        // getGlobalDescribe() → a lazy Map<String, Schema.SObjectType>. We can't
+        // enumerate every org SObject, but the dominant usage is .get(name) /
+        // .containsKey(name), which we resolve truthfully via the org describe.
+        if (n === 'getglobaldescribe') return { __globalDescribeMap: true };
+        // describeSObjects(List<String>) → List<DescribeSObjectResult>. Each element
+        // is a describe token backed by real org metadata (resolved lazily).
+        if (n === 'describesobjects') {
+          const names = Array.isArray(a[0]) ? a[0] : [];
+          const out = [];
+          for (const nm0 of names) { const nm = toApexString(nm0); await this.ensureDescribe(nm); out.push({ __describeResult: nm }); }
+          return out;
+        }
         this.log(`Schema.${name}: describe calls are not simulated locally`, 'system');
         return null;
       }
@@ -2547,7 +4194,7 @@
       // warning and return null so line-by-line stepping continues.
       const orgVal = await this.tryOrgStaticCall(typeName, name, a);
       if (orgVal !== ENGINE_UNRESOLVED) return orgVal;
-      this.log(`⚠ ${typeName}.${name}() is not simulated and could not be resolved in the org — returning null and continuing.`, 'system');
+      this._noteGap(`${typeName}.${name}() is not simulated and could not be resolved in the org`, 'engine-gap', { line, what: 'static call' });
       return null;
     }
 
@@ -2577,6 +4224,28 @@
     }
 
     async resolveCustomSettingCall(typeName, methodName, n, a, line) {
+      // ── Perf (issues 2 & 4): LIST custom settings ──────────────────────────
+      // A LIST custom setting's getInstance(name) is exactly getAll().get(name)
+      // (same real records). So instead of one org round-trip per name — the log
+      // showed DataCache__c.getInstance('LineItemRemoteCPQFields_0'..'_31') firing
+      // 32× — fetch getAll() ONCE per type (session-cached) and serve each name
+      // from it. This is truthful: getAll() returns the identical real records.
+      // HIERARCHY settings are NOT batched: getInstance()/getInstance(Id) merge
+      // org/profile/user levels, which getAll() cannot reproduce — those stay
+      // direct (guarded by the Salesforce-Id / no-arg checks below).
+      if (n === 'getinstance' && a.length) {
+        const key = toApexString(a[0]);
+        if (key != null && key !== '' && !this._looksLikeSalesforceId(key)) {
+          const all = await this._customSettingGetAll(typeName);
+          if (all) return all.containsKey(key) ? all.get(key) : null;
+          // getAll unavailable → fall through to the direct per-name path below.
+        }
+      } else if (n === 'getall') {
+        const all = await this._customSettingGetAll(typeName);
+        if (all) return all;
+        // fall through to the direct path (which emits the empty-map stub).
+      }
+
       const argLit = a.length ? this.apexLiteral(a[0]) : null;
       let expr;
       if (n === 'getall') expr = `${typeName}.getAll()`;
@@ -2594,8 +4263,36 @@
         finally { this.pendingBackend = null; }
       }
       if (val === ENGINE_UNRESOLVED) {
-        this.log(`↳ ${typeName}.${methodName}(): org value unavailable — using an empty ${n === 'getall' ? 'map' : 'record'} stub so stepping continues.`, 'system');
-        return n === 'getall' ? new ApexMap() : { attributes: { type: typeName } };
+        // The org round-trip came back unresolved (org/CLI flakiness — e.g. the old
+        // CLI crashing on a huge log). Degrade to a value that MATCHES real Apex
+        // semantics for THIS call, never a phantom record that would crash on the
+        // first field dereference (that was a fabricated NullPointerException).
+        if (n === 'getall') {
+          // Apex getAll() never returns null → an empty map is safe to iterate.
+          this._noteOrgUnresolved(`${typeName}.getAll()`, 'an empty map', line);
+          return new ApexMap();
+        }
+        const key = a.length ? toApexString(a[0]) : null;
+        if ((n === 'getinstance' || n === 'getvalues') && key != null && key !== '' && !this._looksLikeSalesforceId(key)) {
+          // LIST custom setting getInstance(name)/getValues(name): Apex returns NULL
+          // when no record has that name, and CPQ code universally relies on the
+          //   ConfigX__c dc = ConfigX__c.getInstance(name + '_' + i);
+          //   if (dc == null) return null;           // ← this guard
+          // pattern. Returning null (instead of an empty {} stub) lets that guard run
+          // and eliminates the whole class of fabricated NPEs like
+          // "de-reference a null object (calling 'intValue')" on dc.IsLast__c.
+          this._noteOrgUnresolved(`${typeName}.${methodName}('${key}')`, 'null (treated as no matching record, which is what Apex returns)', line);
+          return null;
+        }
+        // Hierarchy getInstance()/getInstance(Id)/getOrgDefaults()/getValues(Id):
+        // Apex never returns null here (it merges org/profile/user defaults), so we
+        // return an empty record so stepping continues — TAGGED __ccUnresolved (a
+        // non-enumerable marker) so any value read from it is understood to be an
+        // unknown placeholder, not real org data, rather than being blamed on the code.
+        this._noteOrgUnresolved(`${typeName}.${methodName}(${key != null ? "'" + key + "'" : ''})`, 'an empty record (values unknown, not real)', line);
+        const stub = { attributes: { type: typeName } };
+        try { Object.defineProperty(stub, '__ccUnresolved', { value: true, enumerable: false, configurable: true }); } catch (_) {}
+        return stub;
       }
       if (n === 'getall') {
         const m = new ApexMap();
@@ -2605,7 +4302,53 @@
         return m;
       }
       const rec = this.orgJsonToSObject(val, typeName);
-      return (rec && typeof rec === 'object') ? rec : { attributes: { type: typeName } };
+      // Honor a real "no such record" result. A LIST custom setting's
+      // getInstance(name)/getValues(name) returns null in Apex when no record has
+      // that name (CPQ relies on this: `if (dataCache == null) return null;`).
+      // Hierarchy getInstance()/getOrgDefaults() never return null, so the org
+      // yields a record there and we pass it through. Only ENGINE_UNRESOLVED (org
+      // unreachable, handled above) degrades to a stub — never a resolved null.
+      if (rec === null || rec === undefined) return null;
+      return (typeof rec === 'object') ? rec : { attributes: { type: typeName } };
+    }
+
+    /** Fetch a LIST custom setting's getAll() ONCE per type (session-cached),
+     *  returned as an ApexMap<Name, record>. In-flight de-dupes concurrent calls.
+     *  Returns null when the org value is unavailable so the caller falls back to
+     *  a direct per-name query (never fabricates). */
+    async _customSettingGetAll(typeName) {
+      if (!this._csAllCache) this._csAllCache = new Map();
+      if (this._csAllCache.has(typeName)) return this._csAllCache.get(typeName);
+      if (!this._csAllInflight) this._csAllInflight = new Map();
+      if (this._csAllInflight.has(typeName)) return this._csAllInflight.get(typeName);
+
+      const p = (async () => {
+        let val = ENGINE_UNRESOLVED;
+        if (this.host.evalOrg) {
+          this.pendingBackend = `${typeName}.getAll() from org…`;
+          try {
+            const r = await this.host.evalOrg(`${typeName}.getAll()`, { sobjectType: typeName });
+            if (r && r.ok) val = r.value;
+          } catch (_) { /* leave unresolved → null */ }
+          finally { this.pendingBackend = null; }
+        }
+        if (val === ENGINE_UNRESOLVED || !val || typeof val !== 'object' || Array.isArray(val)) return null;
+        const m = new ApexMap();
+        for (const k of Object.keys(val)) m.put(k, this.orgJsonToSObject(val[k], typeName));
+        this._csAllCache.set(typeName, m);
+        return m;
+      })();
+      this._csAllInflight.set(typeName, p);
+      try { return await p; }
+      finally { this._csAllInflight.delete(typeName); }
+    }
+
+    /** True when s looks like a 15- or 18-char Salesforce Id. Hierarchy custom
+     *  setting getInstance(Id) must NOT be batched via getAll() (it merges
+     *  org/profile/user levels), so such args stay on the direct path. Requiring
+     *  a digit avoids misreading all-alpha list-setting Names as Ids. */
+    _looksLikeSalesforceId(s) {
+      return typeof s === 'string' && /^[a-zA-Z0-9]{15}(?:[a-zA-Z0-9]{3})?$/.test(s) && /[0-9]/.test(s);
     }
 
     /** Try to resolve an arbitrary static call in the org (scalar args only). */
@@ -2626,6 +4369,49 @@
       } catch (_) { /* ignore */ }
       finally { this.pendingBackend = null; }
       return ENGINE_UNRESOLVED;
+    }
+
+    /** Resolve a UserInfo.* call truthfully from the org, reproducing thrown
+     *  exceptions so caller try/catch fires exactly as in production. Results are
+     *  cached per (method, args) because identity/license data is session-stable. */
+    async callUserInfoViaOrg(methodName, n, a, line) {
+      const key = `${n}(${a.map(x => this.apexLiteral(x)).join(',')})`;
+      if (!this._userInfoCache) this._userInfoCache = new Map();
+      if (this._userInfoCache.has(key)) {
+        const c = this._userInfoCache.get(key);
+        if (c && c.__throw) throw new ApexError(c.type, c.message, line);
+        return c;
+      }
+      // isCurrentUserLicensed must yield a real Boolean so callers like
+      // `if (!isComplyEnabled())` never de-reference null. Fall back to false when
+      // the org is unreachable — that matches CPQ's own catch-block default.
+      const licenseCheck = (n === 'iscurrentuserlicensed');
+      const fallback = licenseCheck ? false : null;
+      if (!this.host.evalOrg) return fallback;
+      // UserInfo methods take only scalars (namespace string / id) or no args.
+      for (const x of a) { if (x !== null && x !== undefined && typeof x === 'object') return fallback; }
+      const expr = `UserInfo.${methodName}(${a.map(x => this.apexLiteral(x)).join(', ')})`;
+      this.pendingBackend = `UserInfo.${methodName}() from org…`;
+      let r = null;
+      try { r = await this.host.evalOrg(expr, {}); }
+      catch (_) { r = null; }
+      finally { this.pendingBackend = null; }
+      if (r && r.ok) {
+        const v = (r.value !== null && typeof r.value === 'object')
+          ? this.orgJsonToSObject(r.value, 'SObject') : r.value;
+        this._userInfoCache.set(key, v);
+        return v;
+      }
+      // Org reported a thrown Apex exception → reproduce it so caller try/catch
+      // handles it (e.g. TypeException for an uninstalled managed-package namespace).
+      const errStr = (r && r.error) ? String(r.error) : '';
+      const m = errStr.match(/^([A-Za-z_][\w.]*Exception)\s*:\s*([\s\S]*)$/);
+      if (m) {
+        this._userInfoCache.set(key, { __throw: true, type: m[1], message: m[2] });
+        throw new ApexError(m[1], m[2], line);
+      }
+      // Genuinely unresolved (no org / transient failure): degrade to a safe value.
+      return fallback;
     }
 
     /* ---------- general Live-data seam ----------
@@ -2651,6 +4437,20 @@
       return ENGINE_UNRESOLVED;
     }
 
+    /* Resolve a custom label's REAL text from the connected org. Apex compiles
+     * label references, so any label the source names exists in the org; if the
+     * org is unreachable we return null (never a fabricated string). */
+    async resolveLabel(name, line) {
+      if (!this._labelCache) this._labelCache = new Map();
+      const key = String(name);
+      if (this._labelCache.has(key)) return this._labelCache.get(key);
+      const v = await this.resolveViaOrg('System.Label.' + name, {});
+      const out = (v !== ENGINE_UNRESOLVED) ? v : null;
+      if (v === ENGINE_UNRESOLVED) this.log(`⚠ System.Label.${name} could not be resolved from org — returning null.`, 'system');
+      this._labelCache.set(key, out);
+      return out;
+    }
+
     /* Lazily fetch a single field that wasn't part of the record's original query.
      * Only fires when Live data is on, the record has a real 15/18-char Id and a
      * concrete SObject type. The fetched value is cached back onto the record so
@@ -2664,14 +4464,31 @@
       const soql = `SELECT ${field} FROM ${type} WHERE Id = '${String(id).replace(/'/g, "\\'")}' LIMIT 1`;
       this.pendingBackend = `hydrating ${type}.${field} from org…`;
       try {
-        const rows = await this.host.query(soql, {});
+        const rows = await this.host.query(soql, {}, { probe: true });
         if (Array.isArray(rows) && rows.length) {
           const val = sobjGet(rows[0], field);
+          if (val === undefined) {
+            // The row came back but WITHOUT the requested field — the org dropped it as
+            // a non-existent column. Cache null so repeat reads stay quiet, and signal
+            // the field is genuinely absent (not merely a transient miss).
+            sobjSet(rec, field, null);
+            return ENGINE_FIELD_ABSENT;
+          }
           const resolved = val === undefined ? null : val;
           sobjSet(rec, field, resolved); // cache onto the live record
           return resolved;
         }
-      } catch (_) { /* fall through to unresolved */ }
+      } catch (e) {
+        // Distinguish a permanent schema gap ("No such column" / INVALID_FIELD / "not
+        // supported") from a transient org/CLI failure: the former means the connected
+        // org simply does not have this field, so retrying is pointless and the honest
+        // outcome is a recorded absence; the latter degrades quietly to unresolved.
+        const msg = String((e && (e.apexMessage || e.message)) || '');
+        if (/No such column|INVALID_FIELD|not supported|Didn.?t understand relationship|does\s?n.?t exist/i.test(msg)) {
+          sobjSet(rec, field, null);
+          return ENGINE_FIELD_ABSENT;
+        }
+      }
       finally { this.pendingBackend = null; }
       return ENGINE_UNRESOLVED;
     }
@@ -2679,7 +4496,8 @@
 
   /* ================= exports ================= */
   const API = {
-    ApexEngine, ApexError, ApexMap, ApexSet, ApexObject, ApexDate, ApexDatetime,
+    ApexEngine, ApexError, ApexMap, ApexSet, ApexObject, ApexDate, ApexDatetime, ApexTime, ApexBlob, ApexEnumValue,
+    ApexJsonGenerator, ApexJsonParser,
     Environment, toApexString, typeNameOf, apexEquals, formatValue: toApexString, isSObject, sobjType,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
