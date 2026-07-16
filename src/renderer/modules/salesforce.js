@@ -1,5 +1,5 @@
 /**
- * CongaCode — Salesforce Module
+ * Apex Debug Studio — Salesforce Module
  * 5 sub-features: Quick API View, Apex Test Runner, Process Flow Visualizer,
  * Change Impact Analyzer, Deployment Simulator
  */
@@ -115,7 +115,7 @@
     const folder = getFolderPath();
     if (!folder || !username) return;
     try {
-      const api = window.congacode;
+      const api = window.apexStudio;
       if (!api || !api.readSettings) return;
       const settings = await api.readSettings();
       if (!settings.sfOrgMap) settings.sfOrgMap = {};
@@ -129,7 +129,7 @@
     const folder = getFolderPath();
     if (!folder) return null;
     try {
-      const api = window.congacode;
+      const api = window.apexStudio;
       if (!api || !api.readSettings) return null;
       const settings = await api.readSettings();
       return (settings.sfOrgMap && settings.sfOrgMap[folder]) || null;
@@ -161,7 +161,7 @@
   /** Execute a Salesforce CLI command, capture and return full output */
   async function sfExec(command, timeoutMs) {
     const folder = getFolderPath() || undefined;
-    const api = window.congacode;
+    const api = window.apexStudio;
     if (!api || !api.sfExec) {
       throw new Error('sfExec IPC not available');
     }
@@ -194,7 +194,7 @@
     sel.disabled = true;
     if (label) label.textContent = '';
 
-    const api = window.congacode;
+    const api = window.apexStudio;
     if (!api || !api.sfCheckCli) {
       dot.classList.add('no-cli');
       sel.innerHTML = '<option value="">IPC bridge not available</option>';
@@ -302,6 +302,21 @@
     // Persist selection for this repo
     saveOrgForRepo(sel.value);
     updateStatusBarOrg();
+    // Offer to deploy the system-mode helper class if this connected org lacks it.
+    notifySystemHelperOnConnect(connected);
+  }
+
+  /**
+   * Ask the Apex debugger to verify (and, with consent, deploy) its system-mode
+   * helper class on the freshly connected org. Fire-and-forget; safe if the
+   * debugger module isn't loaded yet.
+   */
+  function notifySystemHelperOnConnect(connected) {
+    try {
+      if (connected && typeof window.apexDebuggerCheckSystemHelper === 'function' && typeof window.sfGetActiveOrg === 'function') {
+        window.apexDebuggerCheckSystemHelper(window.sfGetActiveOrg());
+      }
+    } catch (_) { /* non-fatal */ }
   }
 
   /** Authenticate a new org via browser OAuth flow */
@@ -334,6 +349,9 @@
       if (btn) { btn.disabled = false; btn.textContent = '+ Add Org'; }
       updateStatusBarOrg(); // reset status bar text
       await checkOrgConnection();
+      // A freshly authenticated org is auto-selected without firing the dropdown
+      // 'change' event, so trigger the system-mode helper check explicitly.
+      notifySystemHelperOnConnect(sfState.orgConnected);
     }
   }
 
@@ -516,7 +534,7 @@
 
   /** Recursively gather .cls and .trigger files */
   async function gatherApexFiles(folderPath) {
-    const api = window.congacode;
+    const api = window.apexStudio;
     if (!api) return [];
     const files = [];
     try {
@@ -537,7 +555,7 @@
   /** Read file content via IPC */
   async function readFile(fp) {
     try {
-      return await window.congacode.readFile(fp);
+      return await window.apexStudio.readFile(fp);
     } catch { return null; }
   }
 
@@ -887,7 +905,7 @@
 
         // Execute anonymous Apex via sf apex run using temp file
         const escapedApex = apexCode.replace(/'/g, "'\\''");
-        const cmd = `cd "${folder}" && tmpf=$(mktemp /tmp/conga_apex_XXXXXX.apex) && printf '%s' '${escapedApex}' > "$tmpf" && sf apex run --file "$tmpf"${tof} --json 2>&1; rm -f "$tmpf"`;
+        const cmd = `cd "${folder}" && tmpf=$(mktemp /tmp/ads_apex_XXXXXX.apex) && printf '%s' '${escapedApex}' > "$tmpf" && sf apex run --file "$tmpf"${tof} --json 2>&1; rm -f "$tmpf"`;
         output.textContent = `Anonymous Apex:\n${apexCode}\n\n⏳ Executing on org...`;
         const { code, stdout, stderr } = await sfExec(cmd, 60000);
 
@@ -2217,7 +2235,7 @@
       }
     } else {
       try {
-        const status = await window.congacode.gitStatus(folder);
+        const status = await window.apexStudio.gitStatus(folder);
         if (status && status.files) {
           targetClasses = status.files
             .map(f => f.path.split('/').pop().replace(/\.(cls|trigger)$/, ''))
@@ -2485,7 +2503,7 @@
 
     if (scopeSelect.value === 'modified') {
       try {
-        const status = await window.congacode.gitStatus(folder);
+        const status = await window.apexStudio.gitStatus(folder);
         if (status && status.files) {
           filesToDeploy = status.files.map(f => f.path);
         }
@@ -2581,7 +2599,7 @@
     for (const fp of allFiles) {
       const metaFile = fp + '-meta.xml';
       try {
-        await window.congacode.stat(metaFile);
+        await window.apexStudio.stat(metaFile);
       } catch {
         issues.push({
           type: 'warn',
@@ -2911,7 +2929,7 @@
     let sourceFlag = '';
     if (scopeSelect.value === 'modified') {
       try {
-        const status = await window.congacode.gitStatus(folder);
+        const status = await window.apexStudio.gitStatus(folder);
         if (status && status.files && status.files.length > 0) {
           const modifiedPaths = status.files.map(f => f.path).filter(p =>
             p.endsWith('.cls') || p.endsWith('.trigger') || p.endsWith('.js') ||
@@ -3403,6 +3421,10 @@
     $('#sf-org-refresh')?.addEventListener('click', checkOrgConnection);
     $('#sf-org-select')?.addEventListener('change', onOrgSelectChange);
     $('#sf-org-login')?.addEventListener('click', () => showOrgPicker());
+    // System-mode opt-in toggle + debug-log cleanup (handled by the Apex debugger module)
+    $('#sf-systemmode-toggle')?.addEventListener('click', () => window.apexDebuggerToggleSystemMode?.());
+    $('#sf-clearlogs')?.addEventListener('click', () => window.apexDebuggerClearDebugLogs?.());
+    try { window.apexDebuggerUpdateSystemModeUi?.(); } catch (_) {}
     checkOrgConnection();
 
     // Org picker popup

@@ -1,5 +1,5 @@
 /* ========================================================================
-   CongaCode — Styles
+   Apex Debug Studio — Styles
    ======================================================================== */
 
 /* ---- Reset & Base ---- */
@@ -386,7 +386,7 @@
 }
 
 /* Conga Theme */
-[data-theme="conga"] {
+[data-theme="apex"] {
   --bg-primary: #1a1a1a;
   --bg-secondary: #141414;
   --bg-tertiary: #0f0f0f;
@@ -1121,10 +1121,92 @@ html, body {
   -webkit-user-drag: none;
   image-rendering: -webkit-optimize-contrast;
 }
+.welcome-title {
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: .2px;
+  color: var(--text-primary);
+  margin: 6px 0 0;
+}
 .welcome-subtitle {
   font-size: 14px; font-weight: 400;
   color: var(--text-muted);
   margin-top: 2px;
+}
+
+/* ---- Branded Boot Splash ---- */
+#app-splash {
+  position: fixed; inset: 0; z-index: 100000;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-app-region: drag;
+  background:
+    radial-gradient(1200px 820px at 50% 30%, rgba(88, 166, 255, 0.10), transparent 60%),
+    radial-gradient(820px 560px at 50% 118%, rgba(163, 113, 247, 0.08), transparent 62%),
+    var(--bg-primary, #0d1117);
+  opacity: 1;
+  transition: opacity .45s ease;
+}
+#app-splash.splash-hidden { opacity: 0; pointer-events: none; }
+#app-splash.splash-done { display: none; }
+.splash-inner {
+  display: flex; flex-direction: column; align-items: center;
+  transform: translateY(-2%);
+  animation: splashFadeIn .5s ease both;
+}
+.splash-logo {
+  width: 132px; height: 132px;
+  user-select: none; -webkit-user-drag: none;
+  filter:
+    drop-shadow(0 14px 34px rgba(0, 0, 0, 0.42))
+    drop-shadow(0 0 22px rgba(88, 166, 255, 0.14));
+  animation: splashLogoPop .62s cubic-bezier(.2, .7, .2, 1) both;
+}
+.splash-title {
+  margin-top: 22px;
+  font-size: 26px; font-weight: 700; letter-spacing: .2px;
+  color: var(--text-primary, #e6edf3);
+}
+.splash-tagline {
+  margin-top: 6px;
+  font-size: 13.5px;
+  color: var(--text-muted, #8b949e);
+}
+.splash-progress {
+  margin-top: 28px;
+  width: 210px; height: 4px; border-radius: 4px;
+  background: rgba(240, 246, 252, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(240, 246, 252, 0.04);
+  overflow: hidden;
+}
+.splash-progress-bar {
+  width: 40%; height: 100%; border-radius: 4px;
+  background: linear-gradient(90deg, #1f6feb, #58a6ff, #79c0ff);
+  box-shadow: 0 0 12px rgba(88, 166, 255, 0.55);
+  animation: splashLoad 1.15s ease-in-out infinite;
+}
+@keyframes splashLoad {
+  0%   { transform: translateX(-120%); }
+  55%  { transform: translateX(80%); }
+  100% { transform: translateX(330%); }
+}
+@keyframes splashLogoPop {
+  0%   { opacity: 0; transform: scale(.82); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes splashFadeIn {
+  0%   { opacity: 0; }
+  100% { opacity: 1; }
+}
+#welcome-screen:not(.hidden) .welcome-content {
+  animation: welcomeFadeIn .4s ease both;
+}
+@keyframes welcomeFadeIn {
+  0%   { opacity: 0; transform: translateY(6px); }
+  100% { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .splash-inner, .splash-logo, #welcome-screen:not(.hidden) .welcome-content { animation: none; }
+  .splash-progress-bar { animation-duration: 2.4s; }
 }
 
 /* ---- Welcome Spotlight Search ---- */
@@ -2055,7 +2137,76 @@ body.zen-mode #editor-container { border-radius: 0; }
   flex-direction: row;
   overflow: hidden;
   min-width: 0;
+  position: relative;   /* anchor for the query-loader overlay */
 }
+/* ── Live-Org query loader (prominent, consistent across every file) ──────── */
+.dbg-query-banner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(720px, 80%);
+  padding: 10px 18px;
+  background: rgba(20, 24, 33, 0.97);
+  border: 1px solid #d29922;
+  border-left: 4px solid #d29922;
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  color: #f0d9a0;
+  font-size: 13px;
+  animation: dbg-banner-in 0.15s ease-out;
+  pointer-events: auto;
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+}
+.dbg-query-banner:hover {
+  border-color: #f0b429;
+  border-left-color: #f0b429;
+  background: rgba(30, 35, 46, 0.99);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.6);
+}
+.dbg-query-banner:active { transform: translate(-50%, 1px); }
+.dbg-query-banner .dbg-query-banner-go {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding-left: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #ffd970;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+.dbg-query-banner:hover .dbg-query-banner-go { opacity: 1; }
+.dbg-query-banner.hidden { display: none; }
+@keyframes dbg-banner-in {
+  from { opacity: 0; transform: translate(-50%, -6px); }
+  to   { opacity: 1; transform: translate(-50%, 0); }
+}
+.dbg-query-banner-spinner {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border: 3px solid rgba(210, 153, 34, 0.28);
+  border-top-color: #f0b429;
+  border-radius: 50%;
+  animation: dbg-spin 0.7s linear infinite;
+}
+.dbg-query-banner-text { display: flex; flex-direction: column; min-width: 0; }
+.dbg-query-banner-title { font-weight: 700; color: #ffd970; }
+.dbg-query-banner-detail {
+  font-family: var(--mono-font, ui-monospace, monospace);
+  font-size: 11px;
+  color: #cbb587;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 640px;
+}
+.dbg-query-banner-detail:empty { display: none; }
 .editor-split-container #editor-container { flex: 1; overflow: hidden; }
 .editor-split-container #editor-container-secondary { flex: 1; overflow: hidden; }
 .split-resizer {
@@ -3815,6 +3966,18 @@ body.zen-mode #editor-container { border-radius: 0; }
 .sf-btn-login:hover { filter: brightness(1.15); }
 .sf-btn-login:disabled { opacity: .5; cursor: wait; }
 
+/* System-mode opt-in toggle (org bar). OFF = user mode (default), ON = system mode. */
+.sf-btn-sysmode {
+  padding: 1px 8px; font-size: 10px; font-family: inherit; white-space: nowrap;
+  background: var(--bg-primary); color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: 3px; cursor: pointer;
+}
+.sf-btn-sysmode:hover { border-color: var(--accent); color: var(--text-primary); }
+.sf-btn-sysmode.on {
+  background: rgba(255,166,0,.14); color: #ffa600; border-color: #ffa600; font-weight: 600;
+}
+.sf-btn-sysmode:disabled { opacity: .5; cursor: wait; }
+
 /* Test failure detail */
 .sf-test-error-detail {
   font-size: 10.5px; color: #f85149; font-family: 'SF Mono', Menlo, monospace;
@@ -4015,7 +4178,13 @@ body.zen-mode #editor-container { border-radius: 0; }
   letter-spacing: 0.5px;
   color: var(--accent, #007acc);
   margin-right: 4px;
+  cursor: grab;
+  user-select: none;
+  white-space: nowrap;
 }
+.dbg-toolbar-label:active { cursor: grabbing; }
+.debug-toolbar.dragging { cursor: grabbing; box-shadow: 0 8px 26px rgba(0,0,0,0.55); }
+.debug-toolbar.dragging .dbg-toolbar-label { cursor: grabbing; }
 .dbg-toolbar-buttons {
   display: flex;
   gap: 2px;
@@ -4041,6 +4210,25 @@ body.zen-mode #editor-container { border-radius: 0; }
 }
 .dbg-toolbar-btn.dbg-btn-stop:hover {
   background: #f8514920;
+}
+/* Disabled while the engine is running or querying the org, so the user can SEE
+   that work is in progress and can't queue conflicting step commands. */
+.dbg-toolbar-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.dbg-toolbar-btn:disabled:hover {
+  background: none;
+  color: var(--text-secondary, #ccc);
+}
+
+/* Step Back (reverse replay). Neutral by default like the sibling step buttons so a
+   DISABLED state reads as plainly dimmed (not highlighted). It picks up the amber
+   time-travel accent only on hover while enabled, which also signals it's clickable. */
+.dbg-toolbar-btn.dbg-btn-back:hover:not(:disabled) {
+  background: #ffb02020;
+  color: #ffb020;
 }
 
 /* -- Live Org toggle -- */
@@ -4104,15 +4292,45 @@ body.zen-mode #editor-container { border-radius: 0; }
   font-size: 10px;
   font-family: var(--font-mono, monospace);
   color: var(--text-secondary, #999);
-  max-width: 180px;
+  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Never grow/shrink the button row: this pill sizes to its content and holds
+     its place so the "Run in Org" button (and the step buttons) don't shift when
+     the connection text changes. */
+  flex: 0 0 auto;
 }
 .dbg-liveorg-status.connected { color: #3fb950; }
 .dbg-liveorg-status.disconnected { color: #8b949e; }
 .dbg-liveorg-status.fetching { color: #d29922; }
 .dbg-liveorg-status.idle { color: #8b949e; }
+
+/* Exec-status: shown when execution is in a file that isn't the active editor */
+.dbg-exec-status {
+  font-size: 11px;
+  color: #8b949e;
+  margin-left: 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+  opacity: 0.9;
+}
+/* When the pill is a click target (e.g. "paused elsewhere — click to open") */
+.dbg-exec-status.clickable {
+  color: var(--accent, #4daafc);
+  cursor: pointer;
+  text-decoration: underline;
+  opacity: 1;
+}
+.dbg-exec-status.clickable:hover { color: #7cc4ff; }
+/* Exception pill — the run failed; make it unmistakably red. */
+.dbg-exec-status.error {
+  color: #ff6b6b;
+  font-weight: 600;
+}
+.dbg-exec-status.error.clickable:hover { color: #ff9090; }
 
 /* Run in Org button */
 .dbg-runorg-btn {
@@ -4151,6 +4369,63 @@ body.zen-mode #editor-container { border-radius: 0; }
   display: inline-block;
 }
 @keyframes dbg-spin { to { transform: rotate(360deg); } }
+.dbg-org-conn {
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 12px; font-size: 12px; font-weight: 600;
+  border-bottom: 1px solid var(--border, #3c3c3c);
+}
+.dbg-org-conn.connected { color: #3fb950; background: rgba(63, 185, 80, 0.08); }
+.dbg-org-conn.connecting { color: #d29922; background: rgba(210, 153, 34, 0.10); }
+.dbg-org-conn.disconnected { color: var(--text-secondary, #8b949e); background: rgba(139, 148, 158, 0.08); }
+.dbg-org-conn b { font-weight: 700; }
+
+/* Sticky "running now" query banner — pinned to the top of the Org panel so the
+   currently-executing query is always in view while the log scrolls beneath it. */
+.dbg-org-running {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  font-size: 11px;
+  color: #ffb020;
+  background: rgba(255, 176, 32, 0.12);
+  border-bottom: 1px solid rgba(255, 176, 32, 0.35);
+  backdrop-filter: blur(2px);
+  cursor: pointer;
+}
+.dbg-org-running:hover { background: rgba(255, 176, 32, 0.2); }
+.dbg-org-running-jump {
+  flex: 0 0 auto;
+  font-weight: 700;
+  color: #ffd591;
+  opacity: 0.85;
+}
+.dbg-org-running-label {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  flex: 0 0 auto;
+}
+.dbg-org-running-q {
+  font-family: var(--mono, monospace);
+  color: #ffd591;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.dbg-org-running-spin {
+  flex: 0 0 auto;
+  width: 11px; height: 11px;
+  border: 2px solid rgba(255, 176, 32, 0.35);
+  border-top-color: #ffb020;
+  border-radius: 50%;
+  animation: dbg-spin 0.8s linear infinite;
+}
 .dbg-org-summary { padding: 10px 12px; border-bottom: 1px solid var(--border, #3c3c3c); }
 .dbg-org-head { font-weight: 600; font-size: 13px; color: var(--text-primary, #fff); }
 .dbg-org-org { color: var(--text-secondary, #8b949e); font-weight: 400; font-size: 11px; }
@@ -4256,6 +4531,29 @@ body.zen-mode #editor-container { border-radius: 0; }
   color: var(--text-muted, #888);
   font-style: italic;
   font-size: 11px;
+}
+
+/* -- Org & Log tab: Read-mode controls (system-mode toggle + clear logs) -- */
+.dbg-org-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #333);
+  background: var(--bg-secondary, #252526);
+  flex-shrink: 0;
+}
+.dbg-org-controls-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-muted, #888);
+  margin-right: 2px;
+}
+.dbg-org-controls .dbg-clearlogs-btn {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
 }
 
 /* -- Variables Panel -- */
@@ -4403,55 +4701,144 @@ body.zen-mode #editor-container { border-radius: 0; }
 .dbg-val-bool { color: #569cd6; }
 .dbg-val-null { color: #808080; font-style: italic; }
 .dbg-val-muted { color: var(--text-muted, #888); font-style: italic; }
-.dbg-frame-label {
+/* -- Call Stack Panel (Chrome-style: depth header, method + source link, jump) -- */
+.dbg-stack-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 6px 12px 4px;
+  border-bottom: 1px solid var(--border, #333);
+}
+.dbg-stack-head-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-secondary, #8b949e);
+}
+.dbg-stack-head-count {
+  font-size: 10px;
+  font-weight: 600;
+  color: #ffd591;
+  background: rgba(255, 176, 32, 0.12);
+  border: 1px solid rgba(255, 176, 32, 0.3);
+  border-radius: 9px;
+  padding: 1px 8px;
+}
+.dbg-stack-hint {
   padding: 4px 12px;
   font-size: 10px;
-  color: var(--accent, #007acc);
-  font-weight: 600;
-  letter-spacing: 0.3px;
-  border-bottom: 1px solid var(--border, #333);
-  margin-bottom: 2px;
-}
-
-/* -- Call Stack Panel -- */
-.dbg-stack-hint {
-  padding: 3px 12px;
-  font-size: 10px;
-  color: var(--accent, #007acc);
-  opacity: 0.8;
+  color: var(--text-secondary, #8b949e);
+  opacity: 0.85;
 }
 .dbg-stack-frame {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 12px;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 5px 12px;
   cursor: pointer;
-  border-radius: 3px;
+  border-left: 2px solid transparent;
   transition: background 0.1s;
 }
 .dbg-stack-frame:hover {
   background: var(--bg-hover, #2a2d2e);
 }
 .dbg-stack-frame.current {
-  background: var(--accent, #007acc)20;
-  border-left: 2px solid var(--accent, #007acc);
+  background: rgba(255, 176, 32, 0.09);
 }
-.dbg-stack-depth {
-  color: var(--accent, #007acc);
-  font-size: 10px;
-  width: 16px;
+.dbg-stack-frame.selected {
+  background: rgba(76, 154, 255, 0.14);
+  border-left-color: #4c9aff;
+}
+.dbg-stack-frame.current.selected {
+  border-left-color: #ffb020;
+}
+.dbg-stack-frame.no-src {
+  cursor: default;
+  opacity: 0.7;
+}
+.dbg-stack-marker {
+  color: #ffb020;
+  font-size: 11px;
+  width: 10px;
   flex-shrink: 0;
+  line-height: 18px;
+  text-align: center;
+}
+.dbg-stack-frame:not(.current) .dbg-stack-marker {
+  color: var(--text-muted, #6e7681);
+}
+.dbg-stack-frame-body {
+  flex: 1;
+  min-width: 0;
+}
+.dbg-stack-row1 {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
 }
 .dbg-stack-method {
   color: #dcdcaa;
   font-family: var(--font-mono, monospace);
   font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
 }
-.dbg-stack-location {
-  color: var(--text-muted, #888);
+.dbg-stack-parens { color: var(--text-muted, #6e7681); font-weight: 400; }
+.dbg-stack-badge {
+  flex-shrink: 0;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--text-secondary, #8b949e);
+  background: rgba(139, 148, 158, 0.15);
+  border-radius: 8px;
+  padding: 1px 7px;
+}
+.dbg-stack-frame.current .dbg-stack-badge {
+  color: #1a1a1a;
+  background: #ffb020;
+}
+.dbg-stack-src {
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  color: #6a9bd8;
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dbg-stack-frame:hover .dbg-stack-src { text-decoration: underline; }
+.dbg-stack-lineno { color: #ce9178; }
+
+/* Banner shown atop Variables when inspecting a caller frame (not the live line). */
+.dbg-frame-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 5px 12px;
   font-size: 11px;
-  margin-left: auto;
+  color: #cdd9e5;
+  background: rgba(76, 154, 255, 0.12);
+  border-bottom: 1px solid rgba(76, 154, 255, 0.3);
 }
+.dbg-frame-banner b { color: #dcdcaa; font-weight: 600; }
+.dbg-frame-return {
+  margin-left: auto;
+  font-size: 10px;
+  color: #4c9aff;
+  background: transparent;
+  border: 1px solid rgba(76, 154, 255, 0.4);
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.dbg-frame-return:hover { background: rgba(76, 154, 255, 0.18); }
 
 /* -- Console Panel -- */
 .dbg-console-entry {
@@ -4548,6 +4935,238 @@ body.zen-mode #editor-container { border-radius: 0; }
 .dbg-json-num { color: #b5cea8; }
 .dbg-json-bool { color: #569cd6; }
 .dbg-json-null { color: #808080; font-style: italic; }
+
+/* Chrome-DevTools-style expandable value tree (System.debug / eval output) */
+.dbg-tree-root {
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  color: #d4d4d4;
+  user-select: text;
+  word-break: break-word;
+  flex: 1;
+  min-width: 0;
+}
+.dbg-tree-copy {
+  background: transparent;
+  border: 1px solid #444;
+  color: #9cdcfe;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 3px;
+  cursor: pointer;
+  opacity: 0;
+  height: 18px;
+  flex-shrink: 0;
+  transition: opacity 0.15s;
+}
+.dbg-console-entry:hover .dbg-tree-copy { opacity: 0.75; }
+.dbg-tree-copy:hover { opacity: 1 !important; background: #333; }
+.cv-node { display: inline-block; vertical-align: top; }
+.cv-toggle { cursor: pointer; user-select: none; }
+.cv-toggle:hover .cv-preview { text-decoration: underline; }
+.cv-arrow {
+  display: inline-block;
+  width: 12px;
+  color: #808080;
+  font-size: 9px;
+  text-align: center;
+}
+.cv-preview { color: #9aa0a6; }
+.dbg-tree-label { color: #9cdcfe; font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace; font-size: 11px; flex-shrink: 0; white-space: nowrap; }
+.cv-children { display: block; margin-left: 14px; border-left: 1px dotted #333; padding-left: 4px; }
+.cv-children.collapsed { display: none; }
+.cv-prop { white-space: normal; }
+.cv-key { color: #9cdcfe; }
+.cv-str { color: #ce9178; }
+.cv-num { color: #b5cea8; }
+.cv-bool { color: #569cd6; }
+.cv-null, .cv-undef { color: #808080; font-style: italic; }
+.cv-ref { color: #e3b341; font-style: italic; }
+.cv-empty { color: #808080; }
+.cv-more { color: #808080; font-style: italic; }
+
+/* Interactive expandable hover (Chrome DevTools style) — a floating, body-level
+   panel that hosts the click-to-expand cv-* tree the markdown hover can't. It's
+   positioned (fixed) at the hovered token from editor coordinates. */
+.dbg-hover-tree {
+  position: fixed;
+  background: var(--bg-secondary, #1e1e2e);
+  border: 1px solid var(--border, #3c3c4e);
+  border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 560px;
+  min-width: 220px;
+  max-height: 360px;
+  /* Single scroll container: scrolls BOTH axes. (A flex column with an inner-scroll
+     body does NOT work here — the panel is position:fixed with only max-height, so the
+     flex body is sized to its full content height and the container just clips it with
+     no scrollbar. Keeping one overflow:auto box is the reliable, proven model.) */
+  overflow: auto;
+  pointer-events: auto;
+  user-select: text;
+  z-index: 9999;
+}
+.dbg-hover-tree-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #252537;
+  border-bottom: 1px solid #3c3c4e;
+  border-radius: 6px 6px 0 0;
+}
+.dbg-hover-tree-path { color: #9cdcfe; font-weight: 600; }
+.dbg-hover-tree-type { color: #9aa0a6; font-style: italic; font-size: 11px; }
+.dbg-hover-tree-copy {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: #9aa0a6;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  border-radius: 3px;
+}
+.dbg-hover-tree-copy:hover { background: #ffffff14; color: #fff; }
+/* Each key/value stays on ONE line (no wrapping) — long previews scroll horizontally
+   (via the panel's overflow:auto above) instead of breaking onto a second line, so the
+   key:value pairing is never visually split (matches Chrome DevTools). */
+.dbg-hover-tree-body {
+  padding: 8px 10px;
+}
+.dbg-hover-tree-body .cv-prop { white-space: nowrap; }
+
+/* Editable hover values (double-click to override the live engine value). */
+.dbg-hover-tree-edithint {
+  margin-left: auto;
+  color: #6fbf73;
+  font-size: 10px;
+  font-style: italic;
+  letter-spacing: .2px;
+  cursor: default;
+}
+.dbg-hover-tree-edithint + .dbg-hover-tree-copy { margin-left: 8px; }
+.cv-editable { cursor: text; border-radius: 3px; padding: 0 1px; }
+.cv-editable:hover {
+  background: #ffffff12;
+  outline: 1px dotted #6fbf7377;
+  outline-offset: 1px;
+}
+.cv-edit-input {
+  font: inherit;
+  color: var(--text-primary, #fff);
+  background: var(--bg-input, #1e1e2e);
+  border: 1px solid #6fbf73;
+  border-radius: 3px;
+  padding: 0 3px;
+  min-width: 40px;
+  max-width: 320px;
+  outline: none;
+}
+
+/* ⚡ Org tab — activity log (SOQL/DML/branch/loop/status routed out of Console) */
+.dbg-orglog {
+  max-height: 320px;
+  overflow-y: auto;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.dbg-orglog-row {
+  display: flex;
+  gap: 6px;
+  padding: 1px 0;
+  color: var(--text-secondary, #ccc);
+  word-break: break-word;
+}
+.dbg-orglog-icon { flex-shrink: 0; width: 14px; text-align: center; color: #808080; }
+.dbg-orglog-msg { min-width: 0; word-break: break-word; }
+.dbg-orglog-soql .dbg-orglog-msg { color: #4ec9b0; }
+.dbg-orglog-dml .dbg-orglog-msg { color: #ffa600; }
+.dbg-orglog-warn .dbg-orglog-msg { color: #d7ba7d; }
+.dbg-orglog-error .dbg-orglog-msg { color: #f85149; }
+.dbg-orglog-branch .dbg-orglog-msg { color: #c586c0; }
+.dbg-orglog-loop .dbg-orglog-msg { color: #d7ba7d; }
+.dbg-orglog-call .dbg-orglog-msg { color: #dcdcaa; }
+.dbg-orglog-var .dbg-orglog-msg { color: #9cdcfe; }
+.dbg-orglog-nav .dbg-orglog-msg { color: #6a9955; font-style: italic; }
+.dbg-orglog-bp .dbg-orglog-msg { color: #f85149; }
+.dbg-orglog-orgdebug .dbg-orglog-msg { color: #b5cea8; }
+.dbg-orglog-info .dbg-orglog-msg { color: #569cd6; }
+/* Reveal the copy button when hovering an Org & Log row too. */
+.dbg-orglog-row:hover .dbg-tree-copy { opacity: 0.75; }
+.dbg-orglog-msg { display: flex; gap: 6px; align-items: flex-start; }
+.dbg-orglog-msg .dbg-tree-root, .dbg-orglog-msg .dbg-expand { flex: 1; min-width: 0; }
+
+/* Collapsible big / multi-line string payload (Chrome-style one-line preview that
+   expands to the full text). Used in both the Console and the Org & Log tabs so a
+   2 KB SOQL or a long log line never forces the user to scroll a wall of text. */
+.dbg-expand { flex: 1; min-width: 0; }
+.dbg-expand-sum {
+  cursor: pointer;
+  list-style: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  color: inherit;
+}
+.dbg-expand-sum::-webkit-details-marker { display: none; }
+.dbg-expand-sum::before {
+  content: '▶';
+  display: inline-block;
+  width: 12px;
+  color: #808080;
+  font-size: 9px;
+}
+.dbg-expand[open] > .dbg-expand-sum { white-space: normal; }
+.dbg-expand[open] > .dbg-expand-sum::before { content: '▼'; }
+.dbg-expand-full {
+  margin: 3px 0 3px 12px;
+  padding: 6px 8px;
+  background: rgba(0,0,0,0.25);
+  border-left: 2px solid #444;
+  border-radius: 3px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-size: 11px;
+  color: #d4d4d4;
+  user-select: text;
+}
+/* Errors stand out in the Console with a red left rail. */
+.dbg-console-error { border-left: 2px solid #f85149; padding-left: 6px; }
+.dbg-console-error .dbg-expand-full { color: #f0b0ab; }
+
+/* Gutter breakpoint/logpoint context menu (right-click) */
+.dbg-gutter-menu {
+  position: fixed;
+  z-index: 10000;
+  min-width: 210px;
+  background: var(--bg-secondary, #252526);
+  border: 1px solid var(--border, #454545);
+  border-radius: 5px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+  padding: 4px 0;
+  font-size: 12px;
+  color: #ccc;
+  user-select: none;
+}
+.dbg-gutter-menu-item {
+  padding: 5px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dbg-gutter-menu-item:hover { background: var(--accent, #094771); color: #fff; }
 
 /* Console input row */
 .dbg-console-input-row {
@@ -4650,6 +5269,244 @@ body.zen-mode #editor-container { border-radius: 0; }
   font-size: 12px;
 }
 
+/* ---- 📌 hover pin affordance (watch-by-identity) ---- */
+.cv-pin {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .12s, transform .1s;
+  vertical-align: baseline;
+  filter: grayscale(1) opacity(.85);
+}
+.cv-prop:hover > .cv-pin,
+.cv-node:hover > .cv-pin,
+.dbg-hover-tree-body > .cv-pin { opacity: .55; }
+.cv-pin:hover { opacity: 1 !important; transform: scale(1.2); }
+.cv-pin.active { opacity: 1 !important; filter: none; }
+
+/* ---- Watch tab: sections + pinned identity watches ---- */
+.dbg-watch-section {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px 3px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+  color: var(--text-secondary, #9aa);
+  border-top: 1px solid var(--border, #ffffff12);
+}
+.dbg-watch-section:first-child { border-top: none; }
+.dbg-watch-section-hint {
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: #6a7;
+  opacity: .8;
+}
+.dbg-watch-pin {
+  display: flex;
+  flex-direction: column;
+  padding: 3px 10px;
+  position: relative;
+  border-left: 2px solid #2bb3c0;
+}
+.dbg-watch-pin.unbound { border-left-color: #666; opacity: .8; }
+.dbg-watch-pin:hover { background: var(--bg-hover, #2a2d2e); }
+.dbg-watch-pin-row { display: flex; align-items: center; gap: 8px; }
+.dbg-watch-pin-icon { font-size: 11px; }
+.dbg-watch-pin-label {
+  color: #7fd6e0;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46%;
+}
+.dbg-watch-pin-type {
+  color: var(--text-secondary, #888);
+  font-size: 10px;
+  font-style: italic;
+  white-space: nowrap;
+}
+.dbg-watch-pin-val {
+  color: var(--text-primary, #fff);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
+}
+.dbg-watch-muted { color: var(--text-secondary, #888); opacity: .7; font-style: italic; }
+.dbg-watch-objsum { color: #c0a6e6; }
+.dbg-watch-pin-hist {
+  font-size: 10px;
+  color: #d0d0d0;
+  background: #ffffff14;
+  border-radius: 9px;
+  padding: 1px 7px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.dbg-watch-pin-hist.empty { opacity: .45; }
+.dbg-watch-pin-hist:hover { background: #ffffff22; }
+.dbg-watch-pin-flow, .dbg-watch-pin-remove {
+  background: none; border: none; cursor: pointer;
+  color: var(--text-secondary, #999); font-size: 12px;
+  opacity: .5; transition: opacity .15s;
+}
+.dbg-watch-pin:hover .dbg-watch-pin-flow,
+.dbg-watch-pin:hover .dbg-watch-pin-remove { opacity: 1; }
+.dbg-watch-pin-flow:hover { color: #2bb3c0; }
+.dbg-watch-pin-remove:hover { color: #f44; }
+.dbg-watch-pin-timeline {
+  margin: 4px 0 4px 6px;
+  border-left: 1px dashed #ffffff1f;
+  padding-left: 8px;
+}
+.dbg-watch-delta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dbg-watch-delta:hover { background: #ffffff10; }
+.dbg-watch-delta-field { color: #7fd6e0; font-weight: 600; }
+.dbg-watch-delta-arrow { color: #888; }
+.dbg-watch-delta-old { opacity: .65; text-decoration: line-through; text-decoration-color: #ffffff44; }
+.dbg-watch-delta-loc { color: #888; margin-left: auto; font-size: 10px; }
+.dbg-watch-delta-empty { color: var(--text-secondary, #888); font-size: 11px; padding: 2px 4px; font-style: italic; }
+
+/* Follow-mode badge (⟳ binding vs ⦿ instance) */
+.dbg-watch-pin-mode {
+  font-size: 9px;
+  color: var(--text-secondary, #8aa);
+  border: 1px solid #ffffff1f;
+  border-radius: 8px;
+  padding: 0 6px;
+  white-space: nowrap;
+  cursor: help;
+}
+.dbg-watch-pin-mode.follows { color: #6fd0ff; border-color: #3a7bd533; background: #3a7bd514; }
+
+/* Reassignment / replacement divider in a pin's timeline */
+.dbg-watch-replace {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  margin: 2px 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  background: linear-gradient(90deg, #ffb64722 0%, #ffb64708 100%);
+  border: 1px solid #ffb64733;
+}
+.dbg-watch-replace:hover { background: #ffb64733; }
+.dbg-watch-repl-icon { color: #ffb647; font-weight: 700; }
+.dbg-watch-repl-old { opacity: .7; text-decoration: line-through; text-decoration-color: #ffffff44; color: #d6b0a6; }
+.dbg-watch-repl-new { color: #7fe0a6; font-weight: 600; }
+.dbg-watch-repl-tag {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: #ffb647;
+  border: 1px solid #ffb64744;
+  border-radius: 7px;
+  padding: 0 5px;
+}
+
+/* ---- Data Flow tab ---- */
+.dbg-df-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border, #ffffff12);
+}
+.dbg-df-chip {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 11px;
+  background: #ffffff10;
+  color: var(--text-secondary, #bbb);
+  cursor: pointer;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.dbg-df-chip:hover { background: #ffffff1c; }
+.dbg-df-chip.active { background: #2bb3c022; color: #7fd6e0; border-color: #2bb3c0; }
+.dbg-df-table { padding: 4px 0; }
+.dbg-df-head, .dbg-df-mrow {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.2fr) 1fr 1fr;
+  gap: 8px;
+  padding: 4px 10px;
+  align-items: start;
+}
+.dbg-df-head {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color: var(--text-secondary, #888);
+  border-bottom: 1px solid var(--border, #ffffff12);
+}
+.dbg-df-mrow { border-bottom: 1px solid #ffffff08; }
+.dbg-df-mrow:hover { background: var(--bg-hover, #2a2d2e); }
+.dbg-df-method {
+  color: #d7c48a;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 600;
+}
+.dbg-df-line { color: #888; font-weight: 400; }
+.dbg-df-cell { display: flex; flex-wrap: wrap; gap: 4px; }
+.dbg-df-obj {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-family: var(--font-mono, monospace);
+  white-space: nowrap;
+}
+.dbg-df-obj.read { background: #2e7d3222; color: #86d68b; border: 1px solid #2e7d3255; }
+.dbg-df-obj.write { background: #b5732022; color: #f0b657; border: 1px solid #b5732055; }
+.dbg-df-flow-head { padding: 8px 10px 4px; font-size: 11px; color: var(--text-secondary, #bbb); }
+.dbg-df-flow { padding: 0 6px 8px; }
+.dbg-df-frow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px;
+  border-left: 2px solid #ffffff18;
+  margin-left: 6px;
+}
+.dbg-df-frow:hover { background: var(--bg-hover, #2a2d2e); }
+.dbg-df-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .4px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.dbg-df-badge.read { background: #2e7d3233; color: #86d68b; }
+.dbg-df-badge.write { background: #b5732033; color: #f0b657; }
+.dbg-df-count { color: #888; font-size: 10px; margin-left: auto; }
+
 /* -- Breakpoints Panel -- */
 .dbg-bp-entry {
   display: flex;
@@ -4709,6 +5566,74 @@ body.zen-mode #editor-container { border-radius: 0; }
   color: #f85149;
   border-color: #f85149;
 }
+/* Breakpoints panel: per-file grouping (Chrome-style) */
+.dbg-bp-group { margin-bottom: 2px; }
+.dbg-bp-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  background: var(--bg-hover, #2a2d2e);
+  border-top: 1px solid var(--border, #333);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.dbg-bp-group-name {
+  color: var(--text-primary, #fff);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dbg-bp-group-count {
+  color: var(--text-muted, #888);
+  font-size: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 0 6px;
+  min-width: 16px;
+  text-align: center;
+}
+.dbg-bp-group-clear {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text-muted, #888);
+  cursor: pointer;
+  font-size: 10px;
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s;
+}
+.dbg-bp-group-head:hover .dbg-bp-group-clear { opacity: 1; }
+.dbg-bp-group-clear:hover { color: #f85149; }
+.dbg-bp-line { padding-left: 2px; flex: 0 0 auto; }
+/* Per-breakpoint enable/disable checkbox + code snippet (Chrome-style) */
+.dbg-bp-check {
+  flex: 0 0 auto;
+  margin: 0;
+  cursor: pointer;
+  accent-color: #f85149;
+}
+.dbg-bp-snippet {
+  color: #9aa0a6;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+  opacity: 0.85;
+}
+.dbg-bp-entry.disabled .dbg-bp-dot { filter: grayscale(1); opacity: 0.5; }
+.dbg-bp-entry.disabled .dbg-bp-line,
+.dbg-bp-entry.disabled .dbg-bp-snippet,
+.dbg-bp-entry.disabled .dbg-bp-cond { opacity: 0.45; text-decoration: line-through; }
+/* Disabled gutter glyph: faded + greyed so it reads as "off" but still visible */
+.debug-breakpoint-disabled { opacity: 0.4 !important; filter: grayscale(1); }
 
 /* -- Editor Breakpoint & Current Line Decorations -- */
 .debug-breakpoint {
@@ -4721,17 +5646,33 @@ body.zen-mode #editor-container { border-radius: 0; }
   cursor: pointer;
 }
 .debug-breakpoint-conditional {
-  background: #f85149;
+  background: #e3b341;
   border-radius: 2px;
   width: 10px !important;
   height: 10px !important;
   margin-left: 4px;
   margin-top: 4px;
   cursor: pointer;
-  /* Diamond shape for conditional */
+  /* Amber diamond — clearly distinct from the plain red round breakpoint. */
   transform: rotate(45deg);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
 }
-.dbg-bp-entry.conditional .dbg-bp-dot { color: #ffa500; }
+.dbg-bp-entry.conditional .dbg-bp-dot { color: #e3b341; }
+/* Logpoint: a BLUE rounded dot that prints instead of pausing (Chrome-style).
+   Blue + round clearly separates it from the red round breakpoint and the amber
+   diamond conditional breakpoint; the soft blue glow reinforces "logs, never pauses". */
+.debug-logpoint {
+  background: #4c9aff;
+  border: none;
+  border-radius: 50%;
+  width: 11px !important;
+  height: 11px !important;
+  margin-left: 4px;
+  margin-top: 4px;
+  cursor: pointer;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35), 0 0 5px rgba(76, 154, 255, 0.7);
+}
+.dbg-bp-entry.logpoint .dbg-bp-dot { color: #4c9aff; }
 .dbg-bp-cond {
   color: var(--text-secondary, #999);
   font-family: var(--font-mono, monospace);
@@ -4765,6 +5706,137 @@ body.zen-mode #editor-container { border-radius: 0; }
   position: absolute;
   left: 2px;
   top: 2px;
+}
+
+/* Line currently executing during a running (Continue) session — a subtle
+   animated cyan band, distinct from the solid amber paused line. */
+.debug-executing-line {
+  background: rgba(0, 200, 255, 0.10) !important;
+  border-left: 2px solid #29b6f6;
+  animation: dbg-exec-pulse 1s ease-in-out infinite;
+}
+@keyframes dbg-exec-pulse {
+  0%, 100% { background: rgba(0, 200, 255, 0.06) !important; }
+  50%      { background: rgba(0, 200, 255, 0.16) !important; }
+}
+/* Loading variant: shown when execution is at this line AND an org call is in flight */
+.debug-executing-line-loading {
+  border-left: 2px solid #d29922 !important;
+  animation: dbg-exec-loading-pulse 0.75s ease-in-out infinite !important;
+}
+@keyframes dbg-exec-loading-pulse {
+  0%, 100% { background: rgba(210, 153, 34, 0.07) !important; }
+  50%      { background: rgba(210, 153, 34, 0.20) !important; }
+}
+.debug-executing-arrow {
+  background: none !important;
+}
+.debug-executing-arrow::before {
+  content: '⟩';
+  color: #29b6f6;
+  font-size: 11px;
+  position: absolute;
+  left: 2px;
+  top: 1px;
+}
+/* While an org query is in flight at this line, spin the glyph so the user sees
+   the step-by-step querying happening right on the line (never fabricated). It is
+   deliberately larger and brighter than the static step arrow so the "a real org
+   call is happening right here" signal is unmistakable at a glance. */
+.debug-executing-arrow-loading::before {
+  content: '⟳';
+  color: #ffb020;
+  font-size: 17px;
+  font-weight: 700;
+  left: 0;
+  top: 0;
+  line-height: 1;
+  text-shadow: 0 0 6px rgba(255, 176, 32, 0.65);
+  transform-origin: 50% 50%;
+  animation: dbg-spin 0.8s linear infinite;
+}
+/* Issue 3: parent call-site "in progress" markers — shown on the line in the
+   file on screen whose call descended into another file. A pulsing amber dot in
+   the breakpoint gutter + a live elapsed-time message at the end of the line. */
+.debug-inprogress-band {
+  background: rgba(210, 153, 34, 0.16) !important;
+  border-left: 5px solid #f0a500 !important;
+  animation: dbg-inprog-band 0.7s ease-in-out infinite !important;
+}
+@keyframes dbg-inprog-band {
+  0%, 100% { background: rgba(210, 153, 34, 0.10) !important; }
+  50%      { background: rgba(240, 165, 0, 0.30) !important; }
+}
+.debug-inprogress-glyph::before {
+  content: '';
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #f0a500;
+  position: absolute;
+  left: 3px;
+  top: 3px;
+  box-shadow: 0 0 0 0 rgba(240, 165, 0, 0.7);
+  animation: dbg-inprog-pulse 0.9s ease-out infinite;
+}
+@keyframes dbg-inprog-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(240, 165, 0, 0.7); transform: scale(0.85); }
+  70%  { box-shadow: 0 0 0 9px rgba(240, 165, 0, 0); transform: scale(1.1); }
+  100% { box-shadow: 0 0 0 0 rgba(240, 165, 0, 0); transform: scale(0.85); }
+}
+.debug-inprogress-inline {
+  color: #1b1b1b !important;
+  background: #f0a500 !important;
+  font-weight: 700 !important;
+  font-size: 0.95em !important;
+  padding: 1px 8px !important;
+  border-radius: 4px !important;
+  letter-spacing: 0.5px;
+  animation: dbg-inprog-chip 0.7s ease-in-out infinite;
+}
+@keyframes dbg-inprog-chip {
+  0%, 100% { opacity: 0.78; }
+  50%      { opacity: 1; }
+}
+
+/* ── Exception throw-site markers ──────────────────────────────────────────
+   Shown on the EXACT line an exception was thrown so the user sees, right on
+   the code, which line/file failed and why. */
+.debug-exception-line {
+  background: rgba(248, 81, 73, 0.16) !important;
+  border-left: 3px solid #f85149 !important;
+}
+.debug-exception-glyph::before {
+  content: '💥';
+  font-size: 12px;
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+.debug-exception-inline {
+  color: #ff7b72 !important;
+  font-style: italic;
+  opacity: 0.95;
+}
+/* Frames of the same failing call chain that live in the open file (not the
+   throw site itself) — a subtler amber hint pointing at the real throw line. */
+.debug-exception-chain-line {
+  background: rgba(210, 153, 34, 0.10) !important;
+  border-left: 2px solid #d29922 !important;
+}
+.debug-exception-chain-glyph::before {
+  content: '↳';
+  color: #d29922;
+  font-size: 12px;
+  position: absolute;
+  left: 2px;
+  top: 1px;
+}
+.debug-exception-chain-inline {
+  color: #d29922 !important;
+  font-style: italic;
+  opacity: 0.85;
 }
 
 /* -- Request Input Modal -- */
@@ -4805,11 +5877,81 @@ body.zen-mode #editor-container { border-radius: 0; }
 }
 .dbg-request-editor {
   flex: 1;
-  min-height: 300px;
+  min-height: 200px;
   border: 1px solid var(--border, #333);
   border-radius: 4px;
   overflow: hidden;
 }
+.dbg-request-history-wrap {
+  margin-top: 10px;
+  border: 1px solid var(--border, #333);
+  border-radius: 4px;
+  max-height: 180px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.dbg-request-history-wrap.hidden { display: none; }
+.dbg-request-history-hdr {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-muted, #888);
+  border-bottom: 1px solid var(--border, #333);
+  background: var(--bg-secondary, #1e1e1e);
+}
+.dbg-history-clear {
+  background: none;
+  border: none;
+  color: var(--accent, #4aa3ff);
+  cursor: pointer;
+  font-size: 11px;
+}
+.dbg-history-clear:hover { text-decoration: underline; }
+.dbg-request-history {
+  overflow-y: auto;
+}
+.dbg-history-item {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #2a2a2a);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.dbg-history-item:hover { background: var(--bg-hover, rgba(255,255,255,.04)); }
+.dbg-history-main {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.dbg-history-method { font-size: 12px; color: var(--text, #ddd); font-weight: 600; }
+.dbg-history-when { font-size: 10px; color: var(--text-muted, #888); }
+.dbg-history-preview {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-muted, #999);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.dbg-history-actions { display: flex; gap: 6px; }
+.dbg-history-load, .dbg-history-copy {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid var(--border, #333);
+  border-radius: 3px;
+  background: var(--bg-secondary, #252525);
+  color: var(--text, #ddd);
+  cursor: pointer;
+}
+.dbg-history-load:hover, .dbg-history-copy:hover { border-color: var(--accent, #4aa3ff); }
 .dbg-modal-footer {
   display: flex;
   justify-content: flex-end;
@@ -4836,7 +5978,12 @@ body.zen-mode #editor-container { border-radius: 0; }
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* Size to content instead of stretching to the overlay's full height
+     (the overlay is a flex container whose default align-items is stretch). */
+  align-self: flex-start;
+  max-height: calc(100vh - 120px);
 }
+.curl-import-modal .curl-import-body { overflow-y: auto; }
 .curl-import-header {
   display: flex;
   align-items: center;

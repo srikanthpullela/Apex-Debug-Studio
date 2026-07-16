@@ -1,5 +1,5 @@
 /**
- * CongaCode — Main Process
+ * Apex Debug Studio — Main Process
  * Window management, file I/O, auto-save, session, menus, global search, context menu support.
  */
 
@@ -30,22 +30,57 @@ async function getMarked() {
 }
 
 // Set app name FIRST — fixes "Electron" in macOS menu bar
-app.setName('CongaCode');
+app.setName('Apex Debug Studio');
+
+// ---------------------------------------------------------------------------
+// Never let a broken stdout/stderr pipe crash the app.
+// process.stdout / process.stderr are used purely for diagnostics (mirroring the
+// renderer console, log echoing). When our output is piped into a consumer that
+// exits first — e.g. `npm start | grep`, a closed terminal, or a parent that goes
+// away — the NEXT write to that pipe completes ASYNCHRONOUSLY with EPIPE. Node
+// surfaces it as an 'error' event on the stream; with no listener it escalates to
+// an uncaught exception that pops Electron's "A JavaScript error occurred in the
+// main process" dialog and takes the whole app down (repeatedly, on every console
+// line). A vanished diagnostic reader must never be fatal, so swallow these write
+// errors. try/catch around the write() call does NOT help — the failure is async.
+// ---------------------------------------------------------------------------
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === 'function') {
+    stream.on('error', (err) => {
+      if (err && (err.code === 'EPIPE' || err.code === 'EOF' || err.code === 'ERR_STREAM_DESTROYED')) return;
+      // Any other error writing to a diagnostic stream is equally non-fatal here;
+      // there is nowhere safe to report it (writing would recurse), so ignore it.
+    });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Paths
 // ---------------------------------------------------------------------------
-const CONGACODE_DIR = path.join(os.homedir(), 'CongaCode');
-const SESSION_FILE = path.join(CONGACODE_DIR, '.session.json');
-const RECENT_FILE = path.join(CONGACODE_DIR, '.recent.json');
-const SETTINGS_FILE = path.join(CONGACODE_DIR, 'settings.json');
-const AUTOSAVE_DIR = path.join(CONGACODE_DIR, 'AutoSave');
+const APP_DATA_DIR = path.join(os.homedir(), 'ApexDebugStudio');
+
+// One-time migration from the legacy ~/CongaCode data directory so existing
+// users keep their sessions, recent files, settings, bookmarks and auto-saves
+// after the rebrand to Apex Debug Studio.
+try {
+  const legacyDataDir = path.join(os.homedir(), 'CongaCode');
+  if (fs.existsSync(legacyDataDir) && !fs.existsSync(APP_DATA_DIR)) {
+    fs.renameSync(legacyDataDir, APP_DATA_DIR);
+  }
+} catch (_) { /* best effort — never block startup on migration */ }
+
+const SESSION_FILE = path.join(APP_DATA_DIR, '.session.json');
+const RECENT_FILE = path.join(APP_DATA_DIR, '.recent.json');
+const LOG_DIR = path.join(APP_DATA_DIR, 'logs');
+const RENDERER_LOG = path.join(LOG_DIR, 'renderer-console.log');
+const SETTINGS_FILE = path.join(APP_DATA_DIR, 'settings.json');
+const AUTOSAVE_DIR = path.join(APP_DATA_DIR, 'AutoSave');
 
 // File watcher instances (per watched directory)
 const watchers = new Map();
 
 function ensureDirs() {
-  for (const dir of [CONGACODE_DIR, AUTOSAVE_DIR]) {
+  for (const dir of [APP_DATA_DIR, AUTOSAVE_DIR]) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
 }
@@ -194,7 +229,7 @@ function updateDockMenu() {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-save path: ~/CongaCode/AutoSave/YYYY-MM-DD/
+// Auto-save path: ~/ApexDebugStudio/AutoSave/YYYY-MM-DD/
 // Returns the day directory, creating it if needed.
 // ---------------------------------------------------------------------------
 function generateAutoSavePath(dateStr) {
@@ -235,14 +270,63 @@ function getAllFiles(dirPath, maxFiles = 5000) {
 // ---------------------------------------------------------------------------
 let mainWindow = null;
 
+// ---------------------------------------------------------------------------
+// Renderer console capture
+// Mirror the renderer's DevTools console (which also carries the Apex debugger's
+// console-panel output — see addConsoleEntry, which echoes through console.*) to
+// a rotating-free log file plus this process's stdout. This lets an external
+// watcher tail debugger failures live, with no manual copy-paste.
+// Log file: ~/ApexDebugStudio/logs/renderer-console.log
+// ---------------------------------------------------------------------------
+const CONSOLE_LEVEL_NAMES = ['LOG', 'INFO', 'WARNING', 'ERROR'];
+function attachConsoleCapture(win) {
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (_) { /* best effort */ }
+  const writeLine = (line) => {
+    try { fs.appendFileSync(RENDERER_LOG, line); } catch (_) { /* best effort */ }
+    // Skip stdout once its downstream reader is gone; the global 'error' handler
+    // above is the real safety net (EPIPE surfaces asynchronously), this just
+    // avoids buffering into a dead pipe.
+    try {
+      if (!process.stdout.destroyed && process.stdout.writable !== false) {
+        process.stdout.write(`[renderer] ${line}`);
+      }
+    } catch (_) { /* best effort */ }
+  };
+  win.webContents.on('console-message', (_event, level, message, lineNo, sourceId) => {
+    const lvl = CONSOLE_LEVEL_NAMES[level] || `L${level}`;
+    const src = sourceId ? ` (${String(sourceId).split('/').pop()}:${lineNo})` : '';
+    writeLine(`${new Date().toISOString()} [${lvl}]${src} ${message}\n`);
+  });
+  win.webContents.on('render-process-gone', (_e, details) => {
+    writeLine(`${new Date().toISOString()} [CRASH] render-process-gone: ${JSON.stringify(details)}\n`);
+  });
+}
+
+function showWithFade(win) {
+  if (!win || win.isDestroyed()) return;
+  try {
+    win.setOpacity(0);
+    win.show();
+    let op = 0;
+    const timer = setInterval(() => {
+      if (!win || win.isDestroyed()) { clearInterval(timer); return; }
+      op = Math.min(1, op + 0.14);
+      win.setOpacity(op);
+      if (op >= 1) clearInterval(timer);
+    }, 16);
+  } catch (e) {
+    try { win.show(); } catch (_) {}
+  }
+}
+
 function createNewWindow() {
   const win = new BrowserWindow({
     width: 1280, height: 800,
     minWidth: 600, minHeight: 400,
-    title: 'CongaCode',
+    title: 'Apex Debug Studio',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 14, y: 14 },
-    backgroundColor: '#1e1e2e',
+    backgroundColor: '#0d1117',
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'preload.js'),
       contextIsolation: true,
@@ -253,7 +337,8 @@ function createNewWindow() {
   });
   // Load with ?new=1 so the renderer skips session restore
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'), { query: { new: '1' } });
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => showWithFade(win));
+  attachConsoleCapture(win);
 
   // Open external links in default browser for new windows too
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -280,10 +365,10 @@ function createWindow() {
     ...bounds,
     minWidth: 600,
     minHeight: 400,
-    title: 'CongaCode',
+    title: 'Apex Debug Studio',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 14, y: 14 },
-    backgroundColor: '#1e1e2e',
+    backgroundColor: '#0d1117',
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'preload.js'),
       contextIsolation: true,
@@ -294,8 +379,9 @@ function createWindow() {
   });
 
   mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
+  attachConsoleCapture(mainWindow);
   mainWindow.once('ready-to-show', () => {
-    mainWindow.show();
+    showWithFade(mainWindow);
     mainWindow.webContents.send('session:restore', session);
   });
 
@@ -331,7 +417,7 @@ function createWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// Application menu — with "CongaCode" as first menu label
+// Application menu — with "Apex Debug Studio" as first menu label
 // ---------------------------------------------------------------------------
 // Helper: send IPC to the currently focused window (not just mainWindow)
 function sendToFocused(channel, ...args) {
@@ -350,17 +436,17 @@ function buildMenu() {
 
   const template = [
     ...(isMac ? [{
-      label: 'CongaCode',
+      label: 'Apex Debug Studio',
       submenu: [
-        { label: 'About CongaCode', role: 'about' },
+        { label: 'About Apex Debug Studio', role: 'about' },
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
-        { label: 'Hide CongaCode', role: 'hide' },
+        { label: 'Hide Apex Debug Studio', role: 'hide' },
         { role: 'hideOthers' },
         { role: 'unhide' },
         { type: 'separator' },
-        { label: 'Quit CongaCode', role: 'quit' },
+        { label: 'Quit Apex Debug Studio', role: 'quit' },
       ],
     }] : []),
     {
@@ -467,7 +553,7 @@ function buildMenu() {
       role: 'help',
       submenu: [
         { label: 'Open AutoSave Folder', click: () => shell.openPath(AUTOSAVE_DIR) },
-        { label: 'Open CongaCode Folder', click: () => shell.openPath(CONGACODE_DIR) },
+        { label: 'Open Apex Debug Studio Folder', click: () => shell.openPath(APP_DATA_DIR) },
       ],
     },
   ];
@@ -730,7 +816,7 @@ ipcMain.handle('session:load', async () => loadSession());
 ipcMain.handle('recent:add', async (_e, fp) => { addRecent(fp); buildMenu(); updateDockMenu(); return true; });
 ipcMain.handle('recent:get', async () => loadRecent());
 ipcMain.handle('recent:clear', async () => { saveRecent([]); buildMenu(); updateDockMenu(); return true; });
-ipcMain.handle('app:get-paths', async () => ({ congacodeDir: CONGACODE_DIR, autosaveDir: AUTOSAVE_DIR, home: os.homedir() }));
+ipcMain.handle('app:get-paths', async () => ({ appDataDir: APP_DATA_DIR, autosaveDir: AUTOSAVE_DIR, home: os.homedir() }));
 ipcMain.handle('app:new-window', async () => { createNewWindow(); return true; });
 ipcMain.handle('shell:show-item', async (_e, fp) => { shell.showItemInFolder(fp); return true; });
 ipcMain.handle('shell:open-path', async (_e, dp) => { shell.openPath(dp); return true; });
@@ -1453,7 +1539,7 @@ ipcMain.handle('db:query', async (_e, filePath, query, tableName) => {
 // ---------------------------------------------------------------------------
 // Bookmarks persistence
 // ---------------------------------------------------------------------------
-const BOOKMARKS_FILE = path.join(CONGACODE_DIR, '.bookmarks.json');
+const BOOKMARKS_FILE = path.join(APP_DATA_DIR, '.bookmarks.json');
 
 ipcMain.handle('bookmarks:load', async () => {
   try { return JSON.parse(fs.readFileSync(BOOKMARKS_FILE, 'utf-8')); } catch { return []; }
@@ -1599,10 +1685,10 @@ function openFileInNewWindow(filePath) {
   const win = new BrowserWindow({
     width: 1280, height: 800,
     minWidth: 600, minHeight: 400,
-    title: 'CongaCode',
+    title: 'Apex Debug Studio',
     titleBarStyle: 'hiddenInset',
     trafficLightPosition: { x: 14, y: 14 },
-    backgroundColor: '#1e1e2e',
+    backgroundColor: '#0d1117',
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'preload.js'),
       contextIsolation: true,
@@ -1613,7 +1699,7 @@ function openFileInNewWindow(filePath) {
   });
   // Load with ?new=1 so the renderer skips session restore (starts clean)
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'), { query: { new: '1' } });
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => showWithFade(win));
 
   // Once the renderer finishes loading, send the file to open
   win.webContents.once('did-finish-load', () => {
