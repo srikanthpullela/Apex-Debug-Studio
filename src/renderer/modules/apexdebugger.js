@@ -1468,6 +1468,18 @@ function stopDebugSession() {
   updateQueryBanner();
   clearExceptionMarkers();
   clearCurrentLineHighlight();
+  // Fully tear down the "currently executing" follow system too — NOT just the
+  // amber paused line. This cancels the 140ms follow throttle + the in-progress
+  // elapsed-timer interval and clears _execShownLine/_execShownFile, _execPending
+  // and _inProgCtx, and removes the animated executing band decoration. Without
+  // this, a Stop (or Restart → stopDebugSession → startDebugSession) left that
+  // state alive, so the NEXT run repainted the band at the PREVIOUS run's line/
+  // file — the "execution jumps to a different class / the yellow line shows in the
+  // wrong place / it comes back to some other place" symptom, seen on the slower
+  // dev run + Windows but masked on the fast packaged Mac app. onEnginePause
+  // already clears this on every pause; doing it on stop makes every re-run start
+  // from a truly clean slate.
+  clearExecutingLineHighlight();
   // Keep the debug panel (Console / Org & Log) VISIBLE after the session ends so
   // the user can still read and copy the output; only the floating step-toolbar is
   // dismissed. The user closes the panel themselves with its ✕, and starting a new
@@ -6802,15 +6814,44 @@ function navigateToLine(line) {
 // synchronous and only scrolls when the line is off-screen.
 function revealPauseLocation(line, switchedFile) {
   const editor = window.state?.editor;
+  // Never let a pause end up with no line: if the engine handed us a blank line for
+  // this frame, fall back to the top stack frame's line so the yellow highlight still
+  // lands somewhere sensible instead of silently doing nothing.
+  if (!line && Array.isArray(debugState.callStack) && debugState.callStack.length) {
+    const top = debugState.callStack[debugState.callStack.length - 1];
+    if (top && top.line) { line = top.line; debugState.currentLine = line; }
+  }
   if (!editor || !line) return;
   const paint = () => {
     highlightCurrentLine();
     paintExceptionMarkers();
     try { renderBreakpointDecorations(debugState.currentFile); } catch (_) { /* decorations are best-effort */ }
   };
+  // Self-heal the paused (yellow) line. Intermittently (~1 in 10 continues) a competing
+  // decoration render in the same tick — breakpoint decorations, the onDidChangeModel
+  // handler, or a late exec-band clear — wipes the freshly painted highlight, so the
+  // engine stops at the breakpoint but no yellow line shows. Re-assert it once the frame
+  // settles. This is decoration-only (never scrolls) and only fires while we're still
+  // paused on THIS exact line with THIS file still on screen, so it can never paint on a
+  // file the user browsed to or fight a subsequent step/continue.
+  const reassertHighlight = () => {
+    if (!debugState.active || !debugState.paused) return;
+    if (debugState.currentLine !== line) return;
+    const ed = window.state?.editor;
+    const model = ed && ed.getModel ? ed.getModel() : null;
+    const onFile = model && model.uri ? (model.uri.fsPath || model.uri.path) : null;
+    const norm = (p) => (p || '').replace(/\\/g, '/').toLowerCase();
+    if (onFile && debugState.currentFile && norm(onFile) !== norm(debugState.currentFile)) return;
+    highlightCurrentLine();
+  };
+  const scheduleReassert = () => {
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(reassertHighlight);
+    setTimeout(reassertHighlight, 90);
+  };
   if (!switchedFile) {
     paint();
     navigateToLine(line);
+    scheduleReassert();
     return;
   }
   // New model → wait for layout. Two rAFs guarantee a full layout cycle across
@@ -6823,6 +6864,7 @@ function revealPauseLocation(line, switchedFile) {
     paint();
     try { editor.revealLineInCenter(line); }
     catch (_) { try { editor.revealLineInCenterIfOutsideViewport(line); } catch (_) { /* editor gone */ } }
+    scheduleReassert();
   };
   if (typeof requestAnimationFrame === 'function') {
     requestAnimationFrame(() => requestAnimationFrame(reveal));
@@ -6833,13 +6875,28 @@ function revealPauseLocation(line, switchedFile) {
 async function navigateToFile(filePath, line) {
   const content = await window.apexStudio.readFile(filePath);
   await window.openFile(filePath, content);
-  // Wait for model to be set, then apply decorations
-  setTimeout(() => {
+  // A newly-set Monaco model needs a layout pass before decorations/scroll take
+  // effect; a reveal fired too early is silently dropped and the file stays at the
+  // TOP (the "opened the class but the yellow line isn't shown / shows in the wrong
+  // place" race). A single fixed 50ms timeout was enough on the fast packaged Mac
+  // app but too short on the slower dev run / Windows — so mirror the proven
+  // revealPauseLocation fix: two requestAnimationFrames guarantee a full layout
+  // cycle, with a setTimeout fallback for a backgrounded window where rAF is
+  // throttled. Runs the paint + reveal exactly once (same reveal semantics as
+  // before — only scrolls when the target line is outside the viewport).
+  let done = false;
+  const apply = () => {
+    if (done) return;
+    done = true;
     renderBreakpointDecorations(filePath);
     highlightCurrentLine();
     paintExceptionMarkers();
     navigateToLine(line);
-  }, 50);
+  };
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => requestAnimationFrame(apply));
+  }
+  setTimeout(apply, 60);
 }
 
 /* ================================================================
@@ -6960,14 +7017,24 @@ function renderVariableTree(obj, depth = 0, maxDepth = 4) {
 
 function showDebugUI() {
   debugState.debugPanelVisible = true;
-  _$('#debug-toolbar')?.classList.remove('hidden');
+  // The floating step-toolbar (Continue / Step / Stop / Live Org) is only meaningful
+  // while a run is ACTIVE. After execution completes, the user may reopen this panel
+  // from the footer "🐞 Debug panel" chip just to READ the output — in that case show
+  // ONLY the bottom panel and keep the top bar hidden (there's nothing to step, and it
+  // has no controls that make sense post-run). Previously reopening always re-showed
+  // the top bar, leaving a stranded "DEBUGGING" toolbar the user couldn't dismiss.
+  const showToolbar = !!debugState.active;
+  _$('#debug-toolbar')?.classList.toggle('hidden', !showToolbar);
   _$('#debug-panel')?.classList.remove('hidden');
   // The panel is on screen now — hide the status-bar "reopen" affordance.
   _$('#status-reopen-debug')?.classList.add('hidden');
-  // Make the toolbar draggable and restore its remembered (or centred) position.
-  initDebugToolbarDrag();
-  positionDebugToolbar();
-  requestAnimationFrame(positionDebugToolbar);
+  // Make the toolbar draggable and restore its remembered (or centred) position —
+  // only when it's actually shown (an active run).
+  if (showToolbar) {
+    initDebugToolbarDrag();
+    positionDebugToolbar();
+    requestAnimationFrame(positionDebugToolbar);
+  }
   // Enable glyphMargin
   window.state?.editor?.updateOptions({ glyphMargin: true });
   // Trigger layout so editor shrinks above the panel
@@ -8666,11 +8733,30 @@ function startDebugFromModal() {
 
 // Map of line → {filePath, methodName} for CodeLens click resolution
 const _codeLensMap = new Map();
+let _debugCmdRegistered = false;
 
 function registerDebugProviders() {
   if (typeof monaco === 'undefined') return;
 
   const CMD_ID = 'apexstudio.debugMethod';
+
+  // Register the CodeLens command GLOBALLY (not just as an editor action) so a
+  // "▶ Debug with Request" click ALWAYS resolves — even in the ~200ms before the
+  // editor action below attaches, or when the geometry-based DOM interceptor can't
+  // map the click back to a line. Monaco passes the lens's own arguments
+  // [filePath, methodName, line] straight to this handler, so it launches the exact
+  // method that was clicked. This is the real fix for the intermittent
+  // "command 'apexstudio.debugMethod' not found" that left Start Debugging dead.
+  try {
+    if (monaco.editor && typeof monaco.editor.registerCommand === 'function' && !_debugCmdRegistered) {
+      monaco.editor.registerCommand(CMD_ID, (_accessor, filePath, methodName, line) => {
+        if (typeof filePath === 'string' && typeof methodName === 'string') {
+          showRequestModal(filePath, methodName, line);
+        }
+      });
+      _debugCmdRegistered = true;
+    }
+  } catch (_) { /* fall back to editor.addAction + the DOM click interceptor below */ }
 
   // CodeLens: "▶ Debug with Request" above each method
   monaco.languages.registerCodeLensProvider('apex', {
