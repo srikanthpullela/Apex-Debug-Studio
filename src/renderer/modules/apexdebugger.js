@@ -3018,7 +3018,11 @@ async function ensureSystemHelper(org) {
       renderConsolePanel();
       return 'ready';
     }
-    addConsoleEntry('error', `Helper class deploy failed: ${res.error}. Falling back to user-mode queries (permission-limited).`);
+    // Deploy rejected — almost always "no Author Apex / deploy permission",
+    // which is EXPECTED in locked-down customer orgs where uploads aren't
+    // allowed. Keep it calm + actionable; never dump a raw stack at the user.
+    const reason = String(res.error || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    addConsoleEntry('warn', `System mode couldn't be turned on for this org — the read-only helper couldn't be deployed (this is expected in locked-down customer orgs, where uploading anything isn't allowed). Staying in user mode; fields your user can't see show as 🔒. To enable system mode, an admin can deploy the helper once, or grant your user access.${reason ? ` (Reason: ${reason})` : ''}`);
     renderConsolePanel();
     return 'unavailable';
   })();

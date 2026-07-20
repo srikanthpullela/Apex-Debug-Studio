@@ -1406,7 +1406,26 @@ ipcMain.handle('sf:exec', async (_e, command, cwd, timeoutMs) => {
       ? { ...process.env, BROWSER: process.env.BROWSER || '' }
       : { ...process.env, TERM: 'dumb', CLICOLOR: '0', NO_COLOR: '1', SF_JSON_RESULT: '1' };
 
-    const { file: shFile, args: shArgs } = shellCommand(command);
+    // Build the shell invocation. Windows needs special care so that quotes
+    // INSIDE the command (e.g. --query "SELECT ... WHERE Name='x'") survive.
+    //
+    // `cmd.exe /d /s /c` with the /s flag strips ONLY the first and last quote
+    // of the payload and runs the remainder verbatim. So we wrap the whole
+    // command in one extra pair of quotes: cmd strips that outer pair and the
+    // inner quotes reach the `sf` CLI intact. This must be paired with
+    // windowsVerbatimArguments:true, otherwise Node/libuv re-escapes the inner
+    // quotes (turning them into \" ), which is exactly what was corrupting SOQL
+    // queries on Windows — breaking the helper check, the privilege check and
+    // every live read (they silently failed, so the deploy popup never showed).
+    let shFile, shArgs, winVerbatim = false;
+    if (IS_WINDOWS) {
+      const winCmd = command.replace(/\s*2>\/dev\/null/g, '');
+      shFile = process.env.COMSPEC || 'cmd.exe';
+      shArgs = ['/d', '/s', '/c', '"' + winCmd + '"'];
+      winVerbatim = true;
+    } else {
+      ({ file: shFile, args: shArgs } = shellCommand(command));
+    }
     const proc = spawn(shFile, shArgs, {
       cwd: cwd || os.homedir(),
       env,
@@ -1414,6 +1433,8 @@ ipcMain.handle('sf:exec', async (_e, command, cwd, timeoutMs) => {
       // Give login commands their own process group (non-Windows) so we can kill
       // the CLI's OAuth-server grandchild and free port 1717 on cancel/retry.
       detached: isLoginCmd && !IS_WINDOWS,
+      // Pass our pre-quoted Windows command line through untouched (see above).
+      windowsVerbatimArguments: winVerbatim,
     });
     if (isLoginCmd) activeLoginProc = proc;
     // For login: detect the auth URL, open it in the default browser, and tell
