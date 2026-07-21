@@ -96,6 +96,12 @@ const apexStudioApi = {
   // TODO scanning
   scanTodos: (folderPath) => ipcRenderer.invoke('todos:scan', folderPath),
 
+  // App updates (user-initiated — never silent)
+  updatesGetVersion: () => ipcRenderer.invoke('updates:current-version'),
+  updatesGetStatus: () => ipcRenderer.invoke('updates:get-status'),
+  updatesCheck: () => ipcRenderer.invoke('updates:check'),
+  updatesPrimaryAction: () => ipcRenderer.invoke('updates:primary-action'),
+
   // IPC listener
   on: (channel, callback) => {
     const valid = [
@@ -121,6 +127,7 @@ const apexStudioApi = {
       'session:restore', 'app:before-quit', 'help:shortcuts',
       'watch:change',
       'sf:login-progress',
+      'update:status',
     ];
     if (valid.includes(channel)) {
       const listener = (_event, ...args) => callback(...args);

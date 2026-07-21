@@ -65,6 +65,17 @@ jobs:
         run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
         shell: bash
 
+      # Stamp a monotonically increasing version (1.0.<run_number>) on published
+      # main builds ONLY. electron-updater decides "an update is available" by
+      # comparing the version in latest.yml/latest-mac.yml against the running
+      # app's version, so the number MUST increase each publish. The artifactName
+      # filenames stay version-free (see package.json), so the fixed public
+      # download links are unaffected — only the manifest's `version:` changes.
+      - name: Stamp build version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: npm version "1.0.${GITHUB_RUN_NUMBER}" --no-git-tag-version --allow-same-version
+        shell: bash
+
       - name: Build macOS app
         if: matrix.platform == 'mac'
         # --publish never: just build the artifacts, don't try to publish a
@@ -106,7 +117,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           shopt -s nullglob
-          files=(dist/*.dmg dist/*.zip dist/*.exe)
+          # Installers + the electron-updater manifests/blockmaps. The mac job
+          # produces latest-mac.yml, the win job latest.yml; each job uploads only
+          # the files it actually built. The *.yml manifest is what the in-app
+          # "Update" button reads to detect a newer build.
+          files=(dist/*.dmg dist/*.zip dist/*.exe dist/latest*.yml dist/*.blockmap)
           gh release upload v1.0.0 "${files[@]}" --clobber --repo ${{ github.repository }}
         shell: bash
 

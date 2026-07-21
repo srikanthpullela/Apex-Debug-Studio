@@ -17,6 +17,7 @@ const os = require('os');
 const { spawn, execSync, execFileSync, execFile } = require('child_process');
 const chokidar = require('chokidar');
 const simpleGit = require('simple-git');
+const { initUpdater } = require('./updater');
 
 // ---------------------------------------------------------------------------
 // Cross-platform shell invocation
@@ -2012,6 +2013,10 @@ app.whenReady().then(() => {
 
   // Set up dock menu with recent files
   updateDockMenu();
+
+  // Wire the user-initiated update checker (shows the titlebar "Update" button
+  // when a newer packaged build exists; never downloads/installs without a click).
+  initUpdater({ getWindow: () => mainWindow });
 
   // Also handle files passed via command line
   const args = process.argv.slice(app.isPackaged ? 1 : 2);

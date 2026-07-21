@@ -6292,6 +6292,56 @@ function initToolbarButtons() {
   initKebabMenu();
 }
 
+// User-initiated app update button (titlebar, next to search). Never silent:
+// the button only appears when a newer packaged build exists, and only acts on click.
+function initUpdateButton() {
+  const btn = document.getElementById('tbtn-update');
+  const label = document.getElementById('tbtn-update-label');
+  if (!btn || !label || !window.apexStudio) return;
+  let pulsed = false;
+
+  function render(s) {
+    s = s || { state: 'none' };
+    const show = ['available', 'downloading', 'downloaded', 'error'].includes(s.state);
+    btn.classList.toggle('hidden', !show);
+    if (!show) return;
+    const ver = s.version ? ('v' + String(s.version).replace(/^v/, '')) : '';
+    if (s.state === 'downloading') {
+      btn.disabled = true;
+      label.textContent = `Downloading ${s.percent || 0}%`;
+      btn.title = 'Downloading the update…';
+    } else if (s.state === 'downloaded') {
+      btn.disabled = false;
+      label.textContent = 'Restart to update';
+      btn.title = `Update ${ver} downloaded — click to restart & install`;
+    } else if (s.state === 'error') {
+      btn.disabled = false;
+      label.textContent = 'Retry update';
+      btn.title = `Update failed${s.error ? ': ' + s.error : ''}. Click to try again.`;
+    } else { // available
+      btn.disabled = false;
+      label.textContent = 'Update';
+      btn.title = `${ver ? ver + ' ' : ''}available — click to update`;
+      if (!pulsed) {
+        pulsed = true;
+        btn.classList.add('attention');
+        setTimeout(() => btn.classList.remove('attention'), 5000);
+      }
+    }
+  }
+
+  btn.addEventListener('click', () => {
+    if (btn.disabled) return;
+    try { window.apexStudio.updatesPrimaryAction && window.apexStudio.updatesPrimaryAction(); } catch (_) {}
+  });
+
+  try { window.apexStudio.on && window.apexStudio.on('update:status', render); } catch (_) {}
+  // Sync any status emitted before this listener attached.
+  try {
+    window.apexStudio.updatesGetStatus && window.apexStudio.updatesGetStatus().then(render).catch(() => {});
+  } catch (_) {}
+}
+
 function initKebabMenu() {
   const kebabBtn = $('#tbtn-kebab');
   const kebabMenu = $('#titlebar-kebab-menu');
@@ -8132,7 +8182,7 @@ async function init() {
   initScreenshot();
   initDbClient();
   initToolbarButtons();
-
+  initUpdateButton();
   // Module-based features
   if (window.initSnippets)    initSnippets();
   if (window.initColorPicker) initColorPicker();
