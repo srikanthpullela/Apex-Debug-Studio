@@ -6,13 +6,15 @@
  *    whether a newer, successfully-built version exists so the renderer can show a
  *    small "Update available" button in the titlebar. Nothing is downloaded or
  *    installed until the user clicks that button.
- *  - Windows: electron-updater does the full flow on click — download (with
- *    progress) then quitAndInstall. No code-signing certificate required.
- *  - macOS: an unsigned app CANNOT self-install (Squirrel.Mac requires a Developer
- *    ID signature), so we only *detect* a newer build by reading the published
- *    `latest-mac.yml` manifest, and on click we open the release download page so
- *    the user installs the new .dmg themselves. This avoids electron-updater's
- *    mac signature errors entirely.
+ *  - Windows & macOS (installed builds): electron-updater runs the full flow on
+ *    click — download (with progress) then quitAndInstall / relaunch. macOS uses
+ *    Squirrel.Mac, which REQUIRES the app to be Developer ID signed + notarized
+ *    (configured in package.json build.mac + the CI signing step). If an install
+ *    ever fails (e.g. an unsigned local build), we gracefully fall back to opening
+ *    the release download page so the user is never dead-ended.
+ *  - Dev / unpackaged runs: electron-updater can't run, so we only *detect* a
+ *    newer build by reading the published `latest*.yml` manifest and, on click,
+ *    open the release page. This lets the button be verified while developing.
  *
  * The rolling public release keeps a fixed `v1.0.0` tag whose assets are
  * overwritten on every main build; the real build version lives inside the
@@ -26,12 +28,20 @@ const REPO_OWNER = 'srikanthpullela';
 const REPO_NAME = 'Apex-Debug-Studio';
 const RELEASE_PAGE = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest`;
 const MAC_MANIFEST = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download/latest-mac.yml`;
+const WIN_MANIFEST = `https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download/latest.yml`;
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // re-check every 30 min while the app runs
+
+// Also run the (read-only) availability check in a dev / unpackaged run, so the
+// "Update available" button can be verified end-to-end while developing. In dev
+// it only READS the published manifest and, on click, opens the release page —
+// it never downloads or installs anything. Set ADS_UPDATE_DEV=0 to silence it
+// during normal development.
+const DEV_UPDATE_CHECK = process.env.ADS_UPDATE_DEV !== '0';
 
 let getWindow = () => BrowserWindow.getAllWindows()[0] || null;
 // Latest known state so a window that opens later (or reloads) can be re-synced.
 let lastStatus = { state: 'none', version: null, percent: 0, error: null };
-let autoUpdater = null; // lazy — only loaded on Windows
+let autoUpdater = null; // lazy — loaded for installed macOS + Windows builds
 let userInitiatedDownload = false; // true only after the user clicks (Windows)
 
 /** Push the current update status to the renderer so it can show/hide the button. */
@@ -86,10 +96,15 @@ function fetchText(url, redirectsLeft = 5) {
   });
 }
 
-/** macOS: read the published manifest, compare its version to the running app. */
-async function checkMac() {
+/**
+ * Read a published electron-builder manifest (latest-mac.yml / latest.yml) and
+ * compare its version to the running app. Read-only: it only flips the button to
+ * "available"; it never downloads or installs. Used for macOS always, and for
+ * detection in any dev/unpackaged run.
+ */
+async function checkViaManifest(manifestUrl) {
   try {
-    const yml = await fetchText(MAC_MANIFEST);
+    const yml = await fetchText(manifestUrl);
     const m = yml.match(/^version:\s*['"]?([\w.\-]+)['"]?\s*$/m);
     const remote = m && m[1];
     if (!remote) return; // couldn't parse — leave the current state untouched
@@ -101,8 +116,8 @@ async function checkMac() {
   }
 }
 
-/** Windows: electron-updater checks the same release (reads latest.yml). */
-function checkWin() {
+/** Installed builds: electron-updater checks the published release manifest. */
+function checkViaUpdater() {
   if (!autoUpdater) return;
   autoUpdater.checkForUpdates().catch(() => {
     // Passive check failed — stay quiet (don't flip the button to an error state).
@@ -110,10 +125,27 @@ function checkWin() {
 }
 
 function doCheck() {
-  if (!app.isPackaged) return; // dev build: nothing to update to
-  if (process.platform === 'win32') checkWin();
-  else if (process.platform === 'darwin') checkMac();
+  // Installed mac/win builds use electron-updater end-to-end (check → download →
+  // install). Dev/unpackaged runs can't run electron-updater, so they fall back to
+  // reading the published manifest for DETECTION only (the click opens the release
+  // page). Dev detection is opt-out via DEV_UPDATE_CHECK so it can be verified
+  // while developing.
+  if (autoUpdater) { checkViaUpdater(); return; } // installed macOS or Windows
+  if (!app.isPackaged && !DEV_UPDATE_CHECK) return;
+  if (process.platform === 'darwin') checkViaManifest(MAC_MANIFEST);
+  else if (process.platform === 'win32') checkViaManifest(WIN_MANIFEST);
   // Linux/others: no packaged auto-update channel yet — stay quiet.
+}
+
+/**
+ * Surface an update error the user can act on — but only if THEY started the
+ * download/install. A passive/background failure stays silent so we never show a
+ * misleading button.
+ */
+function onUpdateError(err) {
+  if (!userInitiatedDownload) return;
+  userInitiatedDownload = false;
+  send('error', lastStatus.version, 0, String(err && err.message ? err.message : err));
 }
 
 /**
@@ -121,25 +153,43 @@ function doCheck() {
  * and current state — but nothing ever happens without this explicit user action.
  */
 async function primaryAction() {
-  if (process.platform === 'win32' && autoUpdater) {
+  if (autoUpdater) { // installed macOS or Windows
     if (lastStatus.state === 'downloaded') {
-      autoUpdater.quitAndInstall();
-    } else if (lastStatus.state === 'available' || lastStatus.state === 'error') {
+      autoUpdater.quitAndInstall(); // relaunches into the new version
+      return;
+    }
+    if (lastStatus.state === 'error') {
+      // A previous download/install failed (e.g. a signature/permission problem).
+      // Never dead-end the user: open the release page so they can update manually.
+      await shell.openExternal(RELEASE_PAGE);
+      return;
+    }
+    if (lastStatus.state === 'available') {
       userInitiatedDownload = true;
       send('downloading', lastStatus.version, 0);
-      autoUpdater.downloadUpdate().catch((e) => send('error', lastStatus.version, 0, String(e && e.message ? e.message : e)));
+      try {
+        await autoUpdater.downloadUpdate();
+      } catch (e) {
+        onUpdateError(e);
+      }
+      return;
     }
+    // Unknown / 'none' state — re-check so the button reflects reality.
+    doCheck();
     return;
   }
-  // macOS (and any non-Windows): open the release page so the user downloads the
-  // new build and installs it — we can't self-install without an Apple certificate.
+  // Dev / unpackaged (or a platform without an updater): we can't self-install, so
+  // open the release page for a manual download.
   await shell.openExternal(RELEASE_PAGE);
 }
 
 function initUpdater(opts) {
   if (opts && typeof opts.getWindow === 'function') getWindow = opts.getWindow;
 
-  if (app.isPackaged && process.platform === 'win32') {
+  // electron-updater drives the full download/install flow on INSTALLED macOS and
+  // Windows builds. macOS uses Squirrel.Mac, which requires the app to be Developer
+  // ID signed + notarized (see package.json build.mac + the CI signing step).
+  if (app.isPackaged && (process.platform === 'win32' || process.platform === 'darwin')) {
     try {
       autoUpdater = require('electron-updater').autoUpdater;
       autoUpdater.autoDownload = false;          // never fetch bytes without a click
@@ -148,14 +198,7 @@ function initUpdater(opts) {
       autoUpdater.on('update-not-available', () => send('none'));
       autoUpdater.on('download-progress', (p) => send('downloading', lastStatus.version, Math.round(p.percent || 0)));
       autoUpdater.on('update-downloaded', (info) => { userInitiatedDownload = false; send('downloaded', info && info.version); });
-      autoUpdater.on('error', (err) => {
-        // Only surface an error the user can act on if THEY started a download.
-        // A background/passive check failure stays silent (no misleading button).
-        if (userInitiatedDownload) {
-          userInitiatedDownload = false;
-          send('error', lastStatus.version, 0, String(err && err.message ? err.message : err));
-        }
-      });
+      autoUpdater.on('error', onUpdateError);
     } catch (e) {
       autoUpdater = null;
     }

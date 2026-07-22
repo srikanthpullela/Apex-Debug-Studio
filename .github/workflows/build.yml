@@ -76,15 +76,49 @@ jobs:
         run: npm version "1.0.${GITHUB_RUN_NUMBER}" --no-git-tag-version --allow-same-version
         shell: bash
 
-      - name: Build macOS app
+      # Decide whether we can produce a SIGNED + NOTARIZED macOS build. We can only
+      # do that when the Apple signing secrets are present (they're absent on forks
+      # and before the repo owner adds them), so we branch on that to avoid failing
+      # the build. `enabled=true` only when the Developer ID cert secret exists.
+      - name: Detect macOS signing availability
         if: matrix.platform == 'mac'
+        id: macsign
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+        run: |
+          if [ -n "$MAC_CSC_LINK" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "macOS signing secrets found — building signed + notarized."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "No macOS signing secrets — building unsigned (auto-update install will be unavailable)."
+          fi
+        shell: bash
+
+      - name: Build macOS app (signed + notarized)
+        if: matrix.platform == 'mac' && steps.macsign.outputs.enabled == 'true'
+        # Developer ID sign + notarize so Squirrel.Mac can self-install updates.
+        # `-c.mac.notarize.teamId` turns on notarytool notarization; electron-builder
+        # reads the Apple ID + app-specific password from the env below.
+        run: npm run build -- --publish never -c.mac.notarize.teamId="$APPLE_TEAM_ID"
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+
+      - name: Build macOS app (unsigned fallback)
+        if: matrix.platform == 'mac' && steps.macsign.outputs.enabled != 'true'
         # --publish never: just build the artifacts, don't try to publish a
         # GitHub release (electron-builder auto-publishes when it detects CI,
         # which would require a GH_TOKEN we intentionally don't provide).
         run: npm run build -- --publish never
         env:
-          # No Apple Developer certificate on CI — build unsigned instead of
-          # failing on a missing identity.
+          # No Apple Developer certificate available — build unsigned instead of
+          # failing on a missing identity. (In-app auto-update install won't work
+          # for these builds; add the signing secrets to enable it.)
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
       - name: Build Windows app

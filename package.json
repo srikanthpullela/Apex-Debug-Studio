@@ -66,6 +66,10 @@
       ],
       "darkModeSupport": true,
       "artifactName": "Apex-Debug-Studio-mac.${ext}",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
         "NSQuitAlwaysKeepsWindows": false
       }
