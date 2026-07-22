@@ -33,9 +33,15 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
-  function toast(msg, type) {
-    if (window.showToast) window.showToast(msg, type);
+  function toast(msg, type, opts) {
+    if (window.showToast) window.showToast(msg, type, opts);
   }
+
+  // Friendly, actionable wording for the two most common pre-flight failures,
+  // reused everywhere instead of terse/technical one-liners. These are 'error'
+  // toasts, which now stay on screen until dismissed so they can be read.
+  const CLI_MISSING_MSG = 'The Salesforce CLI isn\u2019t installed (or isn\u2019t on your PATH). Install it with: npm install --global @salesforce/cli \u2014 then reopen the app.';
+  const NO_ORG_MSG = 'No Salesforce org is connected. Click "+ Add Org" in the Salesforce panel to sign in.';
 
   // ──────────────────────────────────────────────
   // Persistent "Connecting to Salesforce" progress card (bottom-right).
@@ -99,13 +105,30 @@
     el.classList.add(ok ? 'scp-done' : 'scp-error');
     const sp = el.querySelector('.scp-spinner');
     if (sp) { sp.classList.add('scp-static'); sp.textContent = ok ? '✓' : '✗'; }
-    const cancelBtn = el.querySelector('.scp-cancel');
-    if (cancelBtn) cancelBtn.remove(); // nothing left to cancel once it's settled
     el.querySelector('.scp-title').textContent = ok ? 'Connected' : 'Connection failed';
     el.querySelector('.scp-status').textContent = msg || (ok ? 'Success' : 'Please try again');
     const t = el.querySelector('.scp-timer');
     if (t) t.textContent = '';
-    setTimeout(() => hideConnectProgress(), ok ? 2500 : 5000);
+    const cancelBtn = el.querySelector('.scp-cancel');
+    if (ok) {
+      // Success speaks for itself — drop the button and auto-dismiss shortly.
+      if (cancelBtn) cancelBtn.remove();
+      setTimeout(() => hideConnectProgress(), 2500);
+    } else {
+      // A failure the user needs to read and act on. Don't yank the card away
+      // after a few seconds (that was the core complaint — messages vanished
+      // before they could be understood). Keep it up until the user dismisses
+      // it; repurpose the Cancel button as "Dismiss". A long safety timeout
+      // still cleans it up if the app is left unattended.
+      if (cancelBtn) {
+        const fresh = cancelBtn.cloneNode(true); // strip the cancel-login handler
+        fresh.textContent = 'Dismiss';
+        fresh.title = 'Dismiss';
+        cancelBtn.parentNode.replaceChild(fresh, cancelBtn);
+        fresh.addEventListener('click', () => hideConnectProgress());
+      }
+      setTimeout(() => hideConnectProgress(), 60000);
+    }
   }
 
   function hideConnectProgress(immediate) {
@@ -168,11 +191,59 @@
     if (has('enotfound', 'getaddrinfo', 'econnrefused', 'etimedout', 'network', 'unable to connect', 'socket hang up'))
       return 'We couldn\u2019t reach Salesforce. Check your internet connection and try again.';
     if (has('command not found', 'enoent', 'not recognized', 'is not installed', 'cannot find'))
-      return 'The Salesforce CLI wasn\u2019t found. Please install it, then try connecting again.';
+      return 'The Salesforce CLI isn\u2019t installed (or isn\u2019t on your PATH). Install it with: npm install --global @salesforce/cli \u2014 then reopen the app and try again.';
     if (lines.length === 0)
       return 'Sign-in wasn\u2019t completed. Click "+ Add Org" to try again.';
-    // A genuine but unrecognised error — keep the surface calm; detail goes to the console.
-    return 'We couldn\u2019t finish connecting. Please try again \u2014 if it keeps happening, reconnect the org.';
+    // A genuine but unrecognised error — show it (trimmed) instead of hiding it,
+    // so the user can see what actually went wrong. Full detail also goes to the
+    // console. Hiding it behind a vague line is exactly what left people stuck.
+    return truncate(lines.join(' '), 300);
+  }
+
+  /** Trim overly long messages so a toast/card stays readable. */
+  function truncate(s, max) {
+    const str = String(s || '').trim();
+    return str.length > max ? str.slice(0, max - 1).trimEnd() + '\u2026' : str;
+  }
+
+  /**
+   * Turn ANY raw Salesforce-CLI failure into a friendly, actionable message.
+   * Unlike friendlyConnectError (which is sign-in specific), this is used across
+   * every CLI action — running tests, deploying, live-org reads, etc. Returns
+   * { message, details }: `message` is the calm friendly line to show, `details`
+   * is the raw cleaned output for the toast's "Show details" toggle. When the
+   * failure isn't one we recognise we return the FULL cleaned message as
+   * `message` (never a vague generic) so nothing is ever silently swallowed.
+   */
+  function humanizeSfError(stderr, stdout) {
+    const lines = stripSfNoise([stderr, stdout].filter(Boolean).join('\n'));
+    const raw = lines.join('\n').trim();
+    const j = raw.toLowerCase();
+    const has = (...subs) => subs.some((s) => j.includes(s));
+
+    if (!raw)
+      return { message: 'The Salesforce command finished without any output. Please try again.', details: '' };
+
+    if (has('command not found', 'not recognized', 'is not installed', 'cannot find')
+        || /\bsf(dx)?\b[^\n]*not found/.test(j)
+        || (has('enoent') && has('sf', 'sfdx')))
+      return {
+        message: 'The Salesforce CLI isn\u2019t installed (or isn\u2019t on your PATH). Install it with: npm install --global @salesforce/cli \u2014 then reopen the app and try again.',
+        details: raw,
+      };
+    if (has('enotfound', 'getaddrinfo', 'econnrefused', 'etimedout', 'econnreset', 'socket hang up', 'network is unreachable', 'unable to connect', 'unable to reach'))
+      return { message: 'We couldn\u2019t reach Salesforce. Check your internet connection and try again.', details: raw };
+    if (has('timed out', 'timeout'))
+      return { message: 'The Salesforce command timed out before it finished. Please try again.', details: raw };
+    if (has('no authorization information', 'not been authorized', 'no default environment', 'no target org', 'requires a default org', 'no org configured'))
+      return { message: 'No Salesforce org is connected. Open the Salesforce panel and click "+ Add Org" to sign in.', details: raw };
+    if (has('invalid_grant', 'expired access', 'session expired', 'invalid_session', 'invalid_login', 'refresh token', 'this org appears to be deleted'))
+      return { message: 'Your Salesforce session has expired. Reconnect the org ("+ Add Org") and try again.', details: raw };
+
+    // Unrecognised — never swallow it. Surface the real first line, keep the full
+    // text available under "Show details".
+    const firstLine = raw.split('\n').map((l) => l.trim()).find(Boolean) || raw;
+    return { message: truncate(firstLine, 240), details: raw };
   }
 
 
@@ -3111,8 +3182,8 @@
   async function deployToOrg(validateOnly) {
     const folder = getFolderPath();
     if (!folder) { toast('Open a folder first', 'warn'); return; }
-    if (!sfState.cliInstalled) { toast('Salesforce CLI not installed', 'error'); return; }
-    if (!sfState.orgConnected) { toast('No org connected. Run: sf org login web', 'error'); return; }
+    if (!sfState.cliInstalled) { toast(CLI_MISSING_MSG, 'error'); return; }
+    if (!sfState.orgConnected) { toast(NO_ORG_MSG, 'error'); return; }
 
     openSfPanel('sf-deploy');
     const resultsDiv = $('#sf-deploy-results');
@@ -3231,12 +3302,14 @@
         clog(stdout || stderr || 'Unknown error', 'sf-console-error');
         logDiv.textContent = stdout || stderr || 'No output';
         resultsDiv.innerHTML = `<div class="sf-empty">✗ ${mode} failed. See log below.</div>`;
-        toast(`${validateOnly ? 'Validation' : 'Deployment'} failed`, 'error');
+        const h = humanizeSfError(stderr, stdout);
+        toast(`${validateOnly ? 'Validation' : 'Deployment'} failed \u2014 ${h.message}`, 'error', { details: h.details });
       }
     } catch (e) {
       clogResolve(spinner, `✗ ${mode} error: ${e.message}`, 'sf-console-error');
       resultsDiv.innerHTML = `<div class="sf-empty">✗ Error: ${e.message}</div>`;
-      toast(`Deploy error: ${e.message}`, 'error');
+      const h = humanizeSfError(e && e.message, '');
+      toast(`${validateOnly ? 'Validation' : 'Deployment'} error \u2014 ${h.message}`, 'error', { details: h.details || (e && e.message) || '' });
     }
   }
 
@@ -3342,8 +3415,8 @@
   async function deployPath(targetPath) {
     const folder = getFolderPath();
     if (!folder) { toast('Open a folder first', 'warn'); return; }
-    if (!sfState.cliInstalled) { toast('Salesforce CLI not installed', 'error'); return; }
-    if (!sfState.orgConnected) { toast('No org connected', 'error'); return; }
+    if (!sfState.cliInstalled) { toast(CLI_MISSING_MSG, 'error'); return; }
+    if (!sfState.orgConnected) { toast(NO_ORG_MSG, 'error'); return; }
 
     const resultsDiv = $('#sf-deploy-results');
     const logDiv = $('#sf-deploy-log');
@@ -3403,12 +3476,14 @@
         clog(stdout || stderr || 'Unknown error', 'sf-console-error');
         logDiv.textContent = stdout || stderr || 'No output';
         resultsDiv.innerHTML = '<div class="sf-empty">✗ Deploy failed. See log.</div>';
-        toast('Deploy failed', 'error');
+        const h = humanizeSfError(stderr, stdout);
+        toast(`Deploy failed \u2014 ${h.message}`, 'error', { details: h.details });
       }
     } catch (e) {
       clogResolve(spinner, `✗ Error: ${e.message}`, 'sf-console-error');
       resultsDiv.innerHTML = `<div class="sf-empty">✗ Error: ${e.message}</div>`;
-      toast(`Deploy error: ${e.message}`, 'error');
+      const h = humanizeSfError(e && e.message, '');
+      toast(`Deploy error \u2014 ${h.message}`, 'error', { details: h.details || (e && e.message) || '' });
     }
   }
 
@@ -3664,4 +3739,13 @@
       info: sfState.orgInfo || null,
     };
   };
+
+  /**
+   * Expose the friendly CLI-error translator so any module that shells out to
+   * `sf`/`sfdx` (e.g. the Apex debugger's Live Org reads) can turn a raw failure
+   * into a calm, actionable message + raw details instead of leaking something
+   * like "zsh:1: command not found: sf" into a toast.
+   * @returns {{ message: string, details: string }}
+   */
+  window.sfHumanizeError = humanizeSfError;
 })();

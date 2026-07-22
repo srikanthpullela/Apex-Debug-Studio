@@ -4152,17 +4152,53 @@ function isImageFile(filename) {
 /* ================================================================
    25. TOAST NOTIFICATIONS
    ================================================================ */
-function showToast(message, type = 'info', duration = 4000) {
+// showToast(message, type, opts)
+//   opts may be a number (legacy: duration in ms) or an object:
+//     { duration?: number, details?: string }
+// Auto-dismiss is type-aware so important messages don't vanish before they can
+// be read: errors stay until the user dismisses them, warnings linger, and
+// info/success fade quickly. An explicit duration always wins. `details` holds
+// the raw/technical text (e.g. the full CLI error) behind a "Show details"
+// toggle, so a friendly summary stays readable while nothing is ever swallowed.
+function showToast(message, type = 'info', opts) {
+  const options = (typeof opts === 'number') ? { duration: opts }
+    : (opts && typeof opts === 'object') ? opts : {};
+  const defaultDuration = type === 'error' ? 0 : (type === 'warning' ? 8000 : 4000);
+  const duration = (options.duration != null) ? options.duration : defaultDuration;
+
+  const detailRaw = (options.details != null) ? String(options.details).trim() : '';
+  const details = (detailRaw && detailRaw !== String(message).trim()) ? detailRaw : '';
+
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   const icons = { info: 'ℹ️', success: '✅', warning: '⚠️', error: '❌' };
   toast.innerHTML = `
-    <span class="toast-icon">${icons[type] || icons.info}</span>
-    <span class="toast-msg">${escHtml(message)}</span>
-    <button class="toast-close" title="Dismiss">✕</button>
+    <div class="toast-row">
+      <span class="toast-icon">${icons[type] || icons.info}</span>
+      <span class="toast-msg">${escHtml(message)}</span>
+      <button class="toast-close" title="Dismiss">✕</button>
+    </div>
+    ${details ? `
+      <button class="toast-details-toggle" type="button">Show details</button>
+      <pre class="toast-details hidden">${escHtml(details)}</pre>
+    ` : ''}
   `;
   toast.querySelector('.toast-close').addEventListener('click', () => dismissToast(toast));
+  if (details) {
+    const toggle = toast.querySelector('.toast-details-toggle');
+    const pre = toast.querySelector('.toast-details');
+    toggle.addEventListener('click', () => {
+      const shown = !pre.classList.toggle('hidden');
+      toggle.textContent = shown ? 'Hide details' : 'Show details';
+    });
+  }
   dom.toastContainer.appendChild(toast);
+  // Errors now persist until dismissed, so cap how many can stack at once —
+  // drop the oldest so a burst of failures can't bury the screen.
+  const MAX_TOASTS = 5;
+  while (dom.toastContainer.children.length > MAX_TOASTS && dom.toastContainer.firstChild) {
+    dom.toastContainer.firstChild.remove();
+  }
   if (duration > 0) {
     setTimeout(() => dismissToast(toast), duration);
   }

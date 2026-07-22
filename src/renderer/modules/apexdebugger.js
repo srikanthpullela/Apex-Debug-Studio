@@ -10436,7 +10436,11 @@ window._dbgEvalInOrg = async function (varName, expr) {
   const r = await evaluateInOrg(expr, frame);
   if (r.error) {
     addConsoleEntry('error', `Org eval error for ${expr}: ${r.error}`);
-    window.showToast?.(`Org eval failed: ${r.error}`, 'error');
+    // Translate raw CLI/org failures (e.g. "command not found: sf" when the
+    // Salesforce CLI isn't installed) into a friendly, actionable message; keep
+    // the raw text under the toast's "Show details" so nothing is lost.
+    const h = window.sfHumanizeError ? window.sfHumanizeError(r.error, '') : { message: `Org eval failed: ${r.error}`, details: '' };
+    window.showToast?.(h.message, 'error', { details: h.details || String(r.error || '') });
     return;
   }
   if (varName) frame.variables[varName] = r.value;
