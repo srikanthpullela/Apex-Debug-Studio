@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="github-dark">
+<html lang="en" data-theme="apex-midnight">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -7,18 +7,19 @@
   <title>Apex Debug Studio</title>
   <link rel="stylesheet" href="styles.css" />
   <script>
-    // Apply saved theme before first paint to prevent flash. Default = GitHub Dark.
-    // One-time: upgrade the legacy default ('dark'/none) to GitHub Dark. A flag
-    // (set by app.js after it also migrates the session) makes this run only once,
-    // so a user who later explicitly picks Dark keeps it.
+    // Apply saved theme before first paint to prevent flash. Default = Apex Midnight.
+    // One-time: upgrade the previous auto-defaults ('dark'/'github-dark'/none) to the
+    // signature Apex Midnight theme. A flag (set by app.js after it also migrates the
+    // session) makes this run only once, so a user who explicitly picks another theme
+    // keeps it.
     try {
-      var MIG = 'apexstudio-theme-ghd-migrated';
+      var MIG = 'apexstudio-theme-midnight-migrated';
       var t = localStorage.getItem('apexstudio-theme') || localStorage.getItem('congacode-theme');
-      if (!localStorage.getItem(MIG) && (!t || t === 'dark')) {
-        t = 'github-dark';
-        try { localStorage.setItem('apexstudio-theme', 'github-dark'); } catch(_) {}
+      if (!localStorage.getItem(MIG) && (!t || t === 'dark' || t === 'github-dark')) {
+        t = 'apex-midnight';
+        try { localStorage.setItem('apexstudio-theme', 'apex-midnight'); } catch(_) {}
       }
-      document.documentElement.setAttribute('data-theme', t ? (t === 'conga' ? 'apex' : t) : 'github-dark');
+      document.documentElement.setAttribute('data-theme', t ? (t === 'conga' ? 'apex' : t) : 'apex-midnight');
     } catch(e) {}
   </script>
 </head>
@@ -120,7 +121,7 @@
 
       <!-- Root folder name -->
       <div id="root-folder-bar" class="root-folder-bar hidden">
-        <span class="root-folder-icon">📂</span>
+        <span class="root-folder-icon"><svg class="fic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M1.5 4.5a1 1 0 0 1 1-1h3.1a1 1 0 0 1 .8.4l.7.95a1 1 0 0 0 .8.4h4.8a1 1 0 0 1 1 1v1.1H4.4a1 1 0 0 0-.95.68L1.5 12V4.5z" fill="#5f9bf0"/><path d="M3.7 8.1h10.7a.72.72 0 0 1 .69.93l-1.06 3.5a1 1 0 0 1-.96.71H1.8a.72.72 0 0 1-.69-.93l1.06-3.5a1 1 0 0 1 .96-.71z" fill="#84b5f8"/></svg></span>
         <span id="root-folder-name" class="root-folder-name"></span>
         <button class="sidebar-btn sidebar-btn-right" id="btn-open-folder" title="Open Folder">
           <svg width="16" height="16" viewBox="0 0 16 16"><path d="M1 3h5l2 2h7v8H1V3z" stroke="currentColor" stroke-width="1" fill="none"/></svg>

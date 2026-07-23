@@ -15,7 +15,36 @@
 
 /* ---- Theme Variables ---- */
 
-/* Dark (default) */
+/* Apex Midnight (default) — signature near-black theme (matches the product hero) */
+[data-theme="apex-midnight"] {
+  --bg-primary: #0b0e18;
+  --bg-secondary: #080b13;
+  --bg-tertiary: #04050a;
+  --bg-hover: #141a2a;
+  --bg-active: #1c2440;
+  --bg-input: #0e1220;
+  --border: rgba(255,255,255,.07);
+  --text-primary: #f2f5fb;
+  --text-secondary: #9aa3b8;
+  --text-muted: #5d6579;
+  --accent: #6fa8ff;
+  --accent-hover: #5fd4ff;
+  --tab-active-bg: #0b0e18;
+  --tab-inactive-bg: #080b13;
+  --tab-border: rgba(255,255,255,.07);
+  --status-bg: #04050a;
+  --scrollbar: #1c2440;
+  --scrollbar-hover: #2a3452;
+  --editor-bg: #0b0e18;
+  --editor-fg: #f2f5fb;
+  --selection: rgba(111,168,255,.20);
+  --find-match: rgba(251,191,36,.28);
+  --find-match-current: rgba(251,191,36,.48);
+  --welcome-gradient-a: #0d1020;
+  --welcome-gradient-b: #080a13;
+}
+
+/* Dark */
 [data-theme="dark"] {
   --bg-primary: #1e1e2e;
   --bg-secondary: #181825;
@@ -798,6 +827,12 @@ html, body {
 .tree-chevron-spacer { width: 10px; flex-shrink: 0; }
 .tree-item:hover .tree-chevron { color: var(--text-secondary); }
 .tree-icon { font-size: 14px; flex-shrink: 0; }
+/* Modern inline SVG file/folder icons (see getFileIcon/getFolderIcon) */
+.fic { display: inline-block; width: 16px; height: 16px; vertical-align: middle; flex-shrink: 0; }
+.tree-icon, .tab-icon, .qo-icon, .sys-search-icon, .ws-result-icon,
+.gs-file-icon, .root-folder-icon, .todo-file-icon, .recent-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+}
 .tree-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tree-empty {
   display: flex; flex-direction: column; align-items: center;

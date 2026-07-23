@@ -34,7 +34,7 @@ const state = {
   recentSectionOpen: false,
   recentHeight: 150,       // starting height for recent section
   autoSaveTimers: {},
-  theme: 'github-dark',
+  theme: 'apex-midnight',
   welcomeVisible: true,
   treeSectionOpen: true,
   recentlyClosed: [],      // stack of { title, filePath, content } for Cmd+Shift+T
@@ -175,7 +175,8 @@ function cacheDom() {
    ================================================================ */
 
 const THEMES = [
-  { id: 'dark',             label: 'Dark (Default)',    base: 'vs-dark' },
+  { id: 'apex-midnight',    label: 'Apex Midnight',     base: 'vs-dark' },
+  { id: 'dark',             label: 'Dark',              base: 'vs-dark' },
   { id: 'light',            label: 'Light',             base: 'vs' },
   { id: 'monokai',          label: 'Monokai',           base: 'vs-dark' },
   { id: 'dracula',          label: 'Dracula',           base: 'vs-dark' },
@@ -193,6 +194,76 @@ const THEMES = [
 
 function defineMonacoThemes(monaco) {
   const themes = {
+    'apex-midnight': {
+      base: 'vs-dark', inherit: true,
+      rules: [
+        { token: 'comment', foreground: '5d6579', fontStyle: 'italic' },
+        { token: 'keyword', foreground: '9d8cff' },
+        { token: 'keyword.control', foreground: '9d8cff' },
+        { token: 'storage', foreground: '9d8cff' },
+        { token: 'storage.type', foreground: '9d8cff' },
+        { token: 'storage.modifier', foreground: '9d8cff' },
+        { token: 'string', foreground: '6fd7c1' },
+        { token: 'string.escape', foreground: 'fbbf24' },
+        { token: 'number', foreground: 'fbbf24' },
+        { token: 'constant', foreground: 'fbbf24' },
+        { token: 'constant.numeric', foreground: 'fbbf24' },
+        { token: 'constant.language', foreground: 'fbbf24' },
+        { token: 'type', foreground: '6fa8ff' },
+        { token: 'type.identifier', foreground: '6fa8ff' },
+        { token: 'class', foreground: '6fa8ff' },
+        { token: 'namespace', foreground: '6fa8ff' },
+        { token: 'function', foreground: 'd7ddec' },
+        { token: 'identifier', foreground: 'f2f5fb' },
+        { token: 'variable', foreground: 'f2f5fb' },
+        { token: 'variable.predefined', foreground: 'ff6d9d' },
+        { token: 'operator', foreground: '9aa3b8' },
+        { token: 'delimiter', foreground: '9aa3b8' },
+        { token: 'annotation', foreground: 'fbbf24' },
+        { token: 'tag', foreground: 'ff6d9d' },
+        { token: 'attribute.name', foreground: '5fd4ff' },
+        { token: 'attribute.value', foreground: '6fd7c1' },
+        { token: 'regexp', foreground: '5fd4ff' },
+      ],
+      colors: {
+        'editor.background': '#0b0e18',
+        'editor.foreground': '#f2f5fb',
+        'editor.lineHighlightBackground': '#6fa8ff1c',
+        'editor.lineHighlightBorder': '#00000000',
+        'editor.selectionBackground': '#6fa8ff33',
+        'editor.inactiveSelectionBackground': '#6fa8ff1f',
+        'editor.selectionHighlightBackground': '#6fa8ff22',
+        'editor.wordHighlightBackground': '#6fa8ff1f',
+        'editorCursor.foreground': '#f2f5fb',
+        'editorLineNumber.foreground': '#5b6478',
+        'editorLineNumber.activeForeground': '#c3cad8',
+        'editorIndentGuide.background': '#ffffff0d',
+        'editorIndentGuide.activeBackground': '#ffffff1f',
+        'editorWhitespace.foreground': '#ffffff12',
+        'editor.findMatchBackground': '#fbbf2440',
+        'editor.findMatchHighlightBackground': '#fbbf2420',
+        'editorBracketMatch.background': '#1c2440',
+        'editorBracketMatch.border': '#5d6579',
+        'editorBracketHighlight.foreground1': '#9d8cff',
+        'editorBracketHighlight.foreground2': '#6fd7c1',
+        'editorBracketHighlight.foreground3': '#5fd4ff',
+        'editorBracketHighlight.foreground4': '#fbbf24',
+        'editorBracketHighlight.foreground5': '#6fa8ff',
+        'editorBracketHighlight.foreground6': '#ff6d9d',
+        'editorGutter.background': '#0b0e18',
+        'editorWidget.background': '#0d1020',
+        'editorWidget.border': '#1c2440',
+        'editorHoverWidget.background': '#0d1020',
+        'editorHoverWidget.border': '#1c2440',
+        'editorSuggestWidget.background': '#0b0e18',
+        'editorSuggestWidget.border': '#1c2440',
+        'editorSuggestWidget.selectedBackground': '#1c2440',
+        'input.background': '#0e1220',
+        'dropdown.background': '#0b0e18',
+        'scrollbarSlider.background': '#1c244080',
+        'scrollbarSlider.hoverBackground': '#2a3452aa',
+      },
+    },
     dark: {
       base: 'vs-dark', inherit: true,
       rules: [{ token: 'comment', foreground: '6c7086', fontStyle: 'italic' }],
@@ -1065,6 +1136,13 @@ async function restoreSession() {
     localStorage.setItem('apexstudio-theme-ghd-migrated', '1');
   } catch { ghdMigrationPending = false; }
 
+  // Second one-time window: upgrade the auto-default (unset / 'dark' / 'github-dark')
+  // to the signature "Apex Midnight" theme. Explicit non-default choices are kept.
+  try {
+    midnightMigrationPending = !localStorage.getItem('apexstudio-theme-midnight-migrated');
+    localStorage.setItem('apexstudio-theme-midnight-migrated', '1');
+  } catch { midnightMigrationPending = false; }
+
   // Tell a WINDOW RELOAD (Cmd/Ctrl+R · "Reload Window") apart from a cold app launch.
   // sessionStorage survives a renderer reload but is empty in a brand-new process /
   // window — so finding the flag means "this document was reloaded". We fully restore
@@ -1244,7 +1322,7 @@ async function renderTreeDir(dirPath, parentEl, depth) {
 
     const icon = document.createElement('span');
     icon.className = 'tree-icon';
-    icon.textContent = entry.isDirectory ? '📁' : getFileIcon(entry.name);
+    icon.innerHTML = entry.isDirectory ? getFolderIcon(false) : getFileIcon(entry.name);
 
     const name = document.createElement('span');
     name.className = 'tree-name';
@@ -1279,7 +1357,7 @@ async function renderTreeDir(dirPath, parentEl, depth) {
         expanded = !expanded;
         chevron.textContent = expanded ? '▼' : '▶';
         chevron.classList.toggle('expanded', expanded);
-        icon.textContent = expanded ? '📂' : '📁';
+        icon.innerHTML = getFolderIcon(expanded);
         if (expanded && !childContainer) {
           childContainer = document.createElement('div');
           childContainer.className = 'tree-children';
@@ -2371,14 +2449,23 @@ function renderThemeList(themes) {
   }
 }
 
-// One-time upgrade of the legacy default theme ('dark') to the new GitHub Dark
-// default. `ghdMigrationPending` (captured once at boot in restoreSession) is true
-// only on the first launch after this update, so it never overrides a theme the
-// user explicitly selects afterward.
+// One-time upgrade of the previous auto-default themes ('dark' → GitHub Dark →
+// Apex Midnight) to the current signature default. `*MigrationPending` flags
+// (captured once at boot in restoreSession) are true only on the first launch
+// after each update, so they never override a theme the user explicitly selects.
 let ghdMigrationPending = false;
+let midnightMigrationPending = false;
 function migrateLegacyTheme(themeId) {
-  if (ghdMigrationPending && (!themeId || themeId === 'dark')) themeId = 'github-dark';
-  return themeId === 'conga' ? 'apex' : themeId;
+  if (themeId === 'conga') themeId = 'apex';
+  // Newest default: bump the old auto-defaults (unset / 'dark' / 'github-dark') to
+  // Apex Midnight. Runs only during the one-time migration window.
+  if (midnightMigrationPending && (!themeId || themeId === 'dark' || themeId === 'github-dark')) {
+    return 'apex-midnight';
+  }
+  // Older window: legacy 'dark' default → GitHub Dark (kept for correctness if that
+  // migration hasn't run yet on this profile).
+  if (ghdMigrationPending && (!themeId || themeId === 'dark')) return 'github-dark';
+  return themeId;
 }
 
 function applyTheme(themeId) {
@@ -2529,7 +2616,7 @@ function renderRecentList(files) {
       // Show folder group
       const item = document.createElement('div');
       item.className = 'recent-item recent-item-folder';
-      item.innerHTML = `<span class="recent-item-name">📁 ${escHtml(entry.name)}</span><span class="recent-item-path">${escHtml(entry.shortDir)}</span>`;
+      item.innerHTML = `<span class="recent-item-name">${getFolderIcon(false)} ${escHtml(entry.name)}</span><span class="recent-item-path">${escHtml(entry.shortDir)}</span>`;
       item.addEventListener('click', async () => {
         try { await openFolder(entry.dir); } catch (err) { console.error('open recent error:', err); }
       });
@@ -2538,7 +2625,7 @@ function renderRecentList(files) {
     } else if (entry.type === 'directory') {
       const item = document.createElement('div');
       item.className = 'recent-item recent-item-folder';
-      item.innerHTML = `<span class="recent-item-name">📁 ${escHtml(entry.name)}</span><span class="recent-item-path">${escHtml(entry.shortDir)}</span>`;
+      item.innerHTML = `<span class="recent-item-name">${getFolderIcon(false)} ${escHtml(entry.name)}</span><span class="recent-item-path">${escHtml(entry.shortDir)}</span>`;
       item.addEventListener('click', async () => {
         try { await openFolder(entry.path); } catch (err) { console.error('open recent error:', err); }
       });
@@ -2586,7 +2673,7 @@ function renderWelcomeRecent(files) {
       // Multiple files from same folder → show folder
       const item = document.createElement('div');
       item.className = 'welcome-recent-item welcome-recent-folder';
-      item.innerHTML = `<span class="recent-icon">📁</span><span class="recent-name">${escHtml(entry.name)}</span><span class="recent-dir">${escHtml(entry.shortDir)}</span><span class="recent-badge">${entry.files.length} files</span>`;
+      item.innerHTML = `<span class="recent-icon">${getFolderIcon(false)}</span><span class="recent-name">${escHtml(entry.name)}</span><span class="recent-dir">${escHtml(entry.shortDir)}</span><span class="recent-badge">${entry.files.length} files</span>`;
       item.title = entry.dir;
       item.addEventListener('click', async () => {
         try { await openFolder(entry.dir); } catch (err) { console.error('open folder error:', err); }
@@ -2597,7 +2684,7 @@ function renderWelcomeRecent(files) {
       // A project folder that was opened directly
       const item = document.createElement('div');
       item.className = 'welcome-recent-item welcome-recent-folder';
-      item.innerHTML = `<span class="recent-icon">📁</span><span class="recent-name">${escHtml(entry.name)}</span><span class="recent-dir">${escHtml(entry.shortDir)}</span>`;
+      item.innerHTML = `<span class="recent-icon">${getFolderIcon(false)}</span><span class="recent-name">${escHtml(entry.name)}</span><span class="recent-dir">${escHtml(entry.shortDir)}</span>`;
       item.title = entry.path;
       item.addEventListener('click', async () => {
         try { await openFolder(entry.path); } catch (err) { console.error('open folder error:', err); }
@@ -2768,7 +2855,7 @@ async function showRecentPanel() {
       group.className = 'recent-panel-group';
       const header = document.createElement('div');
       header.className = 'recent-panel-group-header';
-      header.innerHTML = `<span class="recent-icon">📁</span><span class="recent-panel-name">${escHtml(entry.name)}</span><span class="recent-panel-dir">${escHtml(entry.shortDir)}</span><span class="recent-badge">${entry.files.length} files</span>`;
+      header.innerHTML = `<span class="recent-icon">${getFolderIcon(false)}</span><span class="recent-panel-name">${escHtml(entry.name)}</span><span class="recent-panel-dir">${escHtml(entry.shortDir)}</span><span class="recent-badge">${entry.files.length} files</span>`;
       header.addEventListener('click', async () => {
         try { await openFolder(entry.dir); hideRecentPanel(); } catch {}
       });
@@ -2793,7 +2880,7 @@ async function showRecentPanel() {
     } else if (entry.type === 'directory') {
       const item = document.createElement('div');
       item.className = 'recent-panel-item recent-panel-folder';
-      item.innerHTML = `<span class="recent-icon">📁</span><span class="recent-panel-name">${escHtml(entry.name)}</span><span class="recent-panel-dir">${escHtml(entry.shortDir)}</span>`;
+      item.innerHTML = `<span class="recent-icon">${getFolderIcon(false)}</span><span class="recent-panel-name">${escHtml(entry.name)}</span><span class="recent-panel-dir">${escHtml(entry.shortDir)}</span>`;
       item.title = entry.path;
       item.addEventListener('click', async () => {
         try { await openFolder(entry.path); hideRecentPanel(); } catch {}
@@ -3066,7 +3153,7 @@ async function runSystemSearch(query, gen) {
     if (filteredFiles.length > 0) {
       html += '<div class="sys-search-section-header">📄 File Matches</div>';
       for (const r of filteredFiles.slice(0, 15)) {
-        const icon = r.isDirectory ? '📁' : getFileIcon(r.name);
+        const icon = r.isDirectory ? getFolderIcon(false) : getFileIcon(r.name);
         const nameHtml = highlightMatch(r.name, lowerQ);
         allResults.push(r);
         html += `<div class="sys-search-item" data-idx="${allResults.length - 1}">
@@ -3312,7 +3399,7 @@ async function runWelcomeSearch(query, gen) {
     const lowerQ = query.toLowerCase();
     let html = '';
     items.forEach((r, i) => {
-      const icon = r.isDirectory ? '📁' : getFileIcon(r.name);
+      const icon = r.isDirectory ? getFolderIcon(false) : getFileIcon(r.name);
       const nameHtml = highlightMatch(r.name, lowerQ);
       html += `<div class="ws-result-item" data-path="${escHtml(r.path)}" style="animation-delay:${i * 30}ms">
         <span class="ws-result-icon">${icon}</span>
@@ -4128,20 +4215,92 @@ function guessLanguage(filename) {
   return map[ext] || 'plaintext';
 }
 
+/* ================================================================
+   FILE / FOLDER ICONS  (modern, self-contained SVG set)
+   ----------------------------------------------------------------
+   Replaces the old emoji icons. Files render as a rounded "chip"
+   tinted in the file type's accent colour with a short monogram (or
+   a small glyph for images/locks/plain docs); folders render as a
+   filled two-tone glyph. Everything is inline SVG so it works fully
+   offline under contextIsolation — no icon font or asset dependency.
+   ================================================================ */
+const ICON_COLORS = {
+  amber: '#fbbf24', blue: '#6fa8ff', cyan: '#5fd4ff', violet: '#9d8cff',
+  coral: '#ff6d9d', green: '#68d493', teal: '#6fd7c1', muted: '#9aa3b8',
+};
+
+// ext -> [colorKey, label]  (label is <=2 chars or a single glyph char)
+const FILE_ICON_MAP = {
+  js: ['amber', 'JS'], mjs: ['amber', 'JS'], cjs: ['amber', 'JS'],
+  ts: ['blue', 'TS'], mts: ['blue', 'TS'], cts: ['blue', 'TS'],
+  jsx: ['cyan', 'JS'], tsx: ['cyan', 'TS'],
+  json: ['amber', '{}'], json5: ['amber', '{}'], jsonc: ['amber', '{}'],
+  md: ['violet', 'MD'], markdown: ['violet', 'MD'], mdx: ['violet', 'MD'],
+  html: ['coral', '<>'], htm: ['coral', '<>'], xhtml: ['coral', '<>'],
+  css: ['cyan', 'CS'], scss: ['coral', 'SC'], sass: ['coral', 'SC'], less: ['blue', 'LS'],
+  yml: ['green', 'YM'], yaml: ['green', 'YM'], xml: ['green', 'XM'],
+  sh: ['green', 'SH'], bash: ['green', 'SH'], zsh: ['green', 'SH'],
+  py: ['blue', 'PY'], rb: ['coral', 'RB'], go: ['cyan', 'GO'], rs: ['amber', 'RS'],
+  php: ['violet', 'PH'], swift: ['coral', 'SW'], kt: ['violet', 'KT'], kts: ['violet', 'KT'],
+  java: ['coral', 'JV'], c: ['blue', 'C'], h: ['violet', 'H'],
+  cpp: ['blue', 'C+'], cc: ['blue', 'C+'], cs: ['violet', 'C#'],
+  cls: ['blue', 'AP'], trigger: ['blue', 'AP'], apex: ['blue', 'AP'],
+  sql: ['cyan', 'SQ'], vue: ['green', 'VU'], svelte: ['coral', 'Sv'],
+  toml: ['muted', 'TM'], ini: ['muted', 'CF'], cfg: ['muted', 'CF'], conf: ['muted', 'CF'],
+  txt: ['muted', 'TX'], log: ['muted', 'LG'], csv: ['green', 'CS'], tsv: ['green', 'CS'],
+  env: ['amber', 'EN'], patch: ['violet', '\u00B1'], diff: ['violet', '\u00B1'],
+  zip: ['amber', 'ZP'], tar: ['amber', 'ZP'], gz: ['amber', 'ZP'], tgz: ['amber', 'ZP'], rar: ['amber', 'ZP'],
+  mp3: ['violet', '\u266A'], wav: ['violet', '\u266A'], flac: ['violet', '\u266A'], ogg: ['violet', '\u266A'],
+  mp4: ['violet', '\u25B6'], mov: ['violet', '\u25B6'], mkv: ['violet', '\u25B6'], webm: ['violet', '\u25B6'],
+  pdf: ['coral', 'PD'], resource: ['muted', 'RE'],
+};
+const FILE_NAME_MAP = {
+  dockerfile: ['blue', 'DK'], makefile: ['amber', 'MK'],
+  '.gitignore': ['coral', 'GT'], '.gitattributes': ['coral', 'GT'], '.npmrc': ['coral', 'NP'],
+};
+const _IMG_GLYPH = '<circle cx="6" cy="6.4" r="1.05"/><path d="M3.4 11.4l2.5-2.5 1.7 1.7 2.4-2.7 2.6 3.5"/>';
+const _LOCK_GLYPH = '<rect x="4.4" y="7.4" width="7.2" height="4.9" rx="1.1"/><path d="M5.9 7.4V6a2.1 2.1 0 0 1 4.2 0v1.4"/>';
+const _DOC_GLYPH = '<path d="M5 3.3h3.9L11.6 6v6.2a.9.9 0 0 1-.9.9H5a.9.9 0 0 1-.9-.9V4.2A.9.9 0 0 1 5 3.3z"/><path d="M8.7 3.5V6h2.6"/>';
+
+function _iconChip(colorKey, label) {
+  const c = ICON_COLORS[colorKey] || ICON_COLORS.muted;
+  const two = label.length > 1;
+  return `<svg class="fic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">`
+    + `<rect x="1.6" y="1.6" width="12.8" height="12.8" rx="3.6" fill="${c}" fill-opacity="0.15" stroke="${c}" stroke-opacity="0.5"/>`
+    + `<text x="8" y="${two ? '10.8' : '11'}" text-anchor="middle" font-family="ui-monospace,'SF Mono','JetBrains Mono',monospace" font-size="${two ? '6' : '8'}" font-weight="700" letter-spacing="-0.4" fill="${c}">${label}</text>`
+    + `</svg>`;
+}
+function _iconGlyph(colorKey, inner) {
+  const c = ICON_COLORS[colorKey] || ICON_COLORS.muted;
+  return `<svg class="fic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">`
+    + `<rect x="1.6" y="1.6" width="12.8" height="12.8" rx="3.6" fill="${c}" fill-opacity="0.15" stroke="${c}" stroke-opacity="0.5"/>`
+    + `<g fill="none" stroke="${c}" stroke-width="1.05" stroke-linecap="round" stroke-linejoin="round">${inner}</g>`
+    + `</svg>`;
+}
+
 function getFileIcon(name) {
-  const ext = name.split('.').pop().toLowerCase();
-  const icons = {
-    js: '📜', jsx: '⚛️', ts: '🔷', tsx: '⚛️', py: '🐍',
-    html: '🌐', css: '🎨', scss: '🎨', json: '📋', md: '📝',
-    yaml: '⚙️', yml: '⚙️', sh: '⚡', rs: '🦀', go: '🐹',
-    java: '☕', rb: '💎', php: '🐘', swift: '🍎', kt: '🟣',
-    sql: '🗃️', xml: '📄', toml: '⚙️', lock: '🔒', env: '🔐',
-    png: '🖼️', jpg: '🖼️', gif: '🖼️', svg: '🖼️', ico: '🖼️',
-    mp3: '🎵', wav: '🎵', mp4: '🎬', zip: '📦', tar: '📦',
-    vue: '💚', svelte: '🧡',
-    cls: '⚡', trigger: '⚡',
-  };
-  return icons[ext] || '📄';
+  const base = String(name || '').split(/[\\/]/).pop();
+  const lower = base.toLowerCase();
+  const ext = lower.includes('.') ? lower.split('.').pop() : '';
+  if (FILE_NAME_MAP[lower]) return _iconChip(FILE_NAME_MAP[lower][0], FILE_NAME_MAP[lower][1]);
+  if (isImageFile(base)) return _iconGlyph('green', _IMG_GLYPH);
+  if (ext === 'lock' || lower === 'package-lock.json') return _iconGlyph('muted', _LOCK_GLYPH);
+  const spec = FILE_ICON_MAP[ext];
+  if (spec) return _iconChip(spec[0], spec[1]);
+  return _iconGlyph('muted', _DOC_GLYPH);
+}
+
+function getFolderIcon(open) {
+  if (open) {
+    return `<svg class="fic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">`
+      + `<path d="M1.5 4.5a1 1 0 0 1 1-1h3.1a1 1 0 0 1 .8.4l.7.95a1 1 0 0 0 .8.4h4.8a1 1 0 0 1 1 1v1.1H4.4a1 1 0 0 0-.95.68L1.5 12V4.5z" fill="#5f9bf0"/>`
+      + `<path d="M3.7 8.1h10.7a.72.72 0 0 1 .69.93l-1.06 3.5a1 1 0 0 1-.96.71H1.8a.72.72 0 0 1-.69-.93l1.06-3.5a1 1 0 0 1 .96-.71z" fill="#84b5f8"/>`
+      + `</svg>`;
+  }
+  return `<svg class="fic" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">`
+    + `<path d="M1.5 4.5a1 1 0 0 1 1-1h3.1a1 1 0 0 1 .8.4l.7.95a1 1 0 0 0 .8.4h4.8a1 1 0 0 1 1 1V11.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V4.5z" fill="#5f9bf0"/>`
+    + `<path d="M1.5 6.6h13V11.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V6.6z" fill="#84b5f8"/>`
+    + `</svg>`;
 }
 
 function isImageFile(filename) {
@@ -6839,7 +6998,7 @@ function renderApiCollections() {
   }
   list.innerHTML = state.apiCollections.map((col, ci) => `
     <div class="api-collection-group">
-      <div class="api-collection-name">📁 ${escHtml(col.name)} (${col.requests.length})</div>
+      <div class="api-collection-name">${getFolderIcon(false)} ${escHtml(col.name)} (${col.requests.length})</div>
       ${col.requests.map((r, ri) => `
         <div class="api-collection-item" data-ci="${ci}" data-ri="${ri}">
           <span class="api-hist-method method-${r.method.toLowerCase()}">${r.method}</span>
