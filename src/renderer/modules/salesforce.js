@@ -1,7 +1,7 @@
 /**
  * Apex Debug Studio — Salesforce Module
- * 5 sub-features: Quick API View, Apex Test Runner, Process Flow Visualizer,
- * Change Impact Analyzer, Deployment Simulator
+ * 4 sub-features: Quick API View, Apex Test Runner, Process Flow Visualizer,
+ * Change Impact Analyzer
  */
 (function () {
   'use strict';
@@ -13,7 +13,6 @@
     endpoints: [],
     testClasses: [],
     impactResults: null,
-    deployResults: null,
     flowData: null,
     projectPath: null,     // resolved from workspace folder
     projectType: null,     // 'sfdx' | 'metadata' | 'hybrid'
@@ -390,6 +389,7 @@
   }
 
   let _orgCheckGen = 0;
+  let _showAllOrgs = false; // when false, hide expired/deauthorized (⚠) orgs
 
   /** Check CLI availability, list all orgs, populate selector dropdown */
   async function checkOrgConnection() {
@@ -449,10 +449,25 @@
       return an.localeCompare(bn);
     });
 
-    // 4) Populate the dropdown
+    // 4) Populate the dropdown. Active (Connected) orgs are what matter day to
+    //    day, so by default hide the long tail of expired/deauthorized orgs
+    //    (the ⚠ ones) behind a "Show all" item. The saved, currently-selected,
+    //    and default org are always kept visible so a choice is never dropped.
+    const savedOrg = await loadOrgForRepo();
+    if (myGen !== _orgCheckGen) return;
+    const keep = new Set([savedOrg, sfState.selectedOrg].filter(Boolean));
+    const defOrg = orgs.find(o => o.isDefault);
+    if (defOrg) keep.add(defOrg.username);
+    const hiddenInactive = orgs.filter(o => !isOrgConnected(o) && !keep.has(o.username));
+    let visibleOrgs = _showAllOrgs
+      ? orgs
+      : orgs.filter(o => isOrgConnected(o) || keep.has(o.username));
+    if (visibleOrgs.length === 0) visibleOrgs = orgs; // never show an empty list
+
     sel.innerHTML = '';
     let defaultUsername = null;
     for (const o of orgs) {
+      if (!visibleOrgs.includes(o)) continue;
       const opt = document.createElement('option');
       opt.value = o.username;
       // alias may contain comma-separated values — use the first one
@@ -465,22 +480,30 @@
       sel.appendChild(opt);
       if (o.isDefault) defaultUsername = o.username;
     }
+    // Trailing toggle: reveal the hidden inactive orgs, or collapse back to active.
+    if (hiddenInactive.length > 0) {
+      const opt = document.createElement('option');
+      opt.value = _showAllOrgs ? '__sf_show_active__' : '__sf_show_all__';
+      opt.textContent = _showAllOrgs
+        ? '  ▲ Show active orgs only'
+        : `  ▾ Show all orgs (${hiddenInactive.length} inactive)…`;
+      sel.appendChild(opt);
+    }
     sel.disabled = false;
 
     // 5) Auto-select: saved for repo > previously selected > default > first connected > first
-    const savedOrg = await loadOrgForRepo();
     const prev = sfState.selectedOrg;
     const firstConnected = orgs.find(o => isOrgConnected(o));
-    if (savedOrg && orgs.find(o => o.username === savedOrg)) {
+    if (savedOrg && visibleOrgs.find(o => o.username === savedOrg)) {
       sel.value = savedOrg;
-    } else if (prev && orgs.find(o => o.username === prev)) {
+    } else if (prev && visibleOrgs.find(o => o.username === prev)) {
       sel.value = prev;
     } else if (defaultUsername) {
       sel.value = defaultUsername;
-    } else if (firstConnected) {
+    } else if (firstConnected && visibleOrgs.includes(firstConnected)) {
       sel.value = firstConnected.username;
     } else {
-      sel.value = orgs[0].username;
+      sel.value = visibleOrgs[0].username;
     }
     sfState.selectedOrg = sel.value;
 
@@ -499,6 +522,12 @@
     const dot = $('#sf-org-dot');
     const label = $('#sf-org-label');
     if (!sel) return;
+    // Trailing toggle items just switch the filter and re-render — not a real org.
+    if (sel.value === '__sf_show_all__' || sel.value === '__sf_show_active__') {
+      _showAllOrgs = (sel.value === '__sf_show_all__');
+      checkOrgConnection();
+      return;
+    }
     sfState.selectedOrg = sel.value;
     const chosen = sfState.orgList.find(o => o.username === sel.value);
     sfState.orgInfo = chosen || null;
@@ -514,6 +543,8 @@
     updateStatusBarOrg();
     // Offer to deploy the system-mode helper class if this connected org lacks it.
     notifySystemHelperOnConnect(connected);
+    // Reload the Debug Log Analyzer for the newly selected org.
+    try { window.SFLogs?.onOrgChange(); } catch (_) {}
   }
 
   /**
@@ -2759,334 +2790,6 @@
   }
 
   // ──────────────────────────────────────────────
-  // 5. DEPLOYMENT SIMULATOR
-  // ──────────────────────────────────────────────
-  async function simulateDeployment() {
-    const folder = getFolderPath();
-    if (!folder) { toast('Open a folder first', 'warn'); return; }
-
-    const resultsDiv = $('#sf-deploy-results');
-    const logDiv = $('#sf-deploy-log');
-    const scopeSelect = $('#sf-deploy-scope');
-    resultsDiv.innerHTML = '<div class="sf-empty">⏳ Analyzing deployment...</div>';
-    logDiv.classList.add('hidden');
-
-    // Build index
-    await buildClassIndex(folder);
-
-    const issues = [];
-    const logLines = [];
-    let filesToDeploy = [];
-
-    if (scopeSelect.value === 'modified') {
-      try {
-        const status = await window.apexStudio.gitStatus(folder);
-        if (status && status.files) {
-          filesToDeploy = status.files.map(f => f.path);
-        }
-      } catch {
-        toast('Git not available', 'warn');
-        return;
-      }
-    } else {
-      const files = await gatherApexFiles(folder);
-      filesToDeploy = files.map(f => f.replace(folder + '/', ''));
-    }
-
-    logLines.push(`Deployment Validation Report`);
-    logLines.push(`Files to deploy: ${filesToDeploy.length}`);
-    logLines.push(`─`.repeat(50));
-
-    // Check 1: Apex syntax validation
-    logLines.push('\n[1/6] Checking Apex syntax...');
-    const allFiles = await gatherApexFiles(folder);
-    for (const fp of allFiles) {
-      const content = _impactContentCache[fp] || await readFile(fp);
-      if (!content) continue;
-      const fileName = fp.split(/[/\\]/).pop();
-      const syntaxIssues = validateApexSyntax(content, fileName);
-      issues.push(...syntaxIssues);
-    }
-    logLines.push(`  Found ${issues.length} syntax issues`);
-
-    // Check 2: Missing dependencies
-    logLines.push('\n[2/6] Checking dependencies...');
-    let depIssues = 0;
-    for (const [className, info] of Object.entries(sfState.classIndex)) {
-      for (const ref of info.references) {
-        const refName = typeof ref === 'string' ? ref : ref.name;
-        if (!sfState.classIndex[refName] && !sfState.triggerIndex[refName] && !APEX_KEYWORDS.has(refName)) {
-          issues.push({
-            type: 'warn',
-            file: className + '.cls',
-            message: `References "${refName}" — not found in project (may be managed package)`,
-          });
-          depIssues++;
-        }
-      }
-    }
-    logLines.push(`  Found ${depIssues} potential missing references`);
-
-    // Check 3: Test coverage estimation
-    logLines.push('\n[3/6] Checking test coverage...');
-    const classesWithTests = new Set();
-    for (const [testName, testInfo] of Object.entries(sfState.classIndex)) {
-      if (testInfo.isTest) {
-        for (const ref of testInfo.references) {
-          const refName = typeof ref === 'string' ? ref : ref.name;
-          classesWithTests.add(refName);
-        }
-      }
-    }
-    const nonTestClasses = Object.entries(sfState.classIndex).filter(([_, info]) => !info.isTest);
-    const untested = nonTestClasses.filter(([name]) => !classesWithTests.has(name));
-    for (const [name] of untested) {
-      issues.push({
-        type: 'warn',
-        file: name + '.cls',
-        message: 'No test class directly references this class',
-      });
-    }
-    const coverageEst = nonTestClasses.length > 0
-      ? Math.round(((nonTestClasses.length - untested.length) / nonTestClasses.length) * 100)
-      : 0;
-    logLines.push(`  Estimated coverage: ${coverageEst}% (${nonTestClasses.length - untested.length}/${nonTestClasses.length} classes have tests)`);
-    if (coverageEst < 75) {
-      issues.push({ type: 'error', file: 'Project', message: `Estimated test coverage ${coverageEst}% is below Salesforce's 75% requirement` });
-    }
-
-    // Check 4: Trigger handler pattern check
-    logLines.push('\n[4/6] Checking trigger patterns...');
-    for (const [trigName, trigInfo] of Object.entries(sfState.triggerIndex)) {
-      const content = _impactContentCache[trigInfo.filePath] || await readFile(trigInfo.filePath);
-      if (content) {
-        const lineCount = content.split('\n').length;
-        if (lineCount > 30 && trigInfo.references.length === 0) {
-          issues.push({
-            type: 'warn',
-            file: trigName + '.trigger',
-            message: 'Trigger has significant logic without delegating to a handler class',
-          });
-        }
-      }
-    }
-
-    // Check 5: Metadata completeness
-    logLines.push('\n[5/6] Checking metadata...');
-    for (const fp of allFiles) {
-      const metaFile = fp + '-meta.xml';
-      try {
-        await window.apexStudio.stat(metaFile);
-      } catch {
-        issues.push({
-          type: 'warn',
-          file: fp.split(/[/\\]/).pop(),
-          message: 'Missing -meta.xml companion file',
-        });
-      }
-    }
-
-    // Check 6: Best practices
-    logLines.push('\n[6/6] Checking best practices...');
-    for (const fp of allFiles) {
-      const content = _impactContentCache[fp] || await readFile(fp);
-      if (!content) continue;
-      const fileName = fp.split(/[/\\]/).pop();
-      const bpIssues = checkBestPractices(content, fileName);
-      issues.push(...bpIssues);
-    }
-
-    // Sort: errors first, then warnings, then ok
-    issues.sort((a, b) => {
-      const order = { error: 0, warn: 1, ok: 2 };
-      return (order[a.type] || 99) - (order[b.type] || 99);
-    });
-
-    logLines.push(`\n${'─'.repeat(50)}`);
-    logLines.push(`Total issues: ${issues.length} (${issues.filter(i=>i.type==='error').length} errors, ${issues.filter(i=>i.type==='warn').length} warnings)`);
-    logLines.push(`Deployment readiness: ${issues.filter(i=>i.type==='error').length === 0 ? '✓ READY (with warnings)' : '✗ NOT READY'}`);
-
-    sfState.deployResults = issues;
-    renderDeployResults(issues);
-
-    logDiv.classList.remove('hidden');
-    logDiv.textContent = logLines.join('\n');
-
-    const errorCount = issues.filter(i => i.type === 'error').length;
-    const warnCount = issues.filter(i => i.type === 'warn').length;
-    $('#sf-deploy-summary').textContent = `${errorCount} errors, ${warnCount} warnings`;
-    toast(`Deploy validation: ${errorCount} errors, ${warnCount} warnings`, errorCount > 0 ? 'error' : 'success');
-  }
-
-  /** Validate Apex syntax — checks brace matching, semicolons, common typos */
-  function validateApexSyntax(content, fileName) {
-    const issues = [];
-    const lines = content.split('\n');
-
-    // Check 1: Brace matching
-    let braceDepth = 0;
-    let parenDepth = 0;
-    let bracketDepth = 0;
-    let inString = false;
-    let inLineComment = false;
-    let inBlockComment = false;
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      inLineComment = false;
-      for (let c = 0; c < line.length; c++) {
-        const ch = line[c];
-        const next = line[c + 1] || '';
-
-        if (inBlockComment) {
-          if (ch === '*' && next === '/') { inBlockComment = false; c++; }
-          continue;
-        }
-        if (inLineComment) continue;
-        if (ch === '/' && next === '/') { inLineComment = true; continue; }
-        if (ch === '/' && next === '*') { inBlockComment = true; c++; continue; }
-        if (ch === "'") { inString = !inString; continue; }
-        if (inString) continue;
-
-        if (ch === '{') braceDepth++;
-        if (ch === '}') braceDepth--;
-        if (ch === '(') parenDepth++;
-        if (ch === ')') parenDepth--;
-        if (ch === '[') bracketDepth++;
-        if (ch === ']') bracketDepth--;
-
-        if (braceDepth < 0) {
-          issues.push({ type: 'error', file: fileName, message: `Extra closing brace '}' at line ${i+1}` });
-          braceDepth = 0;
-        }
-        if (parenDepth < 0) {
-          issues.push({ type: 'error', file: fileName, message: `Extra closing parenthesis ')' at line ${i+1}` });
-          parenDepth = 0;
-        }
-      }
-    }
-
-    if (braceDepth > 0) {
-      issues.push({ type: 'error', file: fileName, message: `${braceDepth} unclosed brace(s) '{' — missing '}'` });
-    }
-    if (parenDepth > 0) {
-      issues.push({ type: 'error', file: fileName, message: `${parenDepth} unclosed parenthesis '(' — missing ')'` });
-    }
-    if (bracketDepth > 0) {
-      issues.push({ type: 'error', file: fileName, message: `${bracketDepth} unclosed bracket '[' — missing ']'` });
-    }
-
-    // Check 2: Statements without semicolons (common Apex errors)
-    for (let i = 0; i < lines.length; i++) {
-      const trimmed = lines[i].trim();
-      // Skip empty, comments, annotations, braces, class/method declarations
-      if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')
-        || trimmed.startsWith('@') || trimmed === '{' || trimmed === '}' || trimmed === '}'
-        || /^(public|private|protected|global|static|class|interface|enum|trigger|if|else|for|while|do|try|catch|finally|switch|when)\b/.test(trimmed)
-        || trimmed.endsWith('{') || trimmed.endsWith('}') || trimmed.endsWith(',')
-        || trimmed.endsWith(';') || trimmed.endsWith('(') || trimmed.endsWith(')')
-        || trimmed.endsWith('*/')) continue;
-
-      // Lines that look like statements but missing semicolons
-      if (/^\w+.*[^{};,/)\s]$/.test(trimmed) && /\b(return|insert|update|delete|upsert|merge|undelete)\b/.test(trimmed)) {
-        issues.push({ type: 'error', file: fileName, message: `Possible missing semicolon at line ${i+1}: "${trimmed.substring(0, 60)}"` });
-      }
-    }
-
-    // Check 3: Common typos in Apex
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      // Double semicolons
-      if (/;;/.test(line) && !line.includes('for')) {
-        issues.push({ type: 'warn', file: fileName, message: `Double semicolon at line ${i+1}` });
-      }
-      // = in condition (should be ==)
-      if (/\bif\s*\([^=]*[^!=<>]=[^=][^)]*\)/.test(line)) {
-        issues.push({ type: 'warn', file: fileName, message: `Possible assignment in condition at line ${i+1} (use == for comparison)` });
-      }
-    }
-
-    return issues;
-  }
-
-  /** Check Salesforce best practices */
-  function checkBestPractices(content, fileName) {
-    const issues = [];
-    const lines = content.split('\n');
-
-    // SOQL/DML inside loops
-    let inLoop = false;
-    let loopDepth = 0;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (/\b(for|while|do)\s*[\({]/.test(line)) {
-        inLoop = true;
-        loopDepth++;
-      }
-      if (inLoop) {
-        if (line.includes('{')) loopDepth += (line.match(/{/g) || []).length - 1;
-        if (line.includes('}')) loopDepth -= (line.match(/}/g) || []).length;
-        if (loopDepth <= 0) { inLoop = false; loopDepth = 0; }
-
-        // SOQL in loop
-        if (/\[\s*SELECT\b/i.test(line)) {
-          issues.push({ type: 'warn', file: fileName, message: `SOQL query inside loop at line ${i+1} — may hit governor limits` });
-        }
-        // DML in loop
-        if (/\b(insert|update|delete|upsert|merge|undelete)\s+/i.test(line) && !line.trim().startsWith('//')) {
-          issues.push({ type: 'warn', file: fileName, message: `DML operation inside loop at line ${i+1} — may hit governor limits` });
-        }
-      }
-    }
-
-    // Hardcoded IDs
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim().startsWith('//')) continue;
-      if (/['"][a-zA-Z0-9]{15,18}['"]/.test(lines[i]) && /^[a-zA-Z0-9]{15,18}$/.test(lines[i].match(/['"]([a-zA-Z0-9]{15,18})['"]/)?.[1] || '')) {
-        const match = lines[i].match(/['"]([a-zA-Z0-9]{15,18})['"]/);
-        if (match && /^[0-9a-zA-Z]{15}$|^[0-9a-zA-Z]{18}$/.test(match[1]) && /^[a-z0-9]{3}/i.test(match[1])) {
-          issues.push({ type: 'warn', file: fileName, message: `Possible hardcoded Salesforce ID at line ${i+1} — use Custom Settings or Custom Metadata` });
-        }
-      }
-    }
-
-    // System.debug left in production code
-    if (!fileName.includes('Test')) {
-      let debugCount = 0;
-      for (const line of lines) {
-        if (/System\.debug\s*\(/i.test(line) && !line.trim().startsWith('//')) debugCount++;
-      }
-      if (debugCount > 5) {
-        issues.push({ type: 'warn', file: fileName, message: `${debugCount} System.debug statements — consider removing for production` });
-      }
-    }
-
-    return issues;
-  }
-
-  function renderDeployResults(issues) {
-    const resultsDiv = $('#sf-deploy-results');
-    resultsDiv.innerHTML = '';
-
-    if (issues.length === 0) {
-      resultsDiv.innerHTML = '<div class="sf-empty">✓ No issues found. Deployment looks clean!</div>';
-      return;
-    }
-
-    for (const issue of issues) {
-      const item = document.createElement('div');
-      item.className = 'sf-deploy-item';
-      const icon = issue.type === 'error' ? '✗' : issue.type === 'warn' ? '⚠' : '✓';
-      item.innerHTML = `
-        <span class="sf-deploy-icon ${issue.type === 'error' ? 'error' : issue.type === 'warn' ? 'warn' : 'ok'}">${icon}</span>
-        <span class="sf-deploy-name">${escapeHtml(issue.file)}</span>
-        <span class="sf-deploy-msg">${escapeHtml(issue.message)}</span>
-      `;
-      resultsDiv.appendChild(item);
-    }
-  }
-
-  // ──────────────────────────────────────────────
   // HTML ESCAPE
   // ──────────────────────────────────────────────
   function escapeHtml(str) {
@@ -3164,152 +2867,10 @@
         }
         break;
       }
-      case 'deploy-validate':
-        openSfPanel('sf-deploy');
-        setTimeout(() => deployToOrg(true), 200);
-        break;
-      case 'deploy-run':
-        deployToOrg(false);
-        break;
       case 'scan-all':
         openSfPanel('sf-api');
         setTimeout(() => scanEndpoints(), 200);
         break;
-    }
-  }
-
-  /** Real deployment to org via sf project deploy start */
-  async function deployToOrg(validateOnly) {
-    const folder = getFolderPath();
-    if (!folder) { toast('Open a folder first', 'warn'); return; }
-    if (!sfState.cliInstalled) { toast(CLI_MISSING_MSG, 'error'); return; }
-    if (!sfState.orgConnected) { toast(NO_ORG_MSG, 'error'); return; }
-
-    openSfPanel('sf-deploy');
-    const resultsDiv = $('#sf-deploy-results');
-    const logDiv = $('#sf-deploy-log');
-    const scopeSelect = $('#sf-deploy-scope');
-    const tof = targetOrgFlag();
-    const mode = validateOnly ? 'VALIDATING' : 'DEPLOYING';
-    const dryRunFlag = validateOnly ? ' --dry-run' : '';
-
-    resultsDiv.innerHTML = `<div class="sf-empty">⏳ ${mode} to org...</div>`;
-    logDiv.classList.remove('hidden');
-    logDiv.textContent = '';
-
-    // Console output
-    clearConsole();
-    clog(`═══ ${mode} TO ORG ═══`, 'sf-console-info');
-    if (sfState.selectedOrg) clog(`Target: ${sfState.selectedOrg}`, 'sf-console-dim');
-
-    // Build source flag based on scope
-    let sourceFlag = '';
-    if (scopeSelect.value === 'modified') {
-      try {
-        const status = await window.apexStudio.gitStatus(folder);
-        if (status && status.files && status.files.length > 0) {
-          const modifiedPaths = status.files.map(f => f.path).filter(p =>
-            p.endsWith('.cls') || p.endsWith('.trigger') || p.endsWith('.js') ||
-            p.endsWith('.html') || p.endsWith('.css') || p.endsWith('.xml') ||
-            p.endsWith('.cmp') || p.endsWith('.page') || p.endsWith('.component')
-          );
-          if (modifiedPaths.length === 0) {
-            toast('No modified metadata files found', 'warn');
-            resultsDiv.innerHTML = '<div class="sf-empty">No modified metadata files to deploy.</div>';
-            return;
-          }
-          // Use metadata flag with comma-separated paths
-          sourceFlag = ` --source-dir ${modifiedPaths.map(p => `"${p}"`).join(' --source-dir ')}`;
-          clog(`Modified files: ${modifiedPaths.length}`, 'sf-console-dim');
-          for (const p of modifiedPaths.slice(0, 10)) clog(`  ${p}`, 'sf-console-dim');
-          if (modifiedPaths.length > 10) clog(`  ... and ${modifiedPaths.length - 10} more`, 'sf-console-dim');
-        } else {
-          toast('No modified files found', 'warn');
-          resultsDiv.innerHTML = '<div class="sf-empty">No modified files to deploy.</div>';
-          return;
-        }
-      } catch {
-        toast('Git not available for modified detection', 'warn');
-        return;
-      }
-    }
-
-    const cmd = `sf project deploy start${dryRunFlag}${sourceFlag}${tof} --json --wait 30 2>&1`;
-    const displayCmd = `sf project deploy start${dryRunFlag}${sourceFlag ? ' --source-dir ...' : ''}${tof} --wait 30`;
-    clog(`$ ${displayCmd}`, 'sf-console-cmd');
-    const spinner = clogSpinner(`${mode}...`);
-
-    try {
-      const { code, stdout, stderr } = await sfExec(cmd, 600000); // 10 min timeout
-      let json;
-      try { json = JSON.parse(stdout); } catch { json = null; }
-
-      if (json && json.result) {
-        const r = json.result;
-        const status = r.status || (code === 0 ? 'Succeeded' : 'Failed');
-        const icon = code === 0 ? '✓' : '✗';
-        const cls = code === 0 ? 'sf-console-success' : 'sf-console-error';
-
-        clogResolve(spinner, `${icon} ${mode} ${status}`, cls);
-
-        // Component successes
-        const deployed = r.deployedSource || r.files || [];
-        const failures = r.details?.componentFailures || [];
-        const testResults = r.details?.runTestResult;
-
-        if (deployed.length > 0) {
-          clog(`\nDeployed components: ${deployed.length}`, 'sf-console-info');
-          for (const c of deployed.slice(0, 20)) {
-            const name = c.fullName || c.filePath || c.fileName || '';
-            const type = c.type || c.componentType || '';
-            clog(`  ✓ ${type}: ${name}`, 'sf-console-success');
-          }
-          if (deployed.length > 20) clog(`  ... and ${deployed.length - 20} more`, 'sf-console-dim');
-        }
-
-        if (failures.length > 0) {
-          clog(`\nFailed components: ${failures.length}`, 'sf-console-error');
-          for (const f of failures) {
-            clog(`  ✗ ${f.componentType || ''}: ${f.fullName || f.fileName || ''}`, 'sf-console-error');
-            if (f.problem) clog(`    ${f.problem}`, 'sf-console-dim');
-          }
-        }
-
-        if (testResults) {
-          const passed = testResults.numTestsRun - testResults.numFailures;
-          clog(`\nTests: ${passed}/${testResults.numTestsRun} passed`, testResults.numFailures > 0 ? 'sf-console-warn' : 'sf-console-success');
-        }
-
-        // Update results div
-        const issues = [];
-        for (const f of failures) {
-          issues.push({ type: 'error', file: f.fullName || f.fileName || '', message: f.problem || 'Component failure' });
-        }
-        if (deployed.length > 0 && failures.length === 0) {
-          issues.push({ type: 'ok', file: 'Deployment', message: `${icon} ${deployed.length} components ${validateOnly ? 'validated' : 'deployed'} successfully` });
-        }
-        renderDeployResults(issues.length > 0 ? issues : [{ type: 'ok', file: 'Deployment', message: `${icon} ${status}` }]);
-
-        // Log
-        logDiv.textContent = JSON.stringify(json.result, null, 2);
-        const summary = `${code === 0 ? '✓' : '✗'} ${deployed.length} deployed, ${failures.length} failed`;
-        $('#sf-deploy-summary').textContent = summary;
-        toast(`${validateOnly ? 'Validation' : 'Deployment'}: ${status}`, code === 0 ? 'success' : 'error');
-
-      } else {
-        // Non-JSON or unexpected output
-        clogResolve(spinner, `✗ ${mode} failed`, 'sf-console-error');
-        clog(stdout || stderr || 'Unknown error', 'sf-console-error');
-        logDiv.textContent = stdout || stderr || 'No output';
-        resultsDiv.innerHTML = `<div class="sf-empty">✗ ${mode} failed. See log below.</div>`;
-        const h = humanizeSfError(stderr, stdout);
-        toast(`${validateOnly ? 'Validation' : 'Deployment'} failed \u2014 ${h.message}`, 'error', { details: h.details });
-      }
-    } catch (e) {
-      clogResolve(spinner, `✗ ${mode} error: ${e.message}`, 'sf-console-error');
-      resultsDiv.innerHTML = `<div class="sf-empty">✗ Error: ${e.message}</div>`;
-      const h = humanizeSfError(e && e.message, '');
-      toast(`${validateOnly ? 'Validation' : 'Deployment'} error \u2014 ${h.message}`, 'error', { details: h.details || (e && e.message) || '' });
     }
   }
 
@@ -3402,88 +2963,6 @@
           toast('Test Runner works with Apex class files', 'warn');
         }
         break;
-
-      case 'sf-deploy-file':
-      case 'tab-sf-deploy':
-        openSfPanel('sf-deploy');
-        deployPath(filePath);
-        break;
-    }
-  }
-
-  /** Deploy a specific file or folder path to org */
-  async function deployPath(targetPath) {
-    const folder = getFolderPath();
-    if (!folder) { toast('Open a folder first', 'warn'); return; }
-    if (!sfState.cliInstalled) { toast(CLI_MISSING_MSG, 'error'); return; }
-    if (!sfState.orgConnected) { toast(NO_ORG_MSG, 'error'); return; }
-
-    const resultsDiv = $('#sf-deploy-results');
-    const logDiv = $('#sf-deploy-log');
-    const tof = targetOrgFlag();
-
-    resultsDiv.innerHTML = `<div class="sf-empty">⏳ DEPLOYING ${targetPath.split(/[/\\]/).pop()}...</div>`;
-    logDiv.classList.remove('hidden');
-    logDiv.textContent = '';
-
-    clearConsole();
-    clog(`═══ DEPLOYING PATH ═══`, 'sf-console-info');
-    clog(`Source: ${targetPath}`, 'sf-console-dim');
-    if (sfState.selectedOrg) clog(`Target: ${sfState.selectedOrg}`, 'sf-console-dim');
-
-    const cmd = `sf project deploy start --source-dir "${targetPath}"${tof} --json --wait 30 2>&1`;
-    clog(`$ sf project deploy start --source-dir "${targetPath.split(/[/\\]/).pop()}"${tof} --wait 30`, 'sf-console-cmd');
-    const spinner = clogSpinner('DEPLOYING...');
-
-    try {
-      const { code, stdout, stderr } = await sfExec(cmd, 600000);
-      let json;
-      try { json = JSON.parse(stdout); } catch { json = null; }
-
-      if (json && json.result) {
-        const r = json.result;
-        const status = r.status || (code === 0 ? 'Succeeded' : 'Failed');
-        const deployed = r.deployedSource || r.files || [];
-        const failures = r.details?.componentFailures || [];
-
-        clogResolve(spinner, `${code === 0 ? '✓' : '✗'} ${status}`, code === 0 ? 'sf-console-success' : 'sf-console-error');
-
-        if (deployed.length > 0) {
-          clog(`\nDeployed: ${deployed.length} components`, 'sf-console-info');
-          for (const c of deployed.slice(0, 20)) {
-            clog(`  ✓ ${c.type || c.componentType || ''}: ${c.fullName || c.filePath || ''}`, 'sf-console-success');
-          }
-        }
-        if (failures.length > 0) {
-          clog(`\nFailed: ${failures.length}`, 'sf-console-error');
-          for (const f of failures) {
-            clog(`  ✗ ${f.componentType || ''}: ${f.fullName || ''} — ${f.problem || ''}`, 'sf-console-error');
-          }
-        }
-
-        const issues = [];
-        for (const f of failures) {
-          issues.push({ type: 'error', file: f.fullName || f.fileName || '', message: f.problem || 'Component failure' });
-        }
-        if (deployed.length > 0 && failures.length === 0) {
-          issues.push({ type: 'ok', file: 'Deployment', message: `✓ ${deployed.length} components deployed` });
-        }
-        renderDeployResults(issues.length > 0 ? issues : [{ type: 'ok', file: 'Deployment', message: `✓ ${status}` }]);
-        logDiv.textContent = JSON.stringify(json.result, null, 2);
-        toast(`Deploy: ${status}`, code === 0 ? 'success' : 'error');
-      } else {
-        clogResolve(spinner, '✗ Deploy failed', 'sf-console-error');
-        clog(stdout || stderr || 'Unknown error', 'sf-console-error');
-        logDiv.textContent = stdout || stderr || 'No output';
-        resultsDiv.innerHTML = '<div class="sf-empty">✗ Deploy failed. See log.</div>';
-        const h = humanizeSfError(stderr, stdout);
-        toast(`Deploy failed \u2014 ${h.message}`, 'error', { details: h.details });
-      }
-    } catch (e) {
-      clogResolve(spinner, `✗ Error: ${e.message}`, 'sf-console-error');
-      resultsDiv.innerHTML = `<div class="sf-empty">✗ Error: ${e.message}</div>`;
-      const h = humanizeSfError(e && e.message, '');
-      toast(`Deploy error \u2014 ${h.message}`, 'error', { details: h.details || (e && e.message) || '' });
     }
   }
 
@@ -3648,6 +3127,7 @@
   function switchTab(tabId) {
     $$('.sf-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabId));
     $$('.sf-tab-content').forEach(c => c.classList.toggle('active', c.id === tabId));
+    if (tabId === 'sf-log') { try { window.SFLogs?.onShow(); } catch (_) {} }
   }
 
   // ──────────────────────────────────────────────
@@ -3658,6 +3138,13 @@
     $$('.sf-tab').forEach(tab => {
       tab.addEventListener('click', () => switchTab(tab.dataset.tab));
     });
+
+    // Debug Log Analyzer: expose the CLI bridge + initialize the ported analyzer.
+    window.SFLogBridge = {
+      exec: (command, timeoutMs) => sfExec(command + targetOrgFlag(), timeoutMs),
+      selectedOrg: () => sfState.selectedOrg,
+    };
+    try { window.SFLogs?.init(); } catch (_) {}
 
     // Close panel
     $('#btn-sf-close')?.addEventListener('click', () => {
@@ -3691,9 +3178,14 @@
     $('#sf-impact-analyze')?.addEventListener('click', analyzeImpact);
     $('#sf-impact-detail-close')?.addEventListener('click', closeImpactDetail);
 
-    // Deployment
-    $('#sf-deploy-simulate')?.addEventListener('click', simulateDeployment);
-    $('#sf-deploy-run')?.addEventListener('click', () => deployToOrg(false));
+    // Center empty-state CTAs mirror their toolbar action button (delegated,
+    // so it covers every tab's empty state now and any added later).
+    $('#salesforce-panel')?.addEventListener('click', (e) => {
+      const cta = e.target.closest?.('.sf-empty-btn[data-cta]');
+      if (!cta) return;
+      const target = document.getElementById(cta.dataset.cta);
+      if (target && !target.disabled) target.click();
+    });
 
     // Console clear
     $('#sf-console-clear')?.addEventListener('click', clearConsole);

@@ -21,7 +21,7 @@
  * `version` field of the electron-builder manifest (`latest.yml` / `latest-mac.yml`),
  * which CI stamps as `1.0.<run number>` so it strictly increases build-over-build.
  */
-const { app, ipcMain, shell, BrowserWindow } = require('electron');
+const { app, ipcMain, shell, BrowserWindow, dialog } = require('electron');
 const https = require('https');
 
 const REPO_OWNER = 'srikanthpullela';
@@ -183,6 +183,86 @@ async function primaryAction() {
   await shell.openExternal(RELEASE_PAGE);
 }
 
+/**
+ * Menu-driven "Check for Updates…". Unlike the passive doCheck() that only
+ * flips the titlebar button, this always gives the user explicit feedback via a
+ * dialog (up-to-date / available → offer download / error), like a normal app.
+ */
+async function checkForUpdatesInteractive() {
+  const win = getWindow();
+  const current = app.getVersion();
+
+  // Installed macOS / Windows: electron-updater handles check → download → install.
+  if (autoUpdater) {
+    try {
+      const res = await autoUpdater.checkForUpdates();
+      const remote = res && res.updateInfo && res.updateInfo.version;
+      if (remote && compareVersions(remote, current) > 0) {
+        send('available', remote);
+        const { response } = await dialog.showMessageBox(win, {
+          type: 'info',
+          buttons: ['Download & Install', 'Later'],
+          defaultId: 0,
+          cancelId: 1,
+          title: 'Update Available',
+          message: `A new version is available: v${String(remote).replace(/^v/, '')}`,
+          detail: `You're running v${current}. Download and install it now? The app will restart to finish installing.`,
+        });
+        if (response === 0) {
+          userInitiatedDownload = true;
+          send('downloading', remote, 0);
+          try {
+            await autoUpdater.downloadUpdate();
+            const { response: r2 } = await dialog.showMessageBox(win, {
+              type: 'info',
+              buttons: ['Restart Now', 'Later'],
+              defaultId: 0,
+              cancelId: 1,
+              title: 'Update Ready',
+              message: 'Update downloaded',
+              detail: `v${String(remote).replace(/^v/, '')} is ready. Restart now to finish installing?`,
+            });
+            if (r2 === 0) autoUpdater.quitAndInstall();
+          } catch (e) {
+            onUpdateError(e);
+          }
+        }
+      } else {
+        send('none', remote || current);
+        await dialog.showMessageBox(win, {
+          type: 'info',
+          buttons: ['OK'],
+          title: "You're Up to Date",
+          message: "You're up to date",
+          detail: `v${current} is the latest version.`,
+        });
+      }
+    } catch (e) {
+      await dialog.showMessageBox(win, {
+        type: 'warning',
+        buttons: ['OK'],
+        title: 'Update Check Failed',
+        message: 'Could not check for updates',
+        detail: String((e && e.message) || e),
+      });
+    }
+    return;
+  }
+
+  // Dev/unpackaged or a platform without a self-updater: we can't self-install,
+  // so offer to open the releases page for a manual download.
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'info',
+    buttons: ['Open Releases Page', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    title: 'Check for Updates',
+    message: "Automatic updates aren't available in this build",
+    detail: `You're running v${current}. Open the releases page to download the latest version.`,
+  });
+  if (response === 0) await shell.openExternal(RELEASE_PAGE);
+}
+
 function initUpdater(opts) {
   if (opts && typeof opts.getWindow === 'function') getWindow = opts.getWindow;
 
@@ -215,4 +295,4 @@ function initUpdater(opts) {
   setInterval(doCheck, CHECK_INTERVAL_MS);
 }
 
-module.exports = { initUpdater };
+module.exports = { initUpdater, checkForUpdatesInteractive };

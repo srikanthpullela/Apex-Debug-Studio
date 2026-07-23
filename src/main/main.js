@@ -17,7 +17,7 @@ const os = require('os');
 const { spawn, execSync, execFileSync, execFile } = require('child_process');
 const chokidar = require('chokidar');
 const simpleGit = require('simple-git');
-const { initUpdater } = require('./updater');
+const { initUpdater, checkForUpdatesInteractive } = require('./updater');
 
 // ---------------------------------------------------------------------------
 // Cross-platform shell invocation
@@ -601,6 +601,11 @@ function showAboutDialog() {
   });
 }
 
+// User preference mirrored into the native File ▸ Auto Save checkbox. The
+// renderer owns the persisted value (localStorage) and reports it here so the
+// checkbox reflects reality across menu rebuilds. Default OFF.
+let autoSaveEnabled = false;
+
 function buildMenu() {
   const isMac = process.platform === 'darwin';
   const recentFiles = loadRecent();
@@ -615,6 +620,7 @@ function buildMenu() {
       label: 'Apex Debug Studio',
       submenu: [
         { label: 'About Apex Debug Studio', role: 'about' },
+        { label: 'Check for Updates…', click: () => checkForUpdatesInteractive() },
         { type: 'separator' },
         { role: 'services' },
         { type: 'separator' },
@@ -635,6 +641,8 @@ function buildMenu() {
         { type: 'separator' },
         { label: 'Save', accelerator: 'CmdOrCtrl+S', click: () => sendToFocused('file:save') },
         { label: 'Save As…', accelerator: 'CmdOrCtrl+Shift+S', click: () => sendToFocused('file:save-as') },
+        { type: 'separator' },
+        { id: 'menu-autosave', label: 'Auto Save', type: 'checkbox', checked: autoSaveEnabled, click: (item) => { autoSaveEnabled = item.checked; sendToFocused('settings:set-autosave', item.checked); } },
         { type: 'separator' },
         { label: 'Open Recent', submenu: [...recentMenu, { type: 'separator' }, { label: 'Clear Recent', click: () => { saveRecent([]); buildMenu(); } }] },
         { type: 'separator' },
@@ -685,24 +693,6 @@ function buildMenu() {
         { label: 'Toggle Markdown Preview', accelerator: 'CmdOrCtrl+Shift+V', click: () => sendToFocused('view:markdown-preview') },
         { label: 'Toggle Terminal', accelerator: 'Ctrl+`', click: () => sendToFocused('view:toggle-terminal') },
         { type: 'separator' },
-        {
-          label: 'Tools',
-          submenu: [
-            { label: 'API Client', accelerator: 'Ctrl+Shift+A', click: () => sendToFocused('view:api-client') },
-            { label: 'Regex Tester', accelerator: 'Ctrl+Shift+R', click: () => sendToFocused('view:regex-tester') },
-            { label: 'JSON / Data Viewer', accelerator: 'Ctrl+Shift+J', click: () => sendToFocused('view:json-viewer') },
-            { label: 'Bookmarks', accelerator: 'Ctrl+Shift+B', click: () => sendToFocused('view:bookmarks') },
-            { label: 'Code Screenshot', accelerator: 'Ctrl+Shift+S', click: () => sendToFocused('view:screenshot') },
-            { label: 'Database Client', accelerator: 'Ctrl+Shift+D', click: () => sendToFocused('view:db-client') },
-            { type: 'separator' },
-            { label: 'Snippet Manager', accelerator: 'Ctrl+Shift+E', click: () => sendToFocused('view:snippets') },
-            { label: 'Color Picker', accelerator: 'Ctrl+Shift+K', click: () => sendToFocused('view:color-picker') },
-            { label: 'TODO Tracker', accelerator: 'Ctrl+Shift+G', click: () => sendToFocused('view:todo-tracker') },
-            { label: 'Pomodoro Timer', accelerator: 'Ctrl+Shift+Y', click: () => sendToFocused('view:pomodoro') },
-            { label: 'Diff Checker', accelerator: 'Ctrl+Shift+I', click: () => sendToFocused('view:diff-checker') },
-          ],
-        },
-        { type: 'separator' },
         { label: 'Change Theme…', click: () => sendToFocused('view:change-theme') },
         { type: 'separator' },
         { label: 'Zoom In', accelerator: 'CmdOrCtrl+=', click: () => sendToFocused('view:zoom-in') },
@@ -730,6 +720,7 @@ function buildMenu() {
       submenu: [
         ...(!isMac ? [
           { label: 'About Apex Debug Studio', click: () => showAboutDialog() },
+          { label: 'Check for Updates…', click: () => checkForUpdatesInteractive() },
           { type: 'separator' },
         ] : []),
         { label: 'Open AutoSave Folder', click: () => shell.openPath(AUTOSAVE_DIR) },
@@ -739,6 +730,14 @@ function buildMenu() {
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
+
+// Renderer reports the persisted auto-save preference so the native File ▸ Auto
+// Save checkbox reflects it (on startup and whenever it changes).
+ipcMain.on('settings:autosave-changed', (_e, val) => {
+  autoSaveEnabled = !!val;
+  const mi = Menu.getApplicationMenu()?.getMenuItemById('menu-autosave');
+  if (mi) mi.checked = autoSaveEnabled;
+});
 
 // ---------------------------------------------------------------------------
 // IPC Handlers

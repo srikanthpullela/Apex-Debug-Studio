@@ -102,6 +102,9 @@ const apexStudioApi = {
   updatesCheck: () => ipcRenderer.invoke('updates:check'),
   updatesPrimaryAction: () => ipcRenderer.invoke('updates:primary-action'),
 
+  // Renderer → main: keep the native File ▸ Auto Save menu checkbox in sync.
+  notifyAutoSave: (val) => ipcRenderer.send('settings:autosave-changed', !!val),
+
   // IPC listener
   on: (channel, callback) => {
     const valid = [
@@ -113,10 +116,6 @@ const apexStudioApi = {
       'view:zoom-in', 'view:zoom-out', 'view:zoom-reset', 'view:change-theme',
       'view:zen-mode', 'view:split-editor', 'view:markdown-preview',
       'view:toggle-terminal', 'terminal:output', 'terminal:exit',
-      'view:api-client', 'view:regex-tester', 'view:json-viewer',
-      'view:bookmarks', 'view:screenshot', 'view:db-client',
-      'view:snippets', 'view:color-picker', 'view:todo-tracker', 'view:pomodoro',
-      'view:diff-checker',
       'view:salesforce',
       'selection:select-all', 'selection:expand', 'selection:duplicate-line',
       'selection:move-line-up', 'selection:move-line-down',
@@ -128,6 +127,7 @@ const apexStudioApi = {
       'watch:change',
       'sf:login-progress',
       'update:status',
+      'settings:set-autosave',
     ];
     if (valid.includes(channel)) {
       const listener = (_event, ...args) => callback(...args);
